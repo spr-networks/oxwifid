@@ -40,7 +40,7 @@ class Client:
         self.igtk = None
         self.snonce = b""
         self.sc = 0
-        self.client_pn = 0
+        self.client_pn = 1  # CCMP PN starts at 1
 
     def next_sc(self):
         self.sc = (self.sc + 1) % 4096
@@ -114,7 +114,7 @@ class Client:
         pmk = self.sae.pmk
         ptk = sae.derive_ptk_sha256(pmk, C.mac_b(self.bssid), C.mac_b(self.mac), anonce, self.snonce)
         self.kck, self.kek, self.tk = ptk[:16], ptk[16:32], ptk[32:48]
-        self.client_pn = 0
+        self.client_pn = 1  # CCMP PN starts at 1
         self.send(C.build_m2(self.bssid, self.mac, self.snonce, self.kck, self.next_sc()))
 
     def handle_m3(self, pkt, ek):

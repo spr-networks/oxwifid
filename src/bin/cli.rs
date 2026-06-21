@@ -32,9 +32,14 @@ fn main() {
     let mut ping = false;
     let mut sae = false;
     let mut hnp = false;
+    let mut owe = false;
+    let mut ocv = false;
     let mut gw_mac = mac_to_bytes("02:00:00:00:00:00");
     let mut src_ip = [10, 10, 10, 2];
     let mut gw_ip = [10, 10, 10, 1];
+    let mut mode = "stdio".to_string();
+    let mut iface = "wlan0".to_string();
+    let mut channel: u8 = 1;
 
     let mut i = 1;
     while i < args.len() {
@@ -52,6 +57,11 @@ fn main() {
                 sae = true;
                 hnp = true;
             }
+            "--owe" => owe = true,
+            "--ocv" => ocv = true,
+            "--mode" => mode = next(i),
+            "--iface" => iface = next(i),
+            "--channel" => channel = next(i).parse().unwrap_or(1),
             _ => {}
         }
         i += 1;
@@ -70,7 +80,37 @@ fn main() {
     if hnp {
         client.use_hunting_pecking();
     }
+    if owe {
+        client.enable_owe();
+    }
+    if ocv {
+        client.enable_ocv();
+    }
     let ping_cfg = if ping { Some((gw_mac, src_ip, gw_ip)) } else { None };
     let node = ClientNode::new(client, Duration::from_millis(20), ping_cfg);
-    raw_frames::run(node, StdioLink::new());
+    match mode.as_str() {
+        "stdio" => raw_frames::run(node, StdioLink::new()),
+        "iface" => run_iface(node, &iface, channel),
+        other => {
+            eprintln!("unknown mode {other:?} (use stdio or iface)");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_iface(node: ClientNode, iface: &str, channel: u8) {
+    match raw_frames::IfaceLink::open(iface, channel) {
+        Ok(link) => raw_frames::run(node, link),
+        Err(e) => {
+            eprintln!("failed to open iface {iface}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_iface(_node: ClientNode, _iface: &str, _channel: u8) {
+    eprintln!("iface mode is only supported on Linux; use --mode stdio");
+    std::process::exit(1);
 }

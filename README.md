@@ -27,10 +27,20 @@ are missing.
 
 ## Running
 
+Configuration comes from a JSON config file (`--config`), with CLI flags as
+overrides:
+
 ```
-barely-ap [--ssid NAME] [--psk PASS] [--mac AA:BB:CC:DD:EE:FF]
-          [--channel N] [--ip 10.10.10.1] [--mode stdio|iface] [--iface wlanN]
+barely-ap --config barely-ap.json
+barely-ap [--config FILE.json] [--ssid NAME] [--psk PASS] [--mac AA:BB:CC:DD:EE:FF]
+          [--channel N] [--ip 10.10.10.1] [--mode stdio|iface|netlink] [--iface wlanN]
+          [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--band6] [--per-sta-vif]
 ```
+
+The config file (see `barely-ap.example.json`) sets `ssid`, `passphrase`,
+`key_mgmt` (`psk`/`sae`/`sae-transition`/`owe`), `channel`, `interface`, `mode`,
+`mac`, `ip`, and the feature toggles `ocv`, `btm`, `rnr`, `band6`, `per_sta_vif`.
+Unknown keys and type mismatches are hard errors. See [`src/config.rs`](src/config.rs).
 
 ### stdio mode (default, all platforms)
 
@@ -158,9 +168,15 @@ Built to be accepted by a real WPA3 station:
 - **Dragonfly** commit/confirm over Authentication frames → PMK.
 - **SHA-256 4-way handshake** — `KDF-SHA256` PTK, `HMAC-SHA256-128` EAPOL MIC,
   Key Descriptor Version 0.
-- **PMF / 802.11w** — RSN advertises MFPR|MFPC + **BIP-CMAC-128** group-mgmt
-  cipher, an **RSNXE** advertises H2E, message 3 delivers the **IGTK**, and
-  group-addressed robust management frames carry a BIP **Management MIC Element**.
+- **PMF / 802.11w (enforced, not just advertised)** — RSN advertises MFPR|MFPC +
+  **BIP-CMAC-128** group-mgmt cipher, an **RSNXE** advertises H2E, message 3
+  delivers the **IGTK**. Robust management frames are protected (CCMP for
+  unicast, BIP **Management MIC Element** for group), and enforcement is real:
+  - a PMF STA/AP **drops spoofed unprotected** Deauth/Disassoc/Action frames and
+    acts only on BIP-valid (group) or CCMP-valid (unicast) ones;
+  - the AP runs **SA Query** — a (re)association request from an already-PMF-
+    associated STA is rejected with **status 30** + a protected SA Query and the
+    live session is preserved, instead of being torn down by a spoofed frame.
 
 ### Verification — anchored to standards *and* an independent implementation
 
@@ -182,10 +198,138 @@ independent implementation:
 - **PMF** (`tests/sae_handshake.rs`): after SAE the STA installs the AP's IGTK
   and accepts a BIP-protected group deauth (and rejects a tampered one); a wrong
   password fails to associate.
+- **PMF enforcement** (`tests/pmf.rs`): spoofed *unprotected* deauth/disassoc
+  (broadcast and unicast) and a forged-key BIP frame are ignored while the
+  session stays up; a valid BIP (group) or CCMP (unicast) deauth disconnects; a
+  spoofed unprotected (re)assoc request triggers SA Query (status 30 + protected
+  SA Query) and preserves the session; the AP drops unprotected robust mgmt and
+  tears down only on a valid CCMP-protected deauth. A WPA2 control case shows the
+  non-PMF AP restarts (no SA Query), confirming the PMF path is what changes it.
 
-Remaining scope limits: group 19 only (not 20/21/FFC), and real
-`wpa_supplicant`/hwsim interop isn't run on this host (macOS) — the independent
-Python implementation stands in for that cross-check.
+## Verified against real hostapd & wpa_supplicant (mac80211_hwsim)
+
+Every combination below was run on Linux with `mac80211_hwsim` radios against
+**real hostapd / wpa_supplicant v2.10**, completing the full handshake with data
+flowing (ICMP ping replies through the AP's fakenet):
+
+| direction | WPA2 | WPA3-SAE | OWE |
+|---|---|---|---|
+| Rust client → hostapd (2.4 / 5 GHz) | ✅ | ✅ | ✅ |
+| Rust AP ← wpa_supplicant (2.4 / 5 GHz) | ✅ | ✅ | ✅ |
+
+The AP also serves **multiple simultaneous clients** (verified with two
+wpa_supplicant stations, WPA2 + WPA3).
+
+**NAN USD** interoperates with wpa_supplicant v2.12's NAN Discovery Engine both
+ways: the Rust subscriber discovers a wpa_supplicant publish, and wpa_supplicant
+discovers a Rust publish (`NAN-DISCOVERY-RESULT`), service IDs and service info
+matching. The `barely-nan` binary runs the engine on a monitor interface.
+
+This interop pass surfaced eight protocol bugs invisible to the self-consistent
+Rust/Python tests, each now fixed: SAE assoc-req AKM, SAE EAPOL MIC (AES-CMAC),
+m2/m3 RSN echo, m3 RSNXE, OWE bare-X public key, OWE EAPOL MIC (HMAC-SHA256),
+key-data padding (single `0xDD` + zeros), and an OWE beacon mode. The MIC
+algorithm is selected per-AKM via `dot11::KeyMic`.
+
+Hwsim ACK note: a userspace monitor-injection endpoint has no vif address for
+mac80211_hwsim to ACK, so an active co-located vif (an `ibss`/`mesh` vif on the
+same phy, holding the channel) supplies the address — that is how the original
+demo's co-located managed vif worked, made channel-stable for newer kernels.
+
+### nl80211 kernel-offload AP (`--mode netlink`)
+
+The netlink mode is a real nl80211 AP that offloads beaconing and data-plane
+CCMP to the kernel (`START_AP` + `NEW_KEY`), while the 4-way handshake stays in
+`Ap`. The full handshake is verified end-to-end against `wpa_supplicant`
+(`wpa_state=COMPLETED`): two-step station add (the hostapd "UNASSOC_STA
+workaround"), 4-way over the nl80211 control port, PTK/GTK install, authorize,
+and CCMP data both directions (**ping works**, STA in a netns). See
+`tools/hwsim/README.md`.
+
+Verified to scale and recover: **5 concurrent stations** all reach
+`COMPLETED`/keyed, and a **client that disconnects and rejoins** re-handshakes
+and passes data again. Reliability properties borrowed from hostapd:
+
+- **Separate command vs event netlink sockets** — synchronous commands
+  (`NEW_STATION`/`NEW_KEY`/…) run on their own socket so their ACK read-loop
+  never swallows an async auth/assoc/EAPOL frame on the event socket.
+- **Session restart on (re-)Authentication** — a new Auth drops the station's
+  prior ANonce/keys/association, so a client that left without a deauth the AP
+  could see still re-handshakes cleanly (otherwise the reconnect 4-way fails
+  with a MIC/"wrong key" against stale state). Group key is installed once
+  (BSS-wide), not per-station, so a rejoin doesn't reset the group PN.
+
+#### Per-station VIF / AP_VLAN (`--per-sta-vif`)
+
+hostapd's `per_sta_vif`: each associated station is placed in its own kernel
+`AP_VLAN` interface (`NEW_INTERFACE` iftype AP_VLAN → `SET_STATION` with
+`NL80211_ATTR_STA_VLAN`) and gets its **own GTK** installed on that VLAN, so a
+station cannot read broadcast/multicast addressed to another. Verified on hwsim:
+two stations land on `apvlan1`/`apvlan2` (each its own group key), per-VLAN data
+plane passes traffic (**ping works through the VLAN**), and rejoin recreates the
+VLAN cleanly.
+
+### 6 GHz and 802.11be / MLD
+
+6 GHz is fully implemented and **runs on air on 6 GHz**: HE Capabilities, HE
+Operation (with 6 GHz Operation Information), HE 6 GHz Band Capabilities, 6 GHz
+frequency encoding and a 6 GHz (HE-only) beacon builder, driven by `--band6`.
+With the `--band6` flag the AP beacons on 6 GHz (e.g. channel 37 / 6135 MHz) and
+**Wireshark/`tshark` decodes the beacon** — frequency 6135 MHz, HE Capabilities
+and HE Operation elements — confirming spec-compliant 6 GHz frames.
+
+For 802.11be/MLD, the Basic Multi-Link element (carrying the MLD MAC) and EHT
+Capabilities element are implemented and tested. The **Reduced Neighbor Report**
+(`--rnr`) — how a 2.4/5 GHz AP advertises its co-located 6 GHz / MLD affiliated
+AP for out-of-band discovery — is implemented and verified on air.
+
+#### Enabling 6 GHz on a signed-regdb kernel
+
+The test kernel sets `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y` and every regdb
+country flags 6 GHz `NO-IR` for AP mode (hostapd refuses it; hostap's own hwsim
+tests `HwsimSkip` 6 GHz). For testing on the *virtual* hwsim radios, the small
+reversible kernel module in `tools/hwsim/hwsim6g/` clears the `NO-IR` flag on
+each hwsim wiphy's 6 GHz channels (`insmod hwsim6g.ko`; reset by reloading
+`mac80211_hwsim`). With it loaded, both hostapd **and** this AP beacon on 6 GHz.
+The full SAE handshake on 6 GHz additionally needs an ACK source for the raw
+monitor-injection path (IBSS/mesh aren't permitted on 6 GHz) — i.e. the
+nl80211 kernel-offload AP extended to SAE; the beacon/HE layer above is verified.
+
+Remaining limits: group 19 only (not 20/21/FFC). Full MLD multi-link operation
+(per-link profiles, multi-link (re)association and key derivation) is a larger
+effort layered on the elements above.
+
+## Standard AP/STA features (hostapd-style)
+
+Beyond the handshakes, these standard features are implemented and tested:
+
+| Feature | What | Test |
+|---|---|---|
+| CCMP replay protection | reject non-increasing packet numbers (PN starts at 1) | `tests/pmf.rs` |
+| EAPOL-Key replay counters | reject replayed/forged 4-way + group messages | (handshake tests) |
+| GTK rekeying | Group Key Handshake (`wpa_group_rekey`): rotate GTK/IGTK | `tests/rekey.rs` |
+| 802.11n HT | HT Capabilities + HT Operation elements | `tests/frame_vectors.rs` |
+| WMM/QoS | WMM Parameter element (default EDCA) | `tests/frame_vectors.rs` |
+| TIM/DTIM | beacon TIM element | `tests/frame_vectors.rs` |
+| PMKSA caching | cache PMK; fast reconnect skipping SAE (`okc`) | `tests/sae_handshake.rs` |
+| Transition mode | mixed WPA2-PSK + WPA3-SAE RSN; accept both | `tests/sae_handshake.rs` |
+| BSS Max Idle / inactivity | advertise max-idle; disassociate idle STAs | `tests/sae_handshake.rs` |
+| Beacon Protection | BIGTK delivery + BIP-protected beacons (`beacon_prot`) | `tests/sae_handshake.rs` |
+
+## More standard features (second batch)
+
+| Feature | What | Test |
+|---|---|---|
+| 802.11ac VHT | VHT Capabilities + Operation (5 GHz) | `tests/frame_vectors.rs` |
+| Extended Capabilities | BTM + Beacon Protection bits | `tests/frame_vectors.rs` |
+| Supported Operating Classes | current operating class element | `tests/frame_vectors.rs` |
+| 802.11k RRM | RRM Enabled Caps + Neighbor Report action | `tests/features2.rs` |
+| 802.11v BTM | BSS Transition Management (steer / disassoc-imminent) | `tests/features2.rs` |
+| OCV | Operating Channel Validation (OCI in 4-way, anti-MITM) | `tests/features2.rs` |
+| OWE | Opportunistic Wireless Encryption (RFC 8110, P-256 DH) | `tests/features2.rs`, `tests/sae_vectors.rs` |
+| 802.11h CSA | Channel Switch Announcement + apply | `tests/features2.rs` |
+| Multiple BSSID | co-located BSS element | `tests/features2.rs` |
+| WNM disassoc-imminent | STA disconnects on protected BTM | `tests/features2.rs` |
 
 ## Relationship to the original
 

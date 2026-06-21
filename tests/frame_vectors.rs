@@ -26,7 +26,7 @@ const FIXED_TS: u64 = 0x0011_2233_4455_6677;
 fn beacon_matches() {
     let v = vectors();
     let f = &v["frames"]["beacon"];
-    let built = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 1, FIXED_TS, &dot11::RSN);
+    let built = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 1, FIXED_TS, &dot11::RSN, b"US");
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
 
@@ -34,7 +34,7 @@ fn beacon_matches() {
 fn beacon_5ghz_matches() {
     let v = vectors();
     let f = &v["frames"]["beacon_5ghz"];
-    let built = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 36, FIXED_TS, &dot11::RSN);
+    let built = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 36, FIXED_TS, &dot11::RSN, b"US");
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
 
@@ -42,8 +42,8 @@ fn beacon_5ghz_matches() {
 fn band_aware_ies_differ_correctly() {
     // 2.4 GHz advertises a DS Parameter Set (id 3) and Extended Rates (id 50);
     // 5 GHz advertises neither and uses an OFDM-only rate set.
-    let ies_24 = dot11::make_beacon_ies(b"x", 6);
-    let ies_5 = dot11::make_beacon_ies(b"x", 36);
+    let ies_24 = dot11::make_beacon_ies(b"x", 6, b"US");
+    let ies_5 = dot11::make_beacon_ies(b"x", 36, b"US");
     assert!(has_ie(&ies_24, 3), "2.4 GHz must carry a DS Parameter Set");
     assert!(has_ie(&ies_24, 50), "2.4 GHz must carry Extended Supported Rates");
     assert!(!has_ie(&ies_5, 3), "5 GHz must not carry a DS Parameter Set");
@@ -53,6 +53,100 @@ fn band_aware_ies_differ_correctly() {
         let mbps2 = r & 0x7f; // strip basic bit
         assert!(![2, 4, 11, 22].contains(&mbps2), "5 GHz must not advertise CCK rate {mbps2}");
     }
+}
+
+#[test]
+fn band6_ies_are_he_only() {
+    // 6 GHz: HE-only. No DSSS (3), HT (45) or VHT (191) elements; instead the HE
+    // Capabilities (ext 35), HE Operation (ext 36) and HE 6 GHz Band
+    // Capabilities (ext 59) elements, plus operating class 131.
+    assert_eq!(dot11::channel_to_freq_6ghz(37), 6135);
+    let ies = dot11::make_beacon_ies_6ghz(b"x", 37, b"US");
+    assert!(!has_ie(&ies, 3), "6 GHz must not carry a DS Parameter Set");
+    assert!(!has_ie(&ies, 45), "6 GHz must not carry HT Capabilities");
+    assert!(!has_ie(&ies, 191), "6 GHz must not carry VHT Capabilities");
+    assert!(has_ext_ie(&ies, 35), "6 GHz must carry HE Capabilities");
+    assert!(has_ext_ie(&ies, 36), "6 GHz must carry HE Operation");
+    assert!(has_ext_ie(&ies, 59), "6 GHz must carry HE 6 GHz Band Capabilities");
+    // operating class 131 (20 MHz 6 GHz)
+    assert_eq!(ie_payload(&ies, 59).unwrap()[0], 131);
+}
+
+#[test]
+fn he_operation_6ghz_encodes_channel_and_present_bit() {
+    let op = dot11::he_operation_6ghz(37);
+    // ext_ie: [255, len, 36, params(3), bsscolor, basicmcs(2), 6ghz-info(5)]
+    assert_eq!(op[0], 255);
+    assert_eq!(op[2], 36, "HE Operation ext id");
+    // HE Operation Parameters byte 2 bit 1 = "6 GHz Operation Information Present"
+    assert_eq!(op[5] & 0x02, 0x02, "6 GHz info present bit must be set");
+    // 6 GHz Operation Information primary channel = 37
+    let info = &op[op.len() - 5..];
+    assert_eq!(info[0], 37, "primary channel");
+    assert_eq!(info[2], 37, "center freq seg0");
+}
+
+#[test]
+fn multi_link_element_carries_mld_mac() {
+    let mld = mac6("02:00:00:00:0a:00");
+    let ml = dot11::multi_link_basic(&mld);
+    // [255, len, 107(ext), control(2)=0x0000, common_len=7, mld_mac(6)]
+    assert_eq!(ml[0], 255);
+    assert_eq!(ml[2], 107, "Multi-Link ext id");
+    assert_eq!(ml[3] & 0x07, 0, "Multi-Link Control Type = Basic");
+    assert_eq!(ml[5], 7, "Common Info length");
+    assert_eq!(&ml[6..12], &mld, "Common Info carries the MLD MAC");
+    // EHT Capabilities present + well-formed
+    let eht = dot11::eht_capabilities();
+    assert_eq!(eht[0], 255);
+    assert_eq!(eht[2], 108, "EHT Capabilities ext id");
+}
+
+#[test]
+fn reduced_neighbor_report_advertises_6ghz_ap() {
+    // A 2.4 GHz beacon advertises a co-located 6 GHz AP via RNR (id 201).
+    let nb = mac6("02:00:00:00:00:06");
+    let rnr = dot11::reduced_neighbor_report(&nb, 131, 37);
+    assert_eq!(rnr[0], 201, "Reduced Neighbor Report element id");
+    let p = ie_payload(&rnr, 201).unwrap();
+    assert_eq!(p[1], 13, "TBTT Information Length");
+    assert_eq!(p[2], 131, "operating class = 6 GHz (131)");
+    assert_eq!(p[3], 37, "channel");
+    assert_eq!(&p[5..11], &nb, "neighbour BSSID");
+}
+
+#[test]
+fn btm_request_round_trips() {
+    // 802.11v BSS Transition Management Request with one preferred candidate.
+    let cand = dot11::neighbor_report_element(&mac6("02:00:00:00:00:09"), 115, 36);
+    let body = dot11::btm_request_body(7, dot11::BTM_REQ_PREF_CAND_LIST, 0, 1, &cand);
+    assert_eq!(body[0], 10, "WNM category");
+    assert_eq!(body[1], 7, "BSS Transition Management Request action");
+    assert_eq!(body[2], 7, "dialog token");
+    assert_eq!(body[3] & 0x01, 0x01, "preferred candidate list bit");
+    assert_eq!(body[6], 1, "validity interval");
+    // candidate list = Neighbor Report element (id 52) carrying the BSSID
+    assert_eq!(body[7], 52, "Neighbor Report element id");
+    assert_eq!(&body[9..15], &mac6("02:00:00:00:00:09"));
+    // a BTM Response (status 0 = accept) parses back
+    let resp = [10u8, 8, 7, 0];
+    assert_eq!(dot11::parse_btm_response(&resp), Some((7, 0)));
+}
+
+/// Find an Element-ID-Extension element (255) with the given extension id.
+fn has_ext_ie(ies: &[u8], ext_id: u8) -> bool {
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let len = ies[i + 1] as usize;
+        if i + 2 + len > ies.len() {
+            break;
+        }
+        if ies[i] == 255 && len >= 1 && ies[i + 2] == ext_id {
+            return true;
+        }
+        i += 2 + len;
+    }
+    false
 }
 
 fn has_ie(ies: &[u8], id: u8) -> bool {
@@ -95,7 +189,7 @@ fn bip_cmac_protect_verify_roundtrip() {
 
 #[test]
 fn wpa3_security_tail_advertises_pmf_and_sae() {
-    let tail = dot11::security_tail(true);
+    let tail = dot11::security_tail(dot11::SecurityMode::Wpa3Sae);
     // RSN element present with AKM = SAE (00-0F-AC:8) and group mgmt = BIP (..:6)
     assert!(has_ie(&tail, 48), "WPA3 must include an RSN element");
     assert!(has_ie(&tail, 0xf4), "WPA3 must include an RSNXE (H2E)");
@@ -107,8 +201,49 @@ fn wpa3_security_tail_advertises_pmf_and_sae() {
     // caps are the 2 bytes after the AKM list; just confirm 0xc0 byte appears
     assert!(rsn.contains(&0xc0), "MFPR|MFPC capability bits set");
     // WPA2 tail has neither RSNXE nor SAE
-    let tail2 = dot11::security_tail(false);
+    let tail2 = dot11::security_tail(dot11::SecurityMode::Wpa2);
     assert!(!has_ie(&tail2, 0xf4));
+}
+
+#[test]
+fn beacon_carries_ht_wmm_tim() {
+    // 802.11n HT (45/61), WMM (221), and a beacon-only TIM (5) must be present.
+    // Beacon/probe-resp IEs begin after the 24-byte MAC header + 12-byte fixed
+    // fields (timestamp 8 + interval 2 + capability 2).
+    let beacon = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 6, 0, &dot11::RSN, b"US");
+    let bies = &beacon[36..];
+    assert!(has_ie(bies, 45), "HT Capabilities element");
+    assert!(has_ie(bies, 61), "HT Operation element");
+    assert!(has_ie(bies, 221), "WMM/WME vendor element");
+    assert!(has_ie(bies, 5), "TIM element (beacon)");
+    assert_eq!(ie_payload(bies, 61).unwrap()[0], 6, "HT Operation primary channel");
+    assert_eq!(&ie_payload(bies, 221).unwrap()[..6], &[0x00, 0x50, 0xf2, 0x02, 0x01, 0x01]);
+
+    // probe responses carry HT + WMM but NOT the beacon-only TIM.
+    let probe = dot11::build_probe_resp(&mac6("02:00:00:00:00:00"), &mac6("02:00:00:00:ab:cd"), b"x", 6, 0, 0, &dot11::RSN, b"US");
+    let pies = &probe[36..];
+    assert!(has_ie(pies, 45) && has_ie(pies, 221));
+    assert!(!has_ie(pies, 5), "probe response must not include a TIM");
+}
+
+#[test]
+fn modern_ies_present() {
+    // 5 GHz beacon advertises VHT (191/192); all advertise Extended Capabilities
+    // (127, with BTM bit 19 + Beacon Protection bit 84), Supported Operating
+    // Classes (59), and RRM Enabled Capabilities (70).
+    let b5 = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"x", 36, 0, &dot11::RSN, b"US");
+    let ies5 = &b5[36..];
+    assert!(has_ie(ies5, 191) && has_ie(ies5, 192), "5 GHz must advertise VHT");
+    let extcap = ie_payload(ies5, 127).unwrap();
+    assert_eq!(extcap.len(), 11);
+    assert!(extcap[2] & 0x08 != 0, "BSS Transition (ext cap bit 19)");
+    assert!(extcap[10] & 0x10 != 0, "Beacon Protection (ext cap bit 84)");
+    assert!(has_ie(ies5, 59), "Supported Operating Classes");
+    assert!(has_ie(ies5, 70), "RRM Enabled Capabilities");
+
+    // 2.4 GHz must NOT advertise VHT.
+    let b24 = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"x", 6, 0, &dot11::RSN, b"US");
+    assert!(!has_ie(&b24[36..], 191), "2.4 GHz must not advertise VHT");
 }
 
 #[test]
@@ -152,6 +287,7 @@ fn probe_resp_matches() {
         FIXED_TS,
         16,
         &dot11::RSN,
+        b"US",
     );
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
@@ -176,6 +312,7 @@ fn assoc_resp_matches() {
         f["aid"].as_u64().unwrap() as u16,
         16,
         dot11::SUBTYPE_ASSOC_RESP,
+        b"US",
     );
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
@@ -185,7 +322,7 @@ fn eapol_m1_matches() {
     let v = vectors();
     let f = &v["frames"]["eapol_m1"];
     let anonce: [u8; 32] = from_hex(f["anonce"].as_str().unwrap()).try_into().unwrap();
-    let built = dot11::build_eapol_m1(&mac6("02:00:00:00:00:00"), &mac6(f["sta"].as_str().unwrap()), &anonce, 32, false);
+    let built = dot11::build_eapol_m1(&mac6("02:00:00:00:00:00"), &mac6(f["sta"].as_str().unwrap()), &anonce, 32, dot11::KeyMic::HmacSha1);
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
 
@@ -197,7 +334,7 @@ fn eapol_m3_matches() {
     let kck = from_hex(f["kck"].as_str().unwrap());
     let kek = from_hex(f["kek"].as_str().unwrap());
     let gtk = from_hex(f["gtk"].as_str().unwrap());
-    let built = dot11::build_eapol_m3(&mac6("02:00:00:00:00:00"), &mac6(f["sta"].as_str().unwrap()), &anonce, &kck, &kek, &gtk, None, 48, false);
+    let built = dot11::build_eapol_m3(&mac6("02:00:00:00:00:00"), &mac6(f["sta"].as_str().unwrap()), &anonce, &kck, &kek, &dot11::RSN, &gtk, None, None, None, 48, dot11::KeyMic::HmacSha1);
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
 

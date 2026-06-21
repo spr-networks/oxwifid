@@ -103,6 +103,11 @@ def driver():
         / Raw(b"barely-ap-ping")
     )
     time.sleep(0.2)
+    # CCMP PN must start at 1 (the reference client.py counts from 0, which a
+    # standards-compliant receiver rejects as a replay).
+    import itertools
+
+    c.client_iv = itertools.count(1)
     c.enc_send(ping)
 
     for _ in range(500):

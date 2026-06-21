@@ -80,7 +80,12 @@ impl Node for ApNode {
         self.beacon_interval
     }
     fn on_tick(&mut self) -> Vec<Vec<u8>> {
-        vec![self.ap.beacon_frame()]
+        // Disassociate stations idle past the advertised BSS Max Idle period
+        // (hostapd `ap_max_inactivity`, default 300 s) — a station that vanishes
+        // without deauthing is otherwise never reaped.
+        let mut frames = vec![self.ap.beacon_frame()];
+        frames.extend(self.ap.prune_idle(Duration::from_secs(300)));
+        frames
     }
     fn on_frame(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
         let out = self.ap.handle_incoming(frame);

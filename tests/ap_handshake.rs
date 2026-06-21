@@ -29,7 +29,12 @@ fn full_handshake_matches_reference() {
     let assoc_req = from_hex(v["incoming"]["assoc_req"]["bytes"].as_str().unwrap());
     let out = ap.handle_incoming(&assoc_req);
     assert_eq!(out.frames.len(), 2, "assoc must yield assoc-resp + m1");
-    assert_eq!(to_hex(&out.frames[0]), v["frames"]["assoc_resp"]["bytes"].as_str().unwrap());
+    // The AP appends a BSS Max Idle Period element, so the reference assoc-resp
+    // is now a prefix of what the AP emits.
+    assert!(
+        to_hex(&out.frames[0]).starts_with(v["frames"]["assoc_resp"]["bytes"].as_str().unwrap()),
+        "assoc response must match the reference (plus the BSS Max Idle element)"
+    );
     assert_eq!(to_hex(&out.frames[1]), v["frames"]["eapol_m1"]["bytes"].as_str().unwrap());
 
     // 2. EAPOL message 2 (valid) -> EAPOL message 3, station associated

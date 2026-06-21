@@ -138,6 +138,144 @@ fn wpa3_sae_hunting_and_pecking_handshake() {
     assert!(ap.is_associated(&mac_to_bytes("02:00:00:00:ab:cd")));
 }
 
+/// Drive a client (WPA2 or WPA3) against a given AP to full association.
+fn drive(ap: &mut Ap, net: &mut FakeNet, sta: &mut Client) {
+    let mut to_client = vec![ap.beacon_frame()];
+    let mut to_ap: Vec<Vec<u8>> = Vec::new();
+    let mut rounds = 0;
+    while sta.connected < 4 && rounds < 50 {
+        rounds += 1;
+        let mut nxt = Vec::new();
+        for f in to_client.drain(..) {
+            nxt.extend(sta.handle_incoming(&f).frames);
+        }
+        to_ap.extend(nxt);
+        let mut nxt2 = Vec::new();
+        for f in to_ap.drain(..) {
+            nxt2.extend(ap_step(ap, net, &f));
+        }
+        to_client.extend(nxt2);
+    }
+}
+
+#[test]
+fn idle_station_is_pruned_with_protected_deauth() {
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut sta = Client::new("turtlenet", "password1234", sta_mac);
+    sta.enable_sae();
+    let (mut ap, _net, mut sta) = run_sae(sta);
+    assert!(ap.is_associated(&sta_mac));
+
+    // Let the station go idle, then prune with a small max-idle.
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let frames = ap.prune_idle(std::time::Duration::from_millis(5));
+    assert_eq!(frames.len(), 1, "idle PMF station must be deauthed");
+    assert!(!ap.is_associated(&sta_mac), "idle station must be removed");
+
+    // The deauth is CCMP-protected (PMF), so the STA accepts it and disconnects.
+    sta.handle_incoming(&frames[0]);
+    assert_eq!(sta.connected, 0, "STA honours the protected inactivity deauth");
+}
+
+#[test]
+fn pmksa_caching_fast_reconnect_skips_sae() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut sta = Client::new("turtlenet", "password1234", sta_mac);
+    sta.enable_sae();
+    let (mut ap, mut net, mut sta) = run_sae(sta);
+    assert_eq!(sta.connected, 4);
+    let tk = ap.station_tk(&sta_mac).unwrap();
+
+    // Tear the link down on both sides (caches are retained).
+    let d2sta = ap.protected_deauth(&sta_mac, 3).unwrap();
+    sta.handle_incoming(&d2sta);
+    assert_eq!(sta.connected, 0);
+    let mut d2ap = barely_ap::dot11::RADIOTAP_TX.to_vec();
+    d2ap.extend_from_slice(&barely_ap::dot11::build_ccmp_mgmt(
+        barely_ap::dot11::SUBTYPE_DEAUTH, &ap_mac, &sta_mac, &ap_mac, 0x30, 5, 0, &tk, &3u16.to_le_bytes(),
+    ));
+    ap.handle_incoming(&d2ap);
+    assert!(!ap.is_associated(&sta_mac));
+
+    // Reconnect: capture every frame and confirm NO SAE auth is used.
+    let mut all = Vec::new();
+    let mut to_client = vec![ap.beacon_frame()];
+    let mut to_ap: Vec<Vec<u8>> = Vec::new();
+    let mut rounds = 0;
+    while sta.connected < 4 && rounds < 50 {
+        rounds += 1;
+        let mut nxt = Vec::new();
+        for f in to_client.drain(..) {
+            let o = sta.handle_incoming(&f);
+            all.extend(o.frames.clone());
+            nxt.extend(o.frames);
+        }
+        to_ap.extend(nxt);
+        let mut nxt2 = Vec::new();
+        for f in to_ap.drain(..) {
+            let fr = ap_step(&mut ap, &mut net, &f);
+            all.extend(fr.clone());
+            nxt2.extend(fr);
+        }
+        to_client.extend(nxt2);
+    }
+    assert_eq!(sta.connected, 4, "PMKSA fast reconnect must complete the 4-way");
+    assert!(ap.is_associated(&sta_mac));
+
+    for f in &all {
+        let p = barely_ap::dot11::Dot11::parse(barely_ap::dot11::strip_radiotap(f).unwrap()).unwrap();
+        if p.frame_type() == barely_ap::dot11::TYPE_MGMT && p.subtype() == barely_ap::dot11::SUBTYPE_AUTH {
+            if let Some(a) = barely_ap::dot11::parse_auth(&p.body) {
+                assert_ne!(a.algo, barely_ap::dot11::AUTH_ALG_SAE, "PMKSA reconnect must not re-run SAE");
+            }
+        }
+    }
+}
+
+#[test]
+fn beacon_protection_bigtk() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    ap.enable_beacon_protection();
+    let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
+    let mut sta = Client::new("turtlenet", "password1234", sta_mac);
+    sta.enable_sae();
+
+    drive(&mut ap, &mut net, &mut sta);
+    assert_eq!(sta.connected, 4, "handshake completes with beacon protection on");
+
+    // The STA installed the BIGTK delivered in message 3.
+    assert_eq!(sta.bigtk(), Some(ap.bigtk()), "STA installs the BIGTK");
+
+    // A protected beacon from the AP verifies; a tampered one does not.
+    let beacon = ap.beacon_frame();
+    assert!(sta.verify_beacon(&beacon), "valid BIP-protected beacon must verify");
+    let mut bad = beacon.clone();
+    let n = bad.len();
+    bad[n - 30] ^= 0xff;
+    assert!(!sta.verify_beacon(&bad), "tampered beacon must fail BIP verification");
+}
+
+#[test]
+fn transition_mode_accepts_both_wpa2_and_wpa3_clients() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    for use_sae in [false, true] {
+        let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+        let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+        ap.enable_transition();
+        let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
+        let mut sta = Client::new("turtlenet", "password1234", sta_mac);
+        if use_sae {
+            sta.enable_sae();
+        }
+        drive(&mut ap, &mut net, &mut sta);
+        assert_eq!(sta.connected, 4, "transition AP must accept use_sae={use_sae} client");
+        assert!(ap.is_associated(&sta_mac));
+    }
+}
+
 #[test]
 fn wrong_password_sae_fails_to_associate() {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");

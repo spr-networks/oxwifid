@@ -133,6 +133,23 @@ fn full_h2e_exchange_between_two_peers_agrees() {
 }
 
 #[test]
+fn owe_two_parties_derive_the_same_pmk() {
+    // OWE (RFC 8110): the STA and AP independently derive the same PMK/PMKID
+    // from the ephemeral Diffie-Hellman exchange.
+    let (sta_priv, sta_pub) = sae::owe_keypair();
+    let (ap_priv, ap_pub) = sae::owe_keypair();
+    let group = 19;
+    let (sta_pmk, sta_pmkid) = sae::owe_derive(&sta_priv, &ap_pub, &sta_pub, &ap_pub, group).unwrap();
+    let (ap_pmk, ap_pmkid) = sae::owe_derive(&ap_priv, &sta_pub, &sta_pub, &ap_pub, group).unwrap();
+    assert_eq!(to_hex(&sta_pmk), to_hex(&ap_pmk), "OWE PMK agreement");
+    assert_eq!(to_hex(&sta_pmkid), to_hex(&ap_pmkid), "OWE PMKID agreement");
+    // distinct exchanges yield distinct keys
+    let (other_priv, _) = sae::owe_keypair();
+    let (other_pmk, _) = sae::owe_derive(&other_priv, &ap_pub, &sta_pub, &ap_pub, group).unwrap();
+    assert_ne!(to_hex(&sta_pmk), to_hex(&other_pmk));
+}
+
+#[test]
 fn rejects_off_curve_peer_element() {
     let c = Curve::p256();
     let mut sae = Sae::new_h2e(b"byteme", b"mekmitasdigoat", None, &ADDR1, &ADDR2);

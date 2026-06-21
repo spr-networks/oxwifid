@@ -23,7 +23,16 @@ impl IfaceLink {
     /// Open and bind a raw socket to `iface` (which must be in monitor mode) and
     /// pin injected frames to `channel`'s band (frequency / CCK-vs-OFDM / rate).
     pub fn open(iface: &str, channel: u8) -> io::Result<IfaceLink> {
-        let tx_radiotap = dot11::build_radiotap_tx(channel);
+        Self::open_band(iface, channel, false)
+    }
+
+    /// Open with explicit band selection (`band6` = 6 GHz channel numbering).
+    pub fn open_band(iface: &str, channel: u8, band6: bool) -> io::Result<IfaceLink> {
+        let tx_radiotap = if band6 {
+            dot11::build_radiotap_tx_6ghz(channel)
+        } else {
+            dot11::build_radiotap_tx(channel)
+        };
         unsafe {
             let proto = (libc::ETH_P_ALL as u16).to_be() as i32;
             let fd = libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto);

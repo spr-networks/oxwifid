@@ -13,63 +13,62 @@
 use std::time::Duration;
 
 use barely_ap::ap::Ap;
+use barely_ap::config::{parse_ip, Config, KeyMgmt};
 use barely_ap::fakenet::FakeNet;
 use barely_ap::raw_frames::{self, ApNode, StdioLink};
 use barely_ap::util::mac_to_bytes;
 
-struct Config {
-    ssid: String,
-    psk: String,
-    mac: [u8; 6],
-    channel: u8,
-    ip: [u8; 4],
-    mode: String,
-    iface: String,
-    sae: bool,
-}
+/// Build the configuration: start from defaults, load `--config FILE` (JSON) if
+/// given, then apply any CLI flags as overrides (so flags win over the file).
+fn parse_args() -> Config {
+    let args: Vec<String> = std::env::args().collect();
+    let next = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
 
-fn parse_ip(s: &str) -> [u8; 4] {
-    let mut out = [0u8; 4];
-    for (i, part) in s.split('.').enumerate() {
-        if i < 4 {
-            out[i] = part.parse().unwrap_or(0);
+    let mut cfg = Config::default();
+    // First pass: load the config file so CLI flags can override it.
+    for i in 1..args.len() {
+        if args[i] == "--config" {
+            let path = next(i);
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                eprintln!("barely-ap: cannot read config {path:?}: {e}");
+                std::process::exit(1);
+            });
+            cfg = Config::from_json(&text).unwrap_or_else(|e| {
+                eprintln!("barely-ap: {path}: {e}");
+                std::process::exit(1);
+            });
         }
     }
-    out
-}
 
-fn parse_args() -> Config {
-    let mut cfg = Config {
-        ssid: "turtlenet".to_string(),
-        psk: "password1234".to_string(),
-        mac: mac_to_bytes("02:00:00:00:00:00"),
-        channel: 1,
-        ip: [10, 10, 10, 1],
-        mode: "stdio".to_string(),
-        iface: "wlan0".to_string(),
-        sae: false,
-    };
-    let args: Vec<String> = std::env::args().collect();
+    // Second pass: CLI overrides.
     let mut i = 1;
     while i < args.len() {
-        let next = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
         match args[i].as_str() {
+            "--config" => i += 1, // already handled
             "--ssid" => cfg.ssid = next(i),
-            "--psk" => cfg.psk = next(i),
+            "--psk" => cfg.passphrase = next(i),
             "--mac" => cfg.mac = mac_to_bytes(&next(i)),
-            "--channel" => cfg.channel = next(i).parse().unwrap_or(1),
-            "--ip" => cfg.ip = parse_ip(&next(i)),
+            "--channel" => cfg.channel = next(i).parse().unwrap_or(cfg.channel),
+            "--ip" => cfg.ip = parse_ip(&next(i)).unwrap_or(cfg.ip),
             "--mode" => cfg.mode = next(i),
             "--iface" => cfg.iface = next(i),
-            "--sae" => cfg.sae = true,
+            "--sae" => cfg.key_mgmt = KeyMgmt::Sae,
+            "--owe" => cfg.key_mgmt = KeyMgmt::Owe,
+            "--transition" => cfg.key_mgmt = KeyMgmt::SaeTransition,
+            "--ocv" => cfg.ocv = true,
+            "--btm" => cfg.btm = true,
+            "--rnr" => cfg.rnr = true,
+            "--band6" => cfg.band6 = true,
+            "--per-sta-vif" => cfg.per_sta_vif = true,
             "-h" | "--help" => {
-                eprintln!("barely-ap [--ssid NAME] [--psk PASS] [--mac MAC] [--channel N] [--ip IP] [--mode stdio|iface] [--iface NAME]");
+                eprintln!("barely-ap [--config FILE.json] [--ssid NAME] [--psk PASS] [--mac MAC]");
+                eprintln!("          [--channel N] [--ip IP] [--mode stdio|iface|netlink] [--iface NAME]");
+                eprintln!("          [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--band6] [--per-sta-vif]");
                 std::process::exit(0);
             }
             other => {
                 if i == 1 && !other.starts_with('-') {
-                    // positional ssid
-                    cfg.ssid = other.to_string();
+                    cfg.ssid = other.to_string(); // positional ssid
                 }
             }
         }
@@ -80,13 +79,16 @@ fn parse_args() -> Config {
 
 fn main() {
     let cfg = parse_args();
-    let mut ap = Ap::new(&cfg.ssid, &cfg.psk, cfg.mac, cfg.channel);
-    if cfg.sae {
-        ap.enable_sae();
-    }
+    let ap = cfg.build_ap();
     let net = FakeNet::new(cfg.mac, cfg.ip);
     let beacon_interval = Duration::from_millis(50);
 
+    let security = match cfg.key_mgmt {
+        KeyMgmt::Psk => "WPA2-PSK",
+        KeyMgmt::Sae => "WPA3-SAE",
+        KeyMgmt::SaeTransition => "WPA3-SAE/WPA2 transition",
+        KeyMgmt::Owe => "OWE",
+    };
     eprintln!(
         "barely-ap: ssid={:?} channel={} mac={} ip={}.{}.{}.{} mode={} {}",
         cfg.ssid,
@@ -97,22 +99,27 @@ fn main() {
         cfg.ip[2],
         cfg.ip[3],
         cfg.mode,
-        if cfg.sae { "WPA3-SAE" } else { "WPA2-PSK" },
+        security,
     );
+
+    let channel = cfg.channel;
+    // The nl80211/"netlink" mode offloads beaconing + data-plane CCMP to the
+    // kernel, so it drives the bare `Ap` (no userspace frame/event loop).
+    if cfg.mode == "netlink" {
+        run_netlink(ap, &cfg.iface, channel);
+        return;
+    }
 
     let node = ApNode {
         ap,
         net,
         beacon_interval,
     };
-
-    let channel = cfg.channel;
     match cfg.mode.as_str() {
         "stdio" => {
             raw_frames::run(node, StdioLink::new());
         }
-        "iface" => run_iface(node, &cfg.iface, channel),
-        "netlink" => run_netlink(node, &cfg.iface, channel),
+        "iface" => run_iface(node, &cfg.iface, channel, cfg.band6),
         other => {
             eprintln!("unknown mode {other:?} (use stdio, iface, or netlink)");
             std::process::exit(1);
@@ -121,8 +128,8 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-fn run_iface(node: ApNode, iface: &str, channel: u8) {
-    match raw_frames::IfaceLink::open(iface, channel) {
+fn run_iface(node: ApNode, iface: &str, channel: u8, band6: bool) {
+    match raw_frames::IfaceLink::open_band(iface, channel, band6) {
         Ok(link) => raw_frames::run(node, link),
         Err(e) => {
             eprintln!("failed to open iface {iface}: {e}");
@@ -132,24 +139,21 @@ fn run_iface(node: ApNode, iface: &str, channel: u8) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_iface(_node: ApNode, _iface: &str, _channel: u8) {
+fn run_iface(_node: ApNode, _iface: &str, _channel: u8, _band6: bool) {
     eprintln!("iface mode is only supported on Linux; use --mode stdio");
     std::process::exit(1);
 }
 
 #[cfg(target_os = "linux")]
-fn run_netlink(node: ApNode, iface: &str, channel: u8) {
-    match barely_ap::netlink::NetlinkLink::open(iface, channel) {
-        Ok(link) => raw_frames::run(node, link),
-        Err(e) => {
-            eprintln!("failed to open nl80211 on {iface}: {e}");
-            std::process::exit(1);
-        }
+fn run_netlink(ap: Ap, iface: &str, channel: u8) {
+    if let Err(e) = barely_ap::netlink::run_offload_ap(ap, iface, channel) {
+        eprintln!("netlink AP failed on {iface}: {e}");
+        std::process::exit(1);
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_netlink(_node: ApNode, _iface: &str, _channel: u8) {
+fn run_netlink(_ap: Ap, _iface: &str, _channel: u8) {
     eprintln!("netlink mode is only supported on Linux; use --mode stdio");
     std::process::exit(1);
 }

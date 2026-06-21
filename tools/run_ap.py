@@ -53,6 +53,13 @@ class _TunShim:
 
 apmod.TunInterface = _TunShim
 
+# CCMP PN must start at 1: ap.py seeds its per-station / group PN counters with
+# itertools.count() (i.e. 0), which a standards-compliant receiver rejects as a
+# replay. Patch the count() used by ap.py to start at 1.
+import itertools as _it  # noqa: E402
+
+apmod.count = lambda: _it.count(1)
+
 AP_MAC = os.environ.get("AP_MAC", "02:00:00:00:00:00")
 
 ap = apmod.AP("turtlenet", "password1234", mac=AP_MAC, mode="stdio", channel=1)

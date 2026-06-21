@@ -239,6 +239,48 @@ impl Curve {
         }
         Some(pt)
     }
+
+    /// Serialize a point in SEC1 compressed form (0x02/0x03 || X), as OWE and
+    /// most EC protocols exchange public keys.
+    pub fn point_to_compressed(&self, pt: &Point) -> Option<Vec<u8>> {
+        match pt {
+            Point::Infinity => None,
+            Point::Affine(x, y) => {
+                let mut out = Vec::with_capacity(1 + PRIME_LEN);
+                out.push(if y.bit(0) { 0x03 } else { 0x02 });
+                out.extend_from_slice(&scalar_pad(x, PRIME_LEN));
+                Some(out)
+            }
+        }
+    }
+
+    /// Parse a SEC1 compressed point (0x02/0x03 || X), recovering Y. P-256 has
+    /// p ≡ 3 (mod 4), so the square root is `v^((p+1)/4) mod p`.
+    pub fn point_from_compressed(&self, data: &[u8]) -> Option<Point> {
+        if data.len() != 1 + PRIME_LEN || (data[0] != 0x02 && data[0] != 0x03) {
+            return None;
+        }
+        let x = BigUint::from_bytes_be(&data[1..]);
+        if x >= self.p {
+            return None;
+        }
+        let p = &self.p;
+        // rhs = x^3 + a*x + b mod p
+        let rhs = (&x * &x % p * &x % p + &self.a * &x % p + &self.b) % p;
+        let exp = (p + BigUint::one()) >> 2; // (p+1)/4
+        let mut y = rhs.modpow(&exp, p);
+        if &y * &y % p != rhs {
+            return None; // x is not on the curve
+        }
+        if y.bit(0) != (data[0] == 0x03) {
+            y = p - &y;
+        }
+        let pt = Point::Affine(x, y);
+        if !self.on_curve(&pt) {
+            return None;
+        }
+        Some(pt)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,19 +377,27 @@ pub fn derive_pwe_hunting_pecking(c: &Curve, password: &[u8], addr1: &[u8; 6], a
     salt[6..].copy_from_slice(&min);
     let prime_bytes = scalar_pad(&c.p, PRIME_LEN);
 
+    // Run a FIXED number of iterations regardless of when (or whether) a valid
+    // PWE is found: perform the quadratic-residue test every iteration and never
+    // break early. This removes the Dragonblood (CVE-2019-9494) timing/cache
+    // oracle — the loop's running time no longer depends on which counter first
+    // yields a valid point, i.e. on the password. 40 iterations leaves only a
+    // ~2^-40 chance of not finding a PWE, and the *first* valid counter is still
+    // the one selected, so the derived PWE is unchanged.
+    const ITERATIONS: u8 = 40;
     let mut found: Option<(BigUint, bool)> = None;
-    for counter in 1u8..=200 {
+    for counter in 1u8..=ITERATIONS {
         // pwd-seed = HMAC-SHA256(MAX||MIN, password || counter)
         let pwd_seed = hmac_sha256(&salt, &[password, &[counter]]);
         // pwd-value = KDF-256(pwd-seed, "SAE Hunting and Pecking", p)
         let pwd_value = sha256_prf(&pwd_seed, b"SAE Hunting and Pecking", &prime_bytes, PRIME_LEN);
         let x = BigUint::from_bytes_be(&pwd_value);
-        if x < c.p {
-            let y2 = c.y_sqr(&x);
-            if c.is_quadratic_residue(&y2) {
-                found = Some((x, pwd_seed[31] & 0x01 == 1));
-                break;
-            }
+        // Always run the QR test (on a fixed in-range dummy when x >= p) so the
+        // expensive modular exponentiation happens every iteration.
+        let cand = if x < c.p { x.clone() } else { BigUint::one() };
+        let is_pwe = x < c.p && c.is_quadratic_residue(&c.y_sqr(&cand));
+        if is_pwe && found.is_none() {
+            found = Some((x, pwd_seed[31] & 0x01 == 1));
         }
     }
 
@@ -474,6 +524,13 @@ impl Sae {
         Ok(())
     }
 
+    /// True if the peer's commit reflects our own scalar AND element — an SAE
+    /// reflection attack (IEEE 802.11 12.4.5.4). Call after `prepare_commit`.
+    pub fn is_reflection(&self) -> bool {
+        self.peer_scalar.as_ref() == Some(&self.commit_scalar)
+            && self.peer_element.as_ref() == Some(&self.commit_element)
+    }
+
     /// Compute the shared secret and derive KCK/PMK/PMKID.
     pub fn process_commit(&mut self) -> Result<(), SaeError> {
         let peer_scalar = self.peer_scalar.clone().ok_or(SaeError::NotReady)?;
@@ -593,6 +650,72 @@ impl Sae {
 /// Modular inverse mod n (n prime), via Fermat.
 pub fn mod_inverse(a: &BigUint, n: &BigUint) -> BigUint {
     (a % n).modpow(&(n - 2u32), n)
+}
+
+// ---------------------------------------------------------------------------
+// OWE - Opportunistic Wireless Encryption (RFC 8110), group 19
+// ---------------------------------------------------------------------------
+
+/// The P-256 base point G.
+pub fn generator() -> Point {
+    Point::Affine(
+        bn("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"),
+        bn("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"),
+    )
+}
+
+/// Generate an OWE Diffie-Hellman key pair: private scalar and public key as the
+/// bare X-coordinate (`prime_len` bytes). OWE (and hostapd) exchange only X; the
+/// receiver recovers a Y, and the ECDH shared X is independent of Y's parity.
+pub fn owe_keypair() -> (BigUint, Vec<u8>) {
+    let curve = Curve::p256();
+    let priv_k = rand_scalar(&curve.n);
+    let pubk = curve.scalar_mul(&priv_k, &generator());
+    let x = match pubk {
+        Point::Affine(x, _) => scalar_pad(&x, PRIME_LEN),
+        Point::Infinity => unreachable!("k*G is finite for k in [1,n)"),
+    };
+    (priv_k, x)
+}
+
+/// Reconstruct a curve point from a bare X-coordinate (recovering an even Y).
+fn point_from_x(curve: &Curve, x_bytes: &[u8]) -> Option<Point> {
+    let mut compressed = Vec::with_capacity(1 + x_bytes.len());
+    compressed.push(0x02); // even Y; ECDH shared X is parity-independent
+    compressed.extend_from_slice(x_bytes);
+    curve.point_from_compressed(&compressed)
+}
+
+/// Derive the OWE PMK and PMKID (RFC 8110 §4.4). `sta_pub`/`ap_pub` are the
+/// public keys as exchanged (bare X-coordinates); `peer_pub_bytes` is the
+/// *other* party's X. Both sides compute the same result.
+pub fn owe_derive(priv_k: &BigUint, peer_pub_bytes: &[u8], sta_pub: &[u8], ap_pub: &[u8], group: u16) -> Option<([u8; 32], [u8; 16])> {
+    let curve = Curve::p256();
+    let peer_pub = point_from_x(&curve, peer_pub_bytes)?;
+    let shared = curve.scalar_mul(priv_k, &peer_pub);
+    let z = match shared {
+        Point::Affine(x, _) => scalar_pad(&x, PRIME_LEN),
+        Point::Infinity => return None,
+    };
+    // prk = HKDF-Extract(C | A | group, z)  (C = STA pubkey, A = AP pubkey)
+    let mut salt = Vec::new();
+    salt.extend_from_slice(sta_pub);
+    salt.extend_from_slice(ap_pub);
+    salt.extend_from_slice(&group.to_le_bytes());
+    let prk = hkdf_extract(&salt, &[&z]);
+    // PMK = HKDF-Expand(prk, "OWE Key Generation", 32)
+    let pmk_v = hkdf_expand(&prk, b"OWE Key Generation", 32);
+    // PMKID = Truncate-128(SHA-256(C | A))
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(sta_pub);
+    hasher.update(ap_pub);
+    let digest = hasher.finalize();
+    let mut pmk = [0u8; 32];
+    pmk.copy_from_slice(&pmk_v);
+    let mut pmkid = [0u8; 16];
+    pmkid.copy_from_slice(&digest[..16]);
+    Some((pmk, pmkid))
 }
 
 /// Left-pad a scalar to `len` bytes, big-endian.

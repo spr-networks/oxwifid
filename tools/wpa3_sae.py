@@ -285,7 +285,15 @@ def derive_ptk_sha256(pmk, aa, spa, anonce, snonce):
 
 
 def eapol_mic_sha256(kck, frame):
-    return hmac.new(kck, frame, hashlib.sha256).digest()[:16]
+    # WPA3-SAE (AKM 00-0F-AC:8, Key Descriptor Version 0) computes the EAPOL-Key
+    # MIC with AES-128-CMAC over the frame, NOT HMAC-SHA-256. (hostapd: "EAPOL-Key
+    # MIC using AES-CMAC (AKM-defined - SAE)".)
+    from cryptography.hazmat.primitives import cmac
+    from cryptography.hazmat.primitives.ciphers import algorithms
+
+    c = cmac.CMAC(algorithms.AES(bytes(kck)))
+    c.update(bytes(frame))
+    return c.finalize()[:16]
 
 
 # ---------------------------------------------------------------------------

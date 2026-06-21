@@ -40,6 +40,11 @@ pub struct Client {
     gtk: [u8; 16],
     sc: i32,
     client_pn: u64,
+    /// Replay protection: highest received pairwise / group CCMP packet numbers,
+    /// and the highest EAPOL-Key replay counter seen from the AP.
+    last_rx_pn: u64,
+    last_rx_gpn: u64,
+    eapol_replay: u64,
     test_snonce: Option<[u8; 32]>,
     // WPA3-SAE
     password: Vec<u8>,
@@ -50,6 +55,19 @@ pub struct Client {
     sae_pmk: Option<[u8; 32]>,
     /// IGTK installed from EAPOL message 3 (PMF), for BIP verification.
     igtk: Option<[u8; 16]>,
+    /// BIGTK installed from EAPOL message 3 (Beacon Protection).
+    bigtk: Option<[u8; 16]>,
+    /// PMKSA cache for fast reconnect (bssid, PMKID, PMK).
+    cached_pmksa: Option<([u8; 6], [u8; 16], [u8; 32])>,
+    pmksa_reconnect: bool,
+    /// Operating Channel Validation: include + validate the OCI.
+    ocv: bool,
+    /// Operating channel (learned from the beacon's DS Parameter Set).
+    channel: u8,
+    /// OWE (Opportunistic Wireless Encryption) state.
+    owe: bool,
+    owe_priv: Option<num_bigint::BigUint>,
+    owe_pub: Option<Vec<u8>>,
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -75,7 +93,10 @@ impl Client {
             tk: [0; 16],
             gtk: [0; 16],
             sc: 0,
-            client_pn: 0,
+            client_pn: 1,
+            last_rx_pn: 0,
+            last_rx_gpn: 0,
+            eapol_replay: 0,
             test_snonce: None,
             password: psk.as_bytes().to_vec(),
             sae_enabled: false,
@@ -83,7 +104,26 @@ impl Client {
             sae: None,
             sae_pmk: None,
             igtk: None,
+            bigtk: None,
+            cached_pmksa: None,
+            pmksa_reconnect: false,
+            ocv: false,
+            channel: 1,
+            owe: false,
+            owe_priv: None,
+            owe_pub: None,
         }
+    }
+
+    /// Enable Operating Channel Validation (anti-MITM).
+    pub fn enable_ocv(&mut self) {
+        self.ocv = true;
+    }
+
+    /// Enable OWE (Opportunistic Wireless Encryption): connect to an open BSS
+    /// with a Diffie-Hellman exchange that keys the 4-way handshake.
+    pub fn enable_owe(&mut self) {
+        self.owe = true;
     }
 
     /// Use WPA3-SAE (H2E by default) instead of open-system auth + PSK.
@@ -144,6 +184,25 @@ impl Client {
             let bssid = frame.addr2;
             self.bssid = Some(bssid);
             self.connected = 1;
+            // Learn the operating channel from the DS Parameter Set (for OCV).
+            if frame.body.len() > 12 {
+                if let Some(ds) = dot11::find_ie(&frame.body[12..], 3) {
+                    if !ds.is_empty() {
+                        self.channel = ds[0];
+                    }
+                }
+            }
+            // PMKSA caching fast reconnect: if we have a cached PMKSA for this
+            // BSS, do open-system auth and restore the cached PMK (no SAE).
+            if let Some((cbssid, _pmkid, pmk)) = self.cached_pmksa {
+                if cbssid == bssid {
+                    self.sae_pmk = Some(pmk);
+                    self.pmksa_reconnect = true;
+                    let sc = self.next_sc();
+                    out.tx(dot11::build_auth_req(&bssid, &self.mac, sc));
+                    return out;
+                }
+            }
             if self.sae_enabled {
                 self.start_sae(&bssid, &mut out);
             } else {
@@ -166,12 +225,37 @@ impl Client {
             self.bssid = Some(bssid);
             let sc = self.next_sc();
             let ssid = self.ssid.clone();
+            if self.pmksa_reconnect {
+                if let Some((_, pmkid, _)) = self.cached_pmksa {
+                    out.tx(dot11::build_assoc_req_pmkid(&bssid, &self.mac, &ssid, &pmkid, sc));
+                    return out;
+                }
+            }
+            if self.owe {
+                // OWE: generate an ephemeral DH key and send it in the assoc req.
+                let (priv_k, pub_b) = crate::sae::owe_keypair();
+                let dh = dot11::build_dh_param_element(19, &pub_b);
+                self.owe_priv = Some(priv_k);
+                self.owe_pub = Some(pub_b);
+                out.tx(dot11::build_assoc_req_owe(&bssid, &self.mac, &ssid, &dh, sc));
+                return out;
+            }
             out.tx(dot11::build_assoc_req(&bssid, &self.mac, &ssid, sc));
             return out;
         }
 
         // Association response
         if self.connected == 1 && is_mgmt && frame.subtype() == dot11::SUBTYPE_ASSOC_RESP {
+            // OWE: derive the PMK from the AP's DH Parameter element.
+            if self.owe && frame.body.len() > 6 {
+                if let (Some(priv_k), Some(own_pub)) = (self.owe_priv.clone(), self.owe_pub.clone()) {
+                    if let Some((group, ap_pub)) = dot11::parse_dh_param(&frame.body[6..]) {
+                        if let Some((pmk, _pmkid)) = crate::sae::owe_derive(&priv_k, &ap_pub, &own_pub, &ap_pub, group) {
+                            self.sae_pmk = Some(pmk);
+                        }
+                    }
+                }
+            }
             self.connected = 2;
             return out;
         }
@@ -180,6 +264,16 @@ impl Client {
         if self.connected > 1 && frame.is_eapol() {
             if !frame.from_ds() || frame.addr1 != self.mac {
                 return out;
+            }
+            // Group Key Handshake message 1 (GTK rekey) — a group (non-pairwise)
+            // EAPOL-Key with Key Ack set, sent after association.
+            if self.connected >= 4 {
+                if let Some(ek) = frame.eapol_key_body().and_then(dot11::EapolKey::parse) {
+                    if !ek.is_pairwise() && ek.key_ack() {
+                        self.handle_group_rekey(&frame, &ek, &mut out);
+                        return out;
+                    }
+                }
             }
             if self.eapol_state == 0 {
                 self.send_eapol2(&frame, &mut out);
@@ -193,7 +287,18 @@ impl Client {
         if self.connected > 3 && frame.frame_type() == dot11::TYPE_DATA && frame.protected() && frame.from_ds() {
             let key_id = frame.ccmp_key_id();
             let tk = if key_id == 1 { self.gtk } else { self.tk };
+            let Some(pn) = frame.ccmp_pn() else { return out };
+            // CCMP replay protection (separate counters for pairwise and group).
+            let last = if key_id == 1 { self.last_rx_gpn } else { self.last_rx_pn };
+            if pn <= last {
+                return out; // replayed frame
+            }
             if let Some(eth) = dot11::decrypt_ccmp(&frame, &tk, true) {
+                if key_id == 1 {
+                    self.last_rx_gpn = pn;
+                } else {
+                    self.last_rx_pn = pn;
+                }
                 out.to_network.push(eth);
             }
         }
@@ -215,6 +320,13 @@ impl Client {
                 return;
             }
             if let Some(plain) = dot11::decrypt_ccmp_mgmt(frame, &self.tk) {
+                // 802.11v BTM request: disassociate on disassoc-imminent.
+                if plain.len() >= 4 && plain[0] == dot11::ACTION_CATEGORY_WNM && plain[1] == dot11::WNM_BTM_REQUEST {
+                    if plain[3] & 0x04 != 0 {
+                        self.disconnect();
+                    }
+                    return;
+                }
                 if let Some((action, trans_id)) = dot11::parse_sa_query(&plain) {
                     if action == dot11::SA_QUERY_REQUEST {
                         if let Some(bssid) = self.bssid {
@@ -241,6 +353,50 @@ impl Client {
         if accept {
             self.disconnect();
         }
+    }
+
+    /// Handle Group Key Handshake message 1: verify, install the new GTK/IGTK,
+    /// and reply with message 2.
+    fn handle_group_rekey(&mut self, frame: &dot11::Dot11, ek: &dot11::EapolKey, out: &mut ClientOut) {
+        let Some(bssid) = self.bssid else { return };
+        let Some(eapol_frame) = frame.eapol_frame() else { return };
+        let sha256 = self.sae_pmk.is_some();
+
+        // verify MIC
+        let mic_off = 4 + ek.mic_offset;
+        if eapol_frame.len() < mic_off + 16 {
+            return;
+        }
+        let mut to_check = eapol_frame.to_vec();
+        for b in to_check[mic_off..mic_off + 16].iter_mut() {
+            *b = 0;
+        }
+        let computed = dot11::KeyMic::select(sha256, self.owe).compute(&self.kck, &to_check).to_vec();
+        if !crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
+            return;
+        }
+        // EAPOL replay-counter check
+        if ek.key_replay_counter <= self.eapol_replay {
+            return;
+        }
+        self.eapol_replay = ek.key_replay_counter;
+
+        // install the new GTK (and IGTK), resetting the group replay counter
+        if let Some(unwrapped) = crypto::aes_unwrap(&self.kek, &ek.key_data) {
+            if let Some(gtk) = dot11::parse_gtk_kde(&unwrapped) {
+                if gtk.len() == 16 {
+                    self.gtk.copy_from_slice(&gtk);
+                    self.last_rx_gpn = 0;
+                }
+            }
+            if let Some((_id, _ipn, igtk)) = dot11::parse_igtk_kde(&unwrapped) {
+                self.igtk = Some(igtk);
+            }
+        }
+
+        let sc = self.next_sc();
+        let kck = self.kck;
+        out.tx(dot11::build_group_key_msg2(&bssid, &self.mac, &kck, ek.key_replay_counter, sc, dot11::KeyMic::select(sha256, self.owe)));
     }
 
     fn disconnect(&mut self) {
@@ -292,16 +448,24 @@ impl Client {
                 if !verified {
                     return;
                 }
-                let pmk = self.sae.as_ref().map(|s| {
+                let pmk_pmkid = self.sae.as_ref().map(|s| {
                     let mut p = [0u8; 32];
                     p.copy_from_slice(&s.pmk);
-                    p
+                    let mut id = [0u8; 16];
+                    id.copy_from_slice(&s.pmkid);
+                    (p, id)
                 });
-                self.sae_pmk = pmk;
+                self.sae_pmk = pmk_pmkid.map(|(p, _)| p);
                 let Some(bssid) = self.bssid else { return };
+                // Cache the PMKSA for fast reconnect.
+                if let Some((pmk, pmkid)) = pmk_pmkid {
+                    self.cached_pmksa = Some((bssid, pmkid, pmk));
+                }
                 let sc = self.next_sc();
                 let ssid = self.ssid.clone();
-                out.tx(dot11::build_assoc_req(&bssid, &self.mac, &ssid, sc));
+                // SAE associations must advertise the SAE AKM, not WPA2-PSK,
+                // otherwise the AP rejects with "Invalid AKMP".
+                out.tx(dot11::build_assoc_req_sae(&bssid, &self.mac, &ssid, sc));
             }
             _ => {}
         }
@@ -312,6 +476,7 @@ impl Client {
         let Some(key_body) = m1.eapol_key_body() else { return };
         let Some(ek) = dot11::EapolKey::parse(key_body) else { return };
 
+        self.eapol_replay = ek.key_replay_counter; // remember m1's replay counter
         self.anonce = ek.key_nonce;
         self.snonce = self.test_snonce.unwrap_or_else(random_bytes::<32>);
 
@@ -330,12 +495,27 @@ impl Client {
             self.kek.copy_from_slice(&ptk[16..32]);
             self.tk.copy_from_slice(&ptk[32..48]);
         }
-        self.client_pn = 0;
+        self.client_pn = 1;
 
         let sc = self.next_sc();
         let kck = self.kck;
         let snonce = self.snonce;
-        out.tx(dot11::build_eapol_m2(&bssid, &self.mac, &snonce, &kck, sc, sha256));
+        let oci = if self.ocv {
+            Some((dot11::operating_class(self.channel), self.channel))
+        } else {
+            None
+        };
+        // m2 must echo the RSN this STA advertised in its assoc request.
+        let supp_rsn: Vec<u8> = if self.owe {
+            dot11::RSN_OWE.to_vec()
+        } else if sha256 {
+            let mut r = dot11::RSN_WPA3.to_vec();
+            r.extend_from_slice(&dot11::RSNXE_H2E);
+            r
+        } else {
+            dot11::RSN.to_vec()
+        };
+        out.tx(dot11::build_eapol_m2(&bssid, &self.mac, &snonce, &kck, &supp_rsn, sc, dot11::KeyMic::select(sha256, self.owe), oci));
         self.eapol_state = 1;
     }
 
@@ -344,6 +524,12 @@ impl Client {
         let Some(eapol_frame) = m3.eapol_frame() else { return };
         let Some(key_body) = m3.eapol_key_body() else { return };
         let Some(ek) = dot11::EapolKey::parse(key_body) else { return };
+
+        // EAPOL-Key replay-counter enforcement: message 3 must use a counter
+        // greater than message 1's. Rejects replayed/forged message 3.
+        if ek.key_replay_counter <= self.eapol_replay {
+            return;
+        }
 
         // verify the AP's MIC over message 3
         let mic_off = 4 + ek.mic_offset;
@@ -355,31 +541,40 @@ impl Client {
             *b = 0;
         }
         let sha256 = self.sae_pmk.is_some();
-        let computed = if sha256 {
-            crypto::hmac_sha256(&self.kck, &to_check)[..16].to_vec()
-        } else {
-            crypto::hmac_sha1(&self.kck, &to_check)[..16].to_vec()
-        };
+        let computed = dot11::KeyMic::select(sha256, self.owe).compute(&self.kck, &to_check).to_vec();
         if !crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
             return; // bad MIC, drop
         }
+        self.eapol_replay = ek.key_replay_counter;
 
-        // unwrap and install the GTK (RSN || GTK-KDE [|| IGTK-KDE] inside the
-        // wrapped key data). The GTK lies 8 bytes into the GTK KDE, which
-        // follows the 22-byte RSN element; a trailing IGTK KDE does not move it.
+        // unwrap and install the GTK by parsing the GTK KDE (the RSN element
+        // that precedes it varies in length: 22 for WPA2, 28+ for SAE/OWE).
         if let Some(unwrapped) = crypto::aes_unwrap(&self.kek, &ek.key_data) {
-            if unwrapped.len() >= 46 {
-                self.gtk.copy_from_slice(&unwrapped[30..46]);
+            if let Some(gtk) = dot11::parse_gtk_kde(&unwrapped) {
+                if gtk.len() == 16 {
+                    self.gtk.copy_from_slice(&gtk);
+                }
             }
-            // Install the IGTK (PMF) if the AP delivered one.
+            // Install the IGTK (PMF) and BIGTK (Beacon Protection) if delivered.
             if let Some((_id, _ipn, igtk)) = dot11::parse_igtk_kde(&unwrapped) {
                 self.igtk = Some(igtk);
+            }
+            if let Some((_id, _ipn, bigtk)) = dot11::parse_bigtk_kde(&unwrapped) {
+                self.bigtk = Some(bigtk);
+            }
+            // Operating Channel Validation: message 3's OCI must match.
+            if self.ocv {
+                let want = (dot11::operating_class(self.channel), self.channel);
+                match dot11::parse_oci_kde(&unwrapped) {
+                    Some(oci) if oci == want => {}
+                    _ => return, // missing or mismatched OCI -> possible MITM, drop
+                }
             }
         }
 
         let sc = self.next_sc();
         let kck = self.kck;
-        out.tx(dot11::build_eapol_m4(&bssid, &self.mac, &kck, sc, sha256));
+        out.tx(dot11::build_eapol_m4(&bssid, &self.mac, &kck, sc, dot11::KeyMic::select(sha256, self.owe)));
         self.connected = 4;
         self.eapol_state = 2;
     }
@@ -448,6 +643,29 @@ impl Client {
     /// The IGTK installed via PMF (EAPOL message 3), if any.
     pub fn igtk(&self) -> Option<[u8; 16]> {
         self.igtk
+    }
+
+    /// The currently installed GTK (test/inspection helper).
+    pub fn gtk(&self) -> [u8; 16] {
+        self.gtk
+    }
+
+    /// The BIGTK installed via Beacon Protection (EAPOL message 3), if any.
+    pub fn bigtk(&self) -> Option<[u8; 16]> {
+        self.bigtk
+    }
+
+    /// Verify a beacon's BIP Management MIC Element against the installed BIGTK
+    /// (Beacon Protection). Returns true if protected and valid.
+    pub fn verify_beacon(&self, radiotap_frame: &[u8]) -> bool {
+        let Some(bigtk) = self.bigtk else { return false };
+        let Some(body) = dot11::strip_radiotap(radiotap_frame) else {
+            return false;
+        };
+        let Some(frame) = dot11::Dot11::parse(body) else {
+            return false;
+        };
+        dot11::bip_verify(&bigtk, frame.fc0, frame.fc1, &frame.addr1, &frame.addr2, &frame.addr3, &frame.body)
     }
 
     /// Verify a received BIP-protected group-addressed management frame against

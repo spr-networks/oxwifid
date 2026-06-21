@@ -60,8 +60,16 @@ from ap import AP, Station, EAPOL_KEY, RSN  # noqa: E402
 from scapy.layers.dot11 import Dot11Elt  # noqa: E402
 
 
+_HT_CAP = bytes([0x6e, 0x00, 0x17, 0xff, 0xff]) + bytes(14) + bytes([0, 0, 0, 0, 0, 0, 0])
+_WMM = bytes.fromhex("0050f20201010000") + bytes.fromhex("03a4000027a4000042435e0062322f00")
+
+
+def _ht_op(channel):
+    return bytes([channel]) + bytes(5) + bytes(16)
+
+
 def _band_aware_beacon_ies(ssid_name, channel):
-    """Band-aware IE block mirroring the Rust dot11::make_beacon_ies."""
+    """Band-aware IE block mirroring the Rust dot11::make_beacon_ies (incl. HT + WMM)."""
     ssid = ssid_name if isinstance(ssid_name, bytes) else ssid_name.encode()
     ies = Dot11Elt(ID="SSID", info=ssid)
     if channel > 14:
@@ -72,6 +80,19 @@ def _band_aware_beacon_ies(ssid_name, channel):
         ies = ies / Dot11Elt(ID="DSset", info=bytes([channel]))
         ies = ies / Dot11Elt(ID="Country", info=b"US\x20" + bytes([1, 11, 30]))
         ies = ies / Dot11Elt(ID=50, info=bytes([0x30, 0x48, 0x60, 0x6c]))
+    ies = ies / Dot11Elt(ID=45, info=_HT_CAP)
+    ies = ies / Dot11Elt(ID=61, info=_ht_op(channel))
+    if channel > 14:
+        ies = ies / Dot11Elt(ID=191, info=bytes([0xb2, 0x01, 0x80, 0x33, 0xea, 0xff, 0x00, 0x00, 0xea, 0xff, 0x00, 0x00]))
+        ies = ies / Dot11Elt(ID=192, info=bytes([0, 0, 0, 0, 0]))
+    _extcap = bytearray(11)
+    _extcap[2] |= 0x08
+    _extcap[10] |= 0x10
+    ies = ies / Dot11Elt(ID=127, info=bytes(_extcap))
+    _cls = 115 if channel > 14 else 81
+    ies = ies / Dot11Elt(ID=59, info=bytes([_cls, _cls]))
+    ies = ies / Dot11Elt(ID=70, info=bytes([0x02, 0x00, 0x00, 0x00, 0x00]))
+    ies = ies / Dot11Elt(ID=221, info=_WMM)
     return ies
 
 
@@ -200,15 +221,23 @@ def fresh_ap(channel=CHANNEL):
 
 frames = {}
 
-# --- beacon (2.4 GHz, channel 1) ---
-ap, bss = fresh_ap()
-ap.dot11_beacon(AP_MAC, SSID)
-frames["beacon"] = {"bytes": h(captured[0]), "channel": CHANNEL}
+# --- beacons (built manually to include the beacon-only TIM element) ---
+_TIM = Dot11Elt(ID=5, info=bytes([0x00, 0x01, 0x00, 0x00]))
 
-# --- beacon (5 GHz, channel 36) ---
-ap5, _ = fresh_ap(channel=36)
-ap5.dot11_beacon(AP_MAC, SSID)
-frames["beacon_5ghz"] = {"bytes": h(captured[0]), "channel": 36}
+
+def _beacon(channel):
+    return (
+        RadioTap()
+        / Dot11(subtype=8, addr1="ff:ff:ff:ff:ff:ff", addr2=AP_MAC, addr3=AP_MAC)
+        / Dot11Beacon(cap=0x3101, timestamp=FIXED_TS, beacon_interval=0x64)
+        / make_beacon_ies(SSID, channel)
+        / Dot11Elt(ID=5, info=bytes([0x00, 0x01, 0x00, 0x00]))
+        / Raw(RSN)
+    )
+
+
+frames["beacon"] = {"bytes": h(_beacon(CHANNEL)), "channel": CHANNEL}
+frames["beacon_5ghz"] = {"bytes": h(_beacon(36)), "channel": 36}
 
 # --- probe response ---
 ap, bss = fresh_ap()

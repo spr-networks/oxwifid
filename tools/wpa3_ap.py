@@ -32,7 +32,7 @@ class Station:
         self.anonce = os.urandom(32)
         self.kck = self.kek = self.tk = b""
         self.associated = False
-        self.pn = 0
+        self.pn = 1  # CCMP PN starts at 1
 
 
 class AP:

@@ -37,6 +37,14 @@ pub fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
     mac.finalize().into_bytes().into()
 }
 
+/// Plain SHA-256.
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
+}
+
 /// HMAC-SHA256 (full 32-byte tag).
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts any key length");
@@ -330,9 +338,14 @@ pub fn aes_unwrap(kek: &[u8], wrapped: &[u8]) -> Option<Vec<u8>> {
 
 /// Pad to an 8-byte boundary with `0xdd`, like `pad_key_data`.
 pub fn pad_key_data(mut plain: Vec<u8>) -> Vec<u8> {
-    let pad_len = plain.len() % 8;
-    if pad_len != 0 {
-        plain.resize(plain.len() + (8 - pad_len), 0xdd);
+    // IEEE 802.11-2016 §12.7.2: pad the Key Data with a single 0xDD octet
+    // followed by 0x00 octets to the next 8-octet boundary (NOT all 0xDD, which
+    // a real supplicant rejects as a malformed KDE during parsing).
+    if !plain.len().is_multiple_of(8) {
+        plain.push(0xdd);
+        while !plain.len().is_multiple_of(8) {
+            plain.push(0x00);
+        }
     }
     plain
 }
