@@ -519,6 +519,35 @@ fn nl_install_igtk(sock: &mut NetlinkSocket, family: u16, ifindex: u32, idx: u8,
     }
 }
 
+/// Install the BIGTK (Beacon Protection, BIP-CMAC-128) into the kernel at the
+/// beacon key index (6/7) so mac80211 itself stamps + increments the per-beacon
+/// MME — instead of us baking a single fixed-IPN MME into a kernel-repeated
+/// (hence replayable) beacon. mac80211 recognises the 6/7 index range plus the
+/// BIP cipher as the beacon-protection key; `ipn` seeds its sequence counter.
+/// Returns whether the kernel accepted the key (an old kernel without beacon-
+/// protection offload rejects it, in which case the caller disables the feature
+/// rather than emit any MME).
+fn nl_install_bigtk(sock: &mut NetlinkSocket, family: u16, ifindex: u32, idx: u8, bigtk: &[u8; 16], ipn: &[u8; 6]) -> bool {
+    let seq = sock.next_seq();
+    // No KEY_DEFAULT/DEFAULT_MGMT flag: mac80211 recognises the 6/7 index range
+    // plus the BIP cipher as the beacon-protection key on its own (there is no
+    // "default beacon key" nl80211 attribute, unlike the IGTK's DEFAULT_MGMT).
+    let m = GenlMessage::new(family, NL80211_CMD_NEW_KEY, 0, seq)
+        .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
+        .attr(Attr::bytes(NL80211_ATTR_KEY_DATA, bigtk))
+        .attr(Attr::u32(NL80211_ATTR_KEY_CIPHER, WLAN_CIPHER_SUITE_BIP_CMAC_128))
+        .attr(Attr::bytes(NL80211_ATTR_KEY_IDX, &[idx]))
+        .attr(Attr::bytes(NL80211_ATTR_KEY_SEQ, ipn))
+        .attr(Attr::u32(NL80211_ATTR_KEY_TYPE, NL80211_KEYTYPE_GROUP));
+    match sock.request_ack(m) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("netlink AP: NEW_KEY BIGTK (idx {idx}) failed: {e}");
+            false
+        }
+    }
+}
+
 /// Remove a group/management key index from the kernel (the old GTK/IGTK after a
 /// two-phase rekey, once stations have the new one). Best-effort.
 fn nl_del_key(sock: &mut NetlinkSocket, family: u16, ifindex: u32, idx: u8) {
@@ -693,8 +722,11 @@ pub fn run_offload_ap(mut ap: crate::ap::Ap, iface: &str, channel: u8, ctrl_path
         || matches!(ap.security_mode(), dot11::SecurityMode::Wpa3Sae | dot11::SecurityMode::Owe | dot11::SecurityMode::Transition);
 
     // START_AP: the kernel beacons + (after NEW_KEY) does data CCMP. We keep the
-    // 802.1X control port in userspace, delivered over nl80211.
-    let beacon_rt = ap.beacon_frame();
+    // 802.1X control port in userspace, delivered over nl80211. The kernel
+    // repeats this one beacon, so it must NOT carry a fixed-IPN BIP MME (it would
+    // replay forever) — build it without the MME and, when Beacon Protection is
+    // on, install the BIGTK so mac80211 generates + increments the per-beacon MME.
+    let beacon_rt = ap.beacon_frame_unprotected();
     let beacon = dot11::strip_radiotap(&beacon_rt).map(<[u8]>::to_vec).unwrap_or(beacon_rt);
     let (head, tail) = split_beacon_at_tim(&beacon);
     let seq = sock.next_seq();
@@ -753,6 +785,19 @@ pub fn run_offload_ap(mut ap: crate::ap::Ap, iface: &str, channel: u8, ctrl_path
     // (Per-STA-VIF mode installs each station's own GTK on its AP_VLAN instead.)
     let mut gtk_state: Option<(u8, [u8; 16])> = None;
     let mut igtk_state: Option<(u8, [u8; 16])> = None;
+    // BIGTK (Beacon Protection): the (key index, bytes) installed in the kernel,
+    // re-installed on rotation (group rekey toggles the IGTK/BIGTK indices). The
+    // static START_AP beacon carries NO MME; mac80211 stamps the per-beacon MME
+    // from this key. `beacon_prot_on` latches false if the kernel rejects the
+    // BIGTK (no offload support) so we never fall back to a fixed-IPN MME.
+    let mut bigtk_state: Option<(u8, [u8; 16])> = None;
+    let mut beacon_prot_on = ap.beacon_prot();
+    // Per-STA-VIF: the GTK (key index, bytes) currently installed on each
+    // station's AP_VLAN. Re-installed whenever the AP rotates that station's own
+    // per-station GTK (group rekey toggles its index 1<->2), removing the stale
+    // index — the per-AP_VLAN analogue of the BSS-wide two-phase rekey, so an
+    // AP_VLAN never keeps a stale kernel key and isolation is preserved.
+    let mut vlan_gtk: std::collections::HashMap<[u8; 6], (u8, [u8; 16])> = std::collections::HashMap::new();
     let mut vlan = VlanState {
         enabled: ap.per_sta_vif(),
         map: std::collections::HashMap::new(),
@@ -843,6 +888,7 @@ pub fn run_offload_ap(mut ap: crate::ap::Ap, iface: &str, channel: u8, ctrl_path
         stations.retain(|s| live.contains(s));
         keyed.retain(|s| live.contains(s));
         if vlan.enabled {
+            vlan_gtk.retain(|s, _| live.contains(s));
             let gone: Vec<[u8; 6]> = vlan.map.keys().copied().filter(|s| !live.contains(s)).collect();
             for s in gone {
                 if let Some(vidx) = vlan.map.remove(&s) {
@@ -872,7 +918,12 @@ pub fn run_offload_ap(mut ap: crate::ap::Ap, iface: &str, channel: u8, ctrl_path
             if let Some(tk) = ap.station_tk(sta) {
                 nl_new_key(&mut cmd, family_id, key_if, Some(sta), 0, &tk, true);
                 if vlan.enabled {
-                    nl_new_key(&mut cmd, family_id, key_if, None, 1, &ap.station_gtk(sta), false);
+                    // The GTK index is BSS-wide (the advertised key id, shared by
+                    // every station); only the per-station GTK *value* differs.
+                    let gidx = ap.gtk_key_id();
+                    let gkey = ap.station_gtk(sta);
+                    nl_new_key(&mut cmd, family_id, key_if, None, gidx, &gkey, false);
+                    vlan_gtk.insert(*sta, (gidx, gkey));
                 }
                 nl_authorize(&mut cmd, family_id, key_if, sta);
                 keyed.insert(*sta);
@@ -881,12 +932,11 @@ pub fn run_offload_ap(mut ap: crate::ap::Ap, iface: &str, channel: u8, ctrl_path
             }
         }
 
-        // BSS-wide GTK + IGTK: install once a station is keyed, and re-install
-        // whenever the AP rotates them (group rekey). The kernel must end up
-        // using exactly the GTK bytes + index, and IGTK bytes + index/IPN, that
-        // rekey_gtk() handed the stations — otherwise a departed STA can still
-        // read kernel group traffic and BIP frames don't validate. (Per-STA-VIF
-        // mode keys each AP_VLAN above and has no BSS-wide group key.)
+        // BSS-wide GTK: install once a station is keyed, and re-install whenever
+        // the AP rotates it (group rekey). The kernel must end up using exactly
+        // the GTK bytes + index that rekey_gtk() handed the stations — otherwise
+        // a departed STA can still read kernel group traffic. (Per-STA-VIF mode
+        // has no BSS-wide group key; each AP_VLAN is keyed below instead.)
         if !vlan.enabled && (newly_keyed || !keyed.is_empty()) {
             let gtk_idx = ap.gtk_key_id();
             let gtk = ap.gtk();
@@ -901,19 +951,72 @@ pub fn run_offload_ap(mut ap: crate::ap::Ap, iface: &str, channel: u8, ctrl_path
                 }
                 gtk_state = Some((gtk_idx, gtk));
             }
-            // IGTK for PMF (SAE/OWE): install so the kernel can BIP-protect and
-            // validate robust management frames; re-install on rotation.
-            if ap.is_pmf() {
-                let igtk_idx = ap.igtk_key_id() as u8;
-                let igtk = ap.igtk();
-                if igtk_state != Some((igtk_idx, igtk)) {
-                    nl_install_igtk(&mut cmd, family_id, ifindex, igtk_idx, &igtk, &ap.igtk_ipn());
-                    if let Some((old_idx, _)) = igtk_state {
-                        if old_idx != igtk_idx {
-                            nl_del_key(&mut cmd, family_id, ifindex, old_idx);
+        }
+
+        // Per-STA-VIF rekey: re-install each station's own rotated GTK on its
+        // AP_VLAN at the new (toggled) index, dropping the stale index — the
+        // per-AP_VLAN two-phase rekey. Without this, a periodic/strict rekey
+        // would hand stations a new key while the AP_VLAN kernel key stayed
+        // stale. The initial install above seeds vlan_gtk, so this only fires on
+        // an actual rotation.
+        if vlan.enabled {
+            for sta in &stations {
+                if !keyed.contains(sta) {
+                    continue;
+                }
+                let Some(&vidx) = vlan.map.get(sta) else { continue };
+                // Shared BSS-wide index, per-station value (see initial install).
+                let gidx = ap.gtk_key_id();
+                let gkey = ap.station_gtk(sta);
+                if vlan_gtk.get(sta) != Some(&(gidx, gkey)) {
+                    nl_new_key(&mut cmd, family_id, vidx, None, gidx, &gkey, false);
+                    if let Some(&(old_idx, _)) = vlan_gtk.get(sta) {
+                        if old_idx != gidx {
+                            nl_del_key(&mut cmd, family_id, vidx, old_idx);
                         }
                     }
-                    igtk_state = Some((igtk_idx, igtk));
+                    vlan_gtk.insert(*sta, (gidx, gkey));
+                }
+            }
+        }
+
+        // IGTK for PMF (SAE/OWE): BSS-wide (one BIP key for the radio's robust
+        // management frames), installed on the main AP interface in both modes so
+        // the kernel can BIP-protect/validate them; re-install on rotation.
+        if ap.is_pmf() && (newly_keyed || !keyed.is_empty()) {
+            let igtk_idx = ap.igtk_key_id() as u8;
+            let igtk = ap.igtk();
+            if igtk_state != Some((igtk_idx, igtk)) {
+                nl_install_igtk(&mut cmd, family_id, ifindex, igtk_idx, &igtk, &ap.igtk_ipn());
+                if let Some((old_idx, _)) = igtk_state {
+                    if old_idx != igtk_idx {
+                        nl_del_key(&mut cmd, family_id, ifindex, old_idx);
+                    }
+                }
+                igtk_state = Some((igtk_idx, igtk));
+            }
+
+            // BIGTK (Beacon Protection): install into the kernel so mac80211
+            // generates the per-beacon MME. If the kernel rejects it (no offload
+            // support), latch beacon protection off — the static beacon already
+            // carries no MME, so beacons simply go unprotected rather than ship a
+            // replayable fixed-IPN MME.
+            if beacon_prot_on {
+                let bigtk_idx = ap.bigtk_key_id() as u8;
+                let bigtk = ap.bigtk();
+                if bigtk_state != Some((bigtk_idx, bigtk)) {
+                    if nl_install_bigtk(&mut cmd, family_id, ifindex, bigtk_idx, &bigtk, &ap.bigtk_ipn()) {
+                        if let Some((old_idx, _)) = bigtk_state {
+                            if old_idx != bigtk_idx {
+                                nl_del_key(&mut cmd, family_id, ifindex, old_idx);
+                            }
+                        }
+                        bigtk_state = Some((bigtk_idx, bigtk));
+                        eprintln!("netlink AP: Beacon Protection enabled (BIGTK idx {bigtk_idx} installed; kernel stamps per-beacon MME)");
+                    } else {
+                        beacon_prot_on = false;
+                        eprintln!("netlink AP: kernel rejected BIGTK — Beacon Protection DISABLED (beacons unprotected; no MME emitted)");
+                    }
                 }
             }
         }

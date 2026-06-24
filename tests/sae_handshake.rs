@@ -258,6 +258,35 @@ fn beacon_protection_bigtk() {
     assert!(!sta.verify_beacon(&bad), "tampered beacon must fail BIP verification");
 }
 
+/// Netlink kernel-beacon path: the static beacon handed to START_AP must NOT
+/// carry a BIP MME, even with Beacon Protection enabled — a single fixed-IPN MME
+/// repeated forever by the kernel is replayable. (In netlink mode the BIGTK is
+/// installed in the kernel instead, which stamps the per-beacon MME itself.)
+#[test]
+fn netlink_static_beacon_has_no_mme() {
+    const EID_MME: u8 = 76;
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    ap.enable_beacon_protection();
+
+    // The userspace beacon appends an 18-octet MME (id 76, len 16); the netlink
+    // static beacon omits it entirely.
+    let protected = ap.beacon_frame();
+    let unprotected = ap.beacon_frame_unprotected();
+    assert_eq!(
+        protected.len(),
+        unprotected.len() + 18,
+        "protected beacon carries an 18-octet MME the unprotected one does not"
+    );
+    assert_eq!(protected[protected.len() - 18], EID_MME, "protected beacon ends with the MME");
+    // The unprotected beacon must not end with an MME element header.
+    let u = &unprotected;
+    assert!(
+        !(u[u.len() - 18] == EID_MME && u[u.len() - 17] == 16),
+        "netlink static beacon must not contain a trailing MME"
+    );
+}
+
 #[test]
 fn transition_mode_accepts_both_wpa2_and_wpa3_clients() {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");

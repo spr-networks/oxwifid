@@ -58,8 +58,10 @@ pub struct Station {
     pub owe: bool,
     /// Last time a frame was received from this station (inactivity timer).
     pub last_activity: Instant,
-    /// Per-station GTK, used only in `per_sta_vif` mode so each station's VLAN
-    /// has its own group key (broadcast isolation). Ignored otherwise.
+    /// Per-station GTK *value*, used only in `per_sta_vif` mode so each station's
+    /// VLAN has its own group key (broadcast isolation). Ignored otherwise. The
+    /// key *index* is BSS-wide (`Ap::gtk_key_id`) and shared by every station —
+    /// only the value differs per station; that difference is what isolates them.
     pub gtk: [u8; 16],
     /// Fingerprint of the client's association characteristics, for the failure
     /// log (set at association; 0 before then).
@@ -494,6 +496,17 @@ impl Ap {
         self.gtk
     }
 
+    /// The CCMP key index of the group key handed to `sta`. The GTK key index is
+    /// a BSS-wide concept — it is what the RSNE/beacon advertises and the index
+    /// every client installs its GTK under — so it is the single global
+    /// `gtk_key_id` for every station, in both modes. In `per_sta_vif` mode only
+    /// the GTK *value* differs per station (see [`Ap::station_gtk`]); the shared
+    /// index toggles 1<->2 together on each rekey. Used by the netlink path to
+    /// (re)install the GTK at the same index the station was told.
+    pub fn station_gtk_key_id(&self, _sta: &[u8; 6]) -> u8 {
+        self.gtk_key_id
+    }
+
     /// Build an 802.11v BSS Transition Management Request steering `sta` toward a
     /// preferred candidate BSS (a Neighbor Report on the same operating class).
     fn btm_request_frame(&mut self, sta: &[u8; 6]) -> Vec<u8> {
@@ -520,8 +533,22 @@ impl Ap {
         self.owe = true;
     }
 
-    /// One beacon frame for the beacon ticker.
+    /// One beacon frame for the beacon ticker. Adds a per-beacon BIP MME when
+    /// Beacon Protection is enabled (userspace TX path).
     pub fn beacon_frame(&mut self) -> Vec<u8> {
+        self.beacon_frame_inner(true)
+    }
+
+    /// A beacon frame WITHOUT a BIP MME, even when Beacon Protection is enabled.
+    /// The netlink (kernel-beacon) path uses this for the static START_AP beacon:
+    /// a single fixed-IPN MME baked into a kernel-repeated beacon would be
+    /// replayable, so instead the BIGTK is installed in the kernel and mac80211
+    /// generates + increments the per-beacon MME itself.
+    pub fn beacon_frame_unprotected(&mut self) -> Vec<u8> {
+        self.beacon_frame_inner(false)
+    }
+
+    fn beacon_frame_inner(&mut self, protect: bool) -> Vec<u8> {
         let ts = self.current_timestamp();
         let tail = dot11::security_tail(self.security_mode());
         let mut frame = if self.band6 {
@@ -549,7 +576,7 @@ impl Ap {
             nb[5] ^= 0x10;
             frame.extend_from_slice(&dot11::reduced_neighbor_report(&nb, 131, ch6));
         }
-        if self.beacon_prot {
+        if self.beacon_prot && protect {
             // Protect the beacon body with a BIP Management MIC Element (BIGTK).
             // The BIGTK IPN is the same little-endian counter as the IGTK's.
             inc_ipn_le(&mut self.bigtk_ipn);
@@ -1141,11 +1168,12 @@ impl Ap {
         } else {
             dot11::RSN.to_vec()
         };
-        // In per-station-VIF mode each station gets its own GTK (broadcast
-        // isolation) at the fixed index 1; otherwise all stations share the
-        // BSS-wide GTK, whose index follows the rekey toggle.
+        // In per-station-VIF mode each station gets its own GTK *value* (broadcast
+        // isolation); otherwise all stations share the BSS-wide GTK. Either way the
+        // GTK *index* is the single BSS-wide `gtk_key_id` (what the RSNE advertises
+        // and every client installs under), following the rekey toggle.
         let gtk = self.station_gtk(&sta);
-        let gtk_key_id = if self.per_sta_vif { 1 } else { self.gtk_key_id };
+        let gtk_key_id = self.gtk_key_id;
         let m3 = dot11::build_eapol_m3(&self.mac, &sta, &anonce, &kck, &kek, &ap_rsn, gtk_key_id, &gtk, igtk, bigtk, oci, sc, dot11::KeyMic::select(sha256, owe));
         // Keys are derived and m3 is sent, but the station is not authorized
         // until its m4 ACK verifies (see the top of `handle_eapol`). Cache m3 so
@@ -1619,6 +1647,21 @@ impl Ap {
         self.igtk_ipn
     }
 
+    /// Whether Beacon Protection (BIGTK) is enabled.
+    pub fn beacon_prot(&self) -> bool {
+        self.beacon_prot
+    }
+
+    /// The current BIGTK key index (6/7) and IPN, so the netlink path can install
+    /// the BIGTK in the kernel and let mac80211 generate the per-beacon MME.
+    pub fn bigtk_key_id(&self) -> u16 {
+        self.bigtk_key_id
+    }
+
+    pub fn bigtk_ipn(&self) -> [u8; 6] {
+        self.bigtk_ipn
+    }
+
     /// Whether this AP uses Management Frame Protection (PMF/802.11w): true for
     /// SAE, OWE, and transition mode, where the kernel must be given the IGTK to
     /// send/validate BIP-protected robust management frames.
@@ -1636,6 +1679,14 @@ impl Ap {
     pub fn rekey_gtk(&mut self) -> Vec<Vec<u8>> {
         if self.stations.values().any(|s| s.group_rekeying) {
             return Vec::new();
+        }
+        // Per-STA-VIF mode: each station has its OWN group key *value* (broadcast
+        // isolation). A shared GTK value would collapse that isolation, so rotate
+        // each station's per-station GTK value and drive its msg 1 with that value.
+        // The key *index* is a fixed constant (1) — each station's value is the
+        // isolation; the index never moves in this mode.
+        if self.per_sta_vif {
+            return self.rekey_gtk_per_sta();
         }
         let gtk_full = random_bytes::<32>();
         self.gtk.copy_from_slice(&gtk_full[..16]);
@@ -1669,6 +1720,67 @@ impl Ap {
                 let s = self.stations.get_mut(&sta).unwrap();
                 s.eapol_replay += 1;
                 (s.kck, s.kek, s.sha256, s.owe, s.eapol_replay)
+            };
+            let igtk_kde = if sha256 { Some((igtk_key_id, igtk_ipn, igtk)) } else { None };
+            let sc = self.next_sc();
+            let frame = dot11::build_group_key_msg1(&self.mac, &sta, &kck, &kek, gtk_key_id, &gtk, igtk_kde, replay, sc, dot11::KeyMic::select(sha256, owe));
+            let mut f = dot11::RADIOTAP_TX.to_vec();
+            f.extend_from_slice(&frame);
+            if let Some(s) = self.stations.get_mut(&sta) {
+                s.pending_eapol = Some(f.clone());
+                s.eapol_tx = Instant::now();
+                s.eapol_retries = 0;
+                s.group_rekeying = true;
+            }
+            frames.push(f);
+        }
+        frames
+    }
+
+    /// Per-STA-VIF group rekey: rotate EACH associated station's OWN per-station
+    /// GTK *value* and send that station a Group Key message 1 carrying its own
+    /// new value — preserving the per-station broadcast isolation. The GTK *index*
+    /// is a fixed constant (1): each station's own value (isolated in its own
+    /// AP_VLAN) is what separates them, so the index never moves and is not a
+    /// per-station or a shared toggling counter — the new value overwrites the old
+    /// at the same index 1. The IGTK is genuinely BSS-wide (one BIP key for the
+    /// radio's robust management frames), so it IS rotated once with its own 4<->5
+    /// index toggle and delivered to every PMF station. Called only from
+    /// `rekey_gtk` when `per_sta_vif` is set; the caller already guarantees no
+    /// rekey is in flight.
+    fn rekey_gtk_per_sta(&mut self) -> Vec<Vec<u8>> {
+        // The per-station GTK index is a fixed constant (1): each station's own
+        // GTK *value* (its own key, isolated in its own AP_VLAN) is what separates
+        // them, so the index never moves and is not a shared, toggling counter —
+        // only the value rotates per station (below), overwriting the old one at
+        // the same index 1. The BSS-wide IGTK (management-frame BIP, genuinely one
+        // key per radio) still rotates with its own 4<->5 index toggle.
+        self.igtk = random_bytes::<16>();
+        self.igtk_key_id = if self.igtk_key_id == 4 { 5 } else { 4 };
+        self.igtk_ipn = [0; 6]; // fresh IGTK (new key id) gets a fresh IPN
+        self.last_group_rekey = Instant::now();
+        let gtk_key_id: u8 = 1;
+        let igtk = self.igtk;
+        let igtk_key_id = self.igtk_key_id;
+        let igtk_ipn = self.igtk_ipn;
+
+        let stations: Vec<[u8; 6]> = self
+            .stations
+            .iter()
+            .filter(|(_, s)| s.associated)
+            .map(|(m, _)| *m)
+            .collect();
+
+        let mut frames = Vec::new();
+        for sta in stations {
+            let (kck, kek, sha256, owe, replay, gtk) = {
+                let s = self.stations.get_mut(&sta).unwrap();
+                // Rotate this station's own GTK *value*; it goes in at the shared
+                // (already-toggled) BSS-wide index.
+                let gtk_full = random_bytes::<32>();
+                s.gtk.copy_from_slice(&gtk_full[..16]);
+                s.eapol_replay += 1;
+                (s.kck, s.kek, s.sha256, s.owe, s.eapol_replay, s.gtk)
             };
             let igtk_kde = if sha256 { Some((igtk_key_id, igtk_ipn, igtk)) } else { None };
             let sc = self.next_sc();

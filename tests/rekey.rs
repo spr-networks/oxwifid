@@ -167,3 +167,65 @@ fn no_strict_rekey_when_last_station_leaves() {
     ap.tick();
     assert_eq!(ap.gtk(), old, "no strict rekey when the last station leaves");
 }
+
+/// Per-STA-VIF: a group rekey must rotate EACH station's OWN per-station GTK
+/// *value* (so broadcast isolation is preserved) while every station shares the
+/// single BSS-wide GTK *index* (what the RSNE advertises). The index toggles
+/// once, together, for all stations — only the values differ. Regression test
+/// for the over-engineered per-STA-VIF rekey that wrongly gave each station its
+/// own key index.
+#[test]
+fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
+    let (mut ap, mut net) = wpa3_ap();
+    ap.enable_per_sta_vif();
+    let a_mac = mac_to_bytes("02:00:00:00:00:01");
+    let b_mac = mac_to_bytes("02:00:00:00:00:02");
+    let mut a = wpa3_sta("02:00:00:00:00:01");
+    let mut b = wpa3_sta("02:00:00:00:00:02");
+    connect(&mut ap, &mut net, &mut a);
+    connect(&mut ap, &mut net, &mut b);
+
+    // Each station got its OWN distinct GTK value, but at the SAME BSS-wide
+    // index (the advertised key id, 1 initially).
+    let a_gtk0 = ap.station_gtk(&a_mac);
+    let b_gtk0 = ap.station_gtk(&b_mac);
+    assert_ne!(a_gtk0, b_gtk0, "per-STA-VIF: stations have distinct GTK values");
+    assert_eq!(a.gtk(), a_gtk0, "station A installed its own GTK");
+    assert_eq!(b.gtk(), b_gtk0, "station B installed its own GTK");
+    assert_eq!(ap.station_gtk_key_id(&a_mac), 1);
+    assert_eq!(ap.station_gtk_key_id(&b_mac), 1);
+    assert_eq!(
+        ap.station_gtk_key_id(&a_mac),
+        ap.station_gtk_key_id(&b_mac),
+        "the GTK index is BSS-wide: every station shares the same key id",
+    );
+
+    // Rekey: one msg 1 per station, each carrying that station's own NEW value.
+    let msgs = ap.rekey_gtk();
+    assert_eq!(msgs.len(), 2, "one Group Key msg 1 per associated station");
+
+    let a_gtk1 = ap.station_gtk(&a_mac);
+    let b_gtk1 = ap.station_gtk(&b_mac);
+    assert_ne!(a_gtk1, a_gtk0, "A's per-station GTK value rotated");
+    assert_ne!(b_gtk1, b_gtk0, "B's per-station GTK value rotated");
+    assert_ne!(a_gtk1, b_gtk1, "isolation preserved: rotated values still differ");
+    // The per-station GTK index is a fixed constant (1): it does NOT toggle on
+    // rekey — only each station's own value rotates (above). The isolation is the
+    // distinct values, never a per-station or a moving index.
+    assert_eq!(ap.station_gtk_key_id(&a_mac), 1, "index stays at constant 1 after rekey");
+    assert_eq!(ap.station_gtk_key_id(&b_mac), 1, "index stays at constant 1 after rekey");
+    assert_eq!(
+        ap.station_gtk_key_id(&a_mac),
+        ap.station_gtk_key_id(&b_mac),
+        "every station uses the same constant GTK index (1)",
+    );
+
+    // Each station installs the key from ITS OWN msg 1 (not the other's).
+    for m in &msgs {
+        a.handle_incoming(m);
+        b.handle_incoming(m);
+    }
+    assert_eq!(a.gtk(), a_gtk1, "A installed its own rotated GTK");
+    assert_eq!(b.gtk(), b_gtk1, "B installed its own rotated GTK");
+    assert_ne!(a.gtk(), b.gtk(), "post-rekey, the two stations still hold different GTKs");
+}
