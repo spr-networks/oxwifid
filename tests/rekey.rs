@@ -16,14 +16,8 @@ fn ap_step(ap: &mut Ap, net: &mut FakeNet, frame: &[u8]) -> Vec<Vec<u8>> {
     frames
 }
 
-fn wpa3_up() -> (Ap, FakeNet, Client) {
-    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
-    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
-    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
-    ap.enable_sae();
-    let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
-    let mut sta = Client::new("turtlenet", "password1234", sta_mac);
-    sta.enable_sae();
+/// Drive one client through the full handshake against `ap` until associated.
+fn connect(ap: &mut Ap, net: &mut FakeNet, sta: &mut Client) {
     let mut to_client = vec![ap.beacon_frame()];
     let mut to_ap: Vec<Vec<u8>> = Vec::new();
     let mut rounds = 0;
@@ -36,11 +30,31 @@ fn wpa3_up() -> (Ap, FakeNet, Client) {
         to_ap.extend(nxt);
         let mut nxt2 = Vec::new();
         for f in to_ap.drain(..) {
-            nxt2.extend(ap_step(&mut ap, &mut net, &f));
+            nxt2.extend(ap_step(ap, net, &f));
         }
         to_client.extend(nxt2);
     }
     assert_eq!(sta.connected, 4);
+}
+
+fn wpa3_ap() -> (Ap, FakeNet) {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    ap.enable_sae();
+    let net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
+    (ap, net)
+}
+
+fn wpa3_sta(mac: &str) -> Client {
+    let mut sta = Client::new("turtlenet", "password1234", mac_to_bytes(mac));
+    sta.enable_sae();
+    sta
+}
+
+fn wpa3_up() -> (Ap, FakeNet, Client) {
+    let (mut ap, mut net) = wpa3_ap();
+    let mut sta = wpa3_sta("02:00:00:00:ab:cd");
+    connect(&mut ap, &mut net, &mut sta);
     (ap, net, sta)
 }
 
@@ -77,4 +91,79 @@ fn group_rekey_msg1_with_bad_mic_is_ignored() {
     m[n - 40] ^= 0xff;
     sta.handle_incoming(m);
     assert_eq!(sta.gtk(), old_gtk, "a tampered Group Key message must not install a GTK");
+}
+
+#[test]
+fn ap_processes_group_msg2_and_coalesces_rekeys() {
+    let (mut ap, _net, mut sta) = wpa3_up();
+    // First rekey: one msg 1; the station is now awaiting its msg 2 ACK.
+    let msgs = ap.rekey_gtk();
+    assert_eq!(msgs.len(), 1);
+    // A second rekey while the first is still in flight is coalesced to nothing
+    // (hostapd waits for GKeyDoneStations to reach 0 before starting another).
+    assert!(ap.rekey_gtk().is_empty(), "rekey coalesces while one is in flight");
+    // The station ACKs (msg 2); feed it back to the AP, which clears its state.
+    let reply = sta.handle_incoming(&msgs[0]);
+    assert_eq!(reply.frames.len(), 1, "station emits Group Key msg 2");
+    ap.handle_incoming(&reply.frames[0]);
+    // With every station's msg 2 in, a fresh rekey is permitted again.
+    assert_eq!(ap.rekey_gtk().len(), 1, "rekey allowed again once all msg 2s are in");
+}
+
+#[test]
+fn periodic_group_rekey_fires_on_tick() {
+    let (mut ap, _net, mut sta) = wpa3_up();
+    // Well inside a long interval, tick must not rekey.
+    ap.set_group_rekey(3600);
+    assert!(ap.tick().frames.is_empty(), "no rekey well before the interval");
+    // Age the clock past a short interval and the next tick performs the rekey.
+    ap.set_group_rekey(1);
+    let old = ap.gtk();
+    ap.test_expire_group_rekey();
+    let out = ap.tick();
+    assert_ne!(ap.gtk(), old, "periodic wpa_group_rekey rotated the GTK on tick");
+    for f in &out.frames {
+        sta.handle_incoming(f);
+    }
+    assert_eq!(sta.gtk(), ap.gtk(), "station installed the periodically-rotated GTK");
+}
+
+#[test]
+fn disabling_periodic_rekey_stops_it() {
+    let (mut ap, _net, _sta) = wpa3_up();
+    ap.set_group_rekey(0); // disabled
+    let old = ap.gtk();
+    ap.test_expire_group_rekey();
+    ap.tick();
+    assert_eq!(ap.gtk(), old, "wpa_group_rekey=0 disables periodic group rekeying");
+}
+
+#[test]
+fn strict_rekey_on_authorized_leave() {
+    let (mut ap, mut net) = wpa3_ap();
+    let mut a = wpa3_sta("02:00:00:00:00:01");
+    let mut b = wpa3_sta("02:00:00:00:00:02");
+    connect(&mut ap, &mut net, &mut a);
+    connect(&mut ap, &mut net, &mut b);
+
+    let old = ap.gtk();
+    // Kick A; with B still associated, wpa_strict_rekey rotates the GTK so the
+    // departed A can no longer read group traffic.
+    ap.kick(&mac_to_bytes("02:00:00:00:00:01"));
+    let out = ap.tick();
+    assert_ne!(ap.gtk(), old, "strict rekey rotated the GTK after an authorized STA left");
+    for f in &out.frames {
+        b.handle_incoming(f);
+    }
+    assert_eq!(b.gtk(), ap.gtk(), "the remaining station installed the rotated GTK");
+}
+
+#[test]
+fn no_strict_rekey_when_last_station_leaves() {
+    let (mut ap, _net, _sta) = wpa3_up();
+    let old = ap.gtk();
+    // The only station leaves — no one remains to protect, so no rekey.
+    ap.kick(&mac_to_bytes("02:00:00:00:ab:cd"));
+    ap.tick();
+    assert_eq!(ap.gtk(), old, "no strict rekey when the last station leaves");
 }

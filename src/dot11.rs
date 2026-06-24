@@ -35,6 +35,38 @@ pub fn channel_to_freq(channel: u8) -> u16 {
     }
 }
 
+/// The Channel Center Frequency Segment-0 channel for the wide (40/80/160/320
+/// MHz) block containing the primary `channel`, on the 5 GHz (base 36) or 6 GHz
+/// (base 1) band. For 20 MHz this is the primary channel itself.
+pub fn center_channel(channel: u8, width_mhz: u16, band6: bool) -> u8 {
+    let base: i32 = if band6 { 1 } else { 36 };
+    let p = channel as i32;
+    let c = match width_mhz {
+        // HT40+: primary is the lower 20 MHz of the pair; HT40-: the upper.
+        40 => {
+            if (p - base).rem_euclid(8) == 0 {
+                p + 2
+            } else {
+                p - 2
+            }
+        }
+        80 => base + (p - base).div_euclid(16) * 16 + 6,
+        160 => base + (p - base).div_euclid(32) * 32 + 14,
+        320 => base + (p - base).div_euclid(64) * 64 + 30,
+        _ => p,
+    };
+    c as u8
+}
+
+/// Frequency (MHz) of a 5 GHz / 6 GHz center channel.
+pub fn channel_to_center_freq(center_chan: u8, band6: bool) -> u32 {
+    if band6 {
+        5950 + 5 * center_chan as u32
+    } else {
+        5000 + 5 * center_chan as u32
+    }
+}
+
 /// Build a radiotap header for monitor-mode TX that pins the frame to the right
 /// band: it carries a Rate field and a Channel field (frequency + 2 GHz/CCK or
 /// 5 GHz/OFDM flags) so the driver injects on the correct band/encoding.
@@ -149,9 +181,19 @@ pub const SUBTYPE_DISASSOC: u8 = 0x0A;
 pub const SUBTYPE_AUTH: u8 = 0x0B;
 pub const SUBTYPE_DEAUTH: u8 = 0x0C;
 pub const SUBTYPE_ACTION: u8 = 0x0D;
+/// Data-frame subtype: QoS Data (WMM). Carries a 2-byte QoS Control field after
+/// the addresses; its TID feeds the CCMP nonce + AAD.
+pub const SUBTYPE_QOS_DATA: u8 = 0x08;
 
 /// Status code: association rejected temporarily (PMF SA Query comeback).
 pub const STATUS_ASSOC_REJECTED_TEMP: u16 = 30;
+/// Status code: unsupported authentication algorithm (802.11 status 13). Sent
+/// when a SAE-only AP receives an open-system Authentication request.
+pub const STATUS_UNSUPPORTED_AUTH_ALG: u16 = 13;
+/// Status code: unspecified failure (802.11 status 1). Used to deny an
+/// association that fails the WPA3-SAE / OWE anti-downgrade check (e.g. an OWE
+/// request without the required Diffie-Hellman Parameter element).
+pub const STATUS_UNSPECIFIED_FAILURE: u16 = 1;
 /// SA Query action category / actions (802.11w).
 pub const ACTION_CATEGORY_SA_QUERY: u8 = 8;
 pub const SA_QUERY_REQUEST: u8 = 0;
@@ -188,10 +230,19 @@ fn ht_capabilities() -> Vec<u8> {
     ie(45, &info)
 }
 
-/// 802.11n HT Operation element (ID 61) for `channel` (20 MHz, no secondary).
-fn ht_operation(channel: u8) -> Vec<u8> {
+/// 802.11n HT Operation element (ID 61) for `channel`. For widths >= 40 MHz it
+/// sets the Secondary Channel Offset and the STA Channel Width bit.
+fn ht_operation(channel: u8, width: u16, band6: bool) -> Vec<u8> {
     let mut info = vec![channel];
-    info.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00]); // HT Operation Info
+    let mut op = [0u8; 5]; // HT Operation Info
+    if width >= 40 {
+        let base: i32 = if band6 { 1 } else { 36 };
+        // Secondary Channel Offset: 1 = above (primary is the lower 20 MHz of
+        // the 40 MHz pair), 3 = below.
+        op[0] = if (channel as i32 - base).rem_euclid(8) == 0 { 0x01 } else { 0x03 };
+        op[0] |= 0x04; // STA Channel Width = 1 (any width above 20 MHz)
+    }
+    info.extend_from_slice(&op);
     info.extend_from_slice(&[0u8; 16]); // Basic HT-MCS Set
     ie(61, &info)
 }
@@ -210,6 +261,47 @@ fn wmm_parameter() -> Vec<u8> {
             0x62, 0x32, 0x2f, 0x00, // AC_VO
         ],
     )
+}
+
+/// WMM/WME Information element (subtype 0) for a station's (Re)Assoc Request,
+/// advertising that it is WMM-capable so the AP enables QoS for it.
+pub fn wmm_information() -> Vec<u8> {
+    // OUI 00:50:f2, type 2 (WMM), subtype 0 (Information), version 1, QoS Info 0.
+    ie(221, &[0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00])
+}
+
+/// Map an Ethernet frame to its 802.11e/WMM user priority (TID 0-7) from the IP
+/// DSCP / IPv6 Traffic Class precedence — the kernel's `cfg80211_classify8021d`
+/// default, `UP = ToS >> 5`. The MAC's EDCA then selects the access category
+/// (UP 1,2→BK, 0,3→BE, 4,5→VI, 6,7→VO). Non-IP frames (ARP, etc.) are best-effort
+/// (TID 0).
+pub fn wmm_tid(eth: &[u8]) -> u8 {
+    if eth.len() < 16 {
+        return 0;
+    }
+    match u16::from_be_bytes([eth[12], eth[13]]) {
+        0x0800 => eth[15] >> 5,                                     // IPv4 ToS byte
+        0x86DD => (((eth[14] & 0x0f) << 4) | (eth[15] >> 4)) >> 5,  // IPv6 Traffic Class
+        _ => 0,
+    }
+}
+
+/// Whether an IE block carries a WMM/WME element (vendor OUI 00:50:F2, type 2).
+/// A station that includes this in its (Re)Association Request is negotiating
+/// WMM. Pass the IE portion of the frame (after the fixed fields).
+pub fn has_wmm_ie(ies: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let len = ies[i + 1] as usize;
+        if i + 2 + len > ies.len() {
+            break;
+        }
+        if ies[i] == 221 && len >= 4 && ies[i + 2..i + 6] == [0x00, 0x50, 0xf2, 0x02] {
+            return true;
+        }
+        i += 2 + len;
+    }
+    false
 }
 
 /// TIM (Traffic Indication Map) element (ID 5), beacon-only. DTIM period 1.
@@ -236,17 +328,29 @@ pub fn bss_max_idle_element(period_1000tu: u16) -> Vec<u8> {
     ie(90, &info)
 }
 
-/// 802.11ac VHT Capabilities element (ID 191), 5 GHz. 1 SS, MCS 0-9.
-fn vht_capabilities() -> Vec<u8> {
-    let mut info = vec![0xb2, 0x01, 0x80, 0x33]; // VHT Capabilities Info
+/// 802.11ac VHT Capabilities element (ID 191), 5 GHz. MCS 0-9, 2 SS. Bits 2-3 of
+/// the first Capabilities-Info byte are the Supported Channel Width Set: 0 = up
+/// to 80 MHz, 1 = also 160 MHz. A station caps its width to this regardless of
+/// the VHT Operation, so a 160 MHz BSS must advertise it here too.
+fn vht_capabilities(width: u16) -> Vec<u8> {
+    let b0 = if width >= 160 { 0xb6 } else { 0xb2 };
+    let mut info = vec![b0, 0x01, 0x80, 0x33]; // VHT Capabilities Info
     // Supported VHT-MCS and NSS Set (rx map, rx highest, tx map, tx highest)
     info.extend_from_slice(&[0xea, 0xff, 0x00, 0x00, 0xea, 0xff, 0x00, 0x00]);
     ie(191, &info)
 }
 
-/// 802.11ac VHT Operation element (ID 192): 20/40 MHz, no center segment.
-fn vht_operation() -> Vec<u8> {
-    ie(192, &[0x00, 0x00, 0x00, 0x00, 0x00])
+/// 802.11ac VHT Operation element (ID 192). Encodes the 80/160 MHz width via the
+/// Channel Width field and the Center Frequency Segment channels.
+fn vht_operation(channel: u8, width: u16) -> Vec<u8> {
+    // Channel Width: 0 = 20/40 MHz, 1 = 80/160/80+80 (segments disambiguate).
+    let (cw, seg0, seg1) = match width {
+        80 => (1u8, center_channel(channel, 80, false), 0u8),
+        // 160 MHz, new encoding: width=1, seg0 = the 80 MHz center, seg1 = 160.
+        160 => (1u8, center_channel(channel, 80, false), center_channel(channel, 160, false)),
+        _ => (0u8, 0u8, 0u8),
+    };
+    ie(192, &[cw, seg0, seg1, 0x00, 0x00]) // + Basic VHT-MCS and NSS Set
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +375,16 @@ fn ext_ie(ext_id: u8, data: &[u8]) -> Vec<u8> {
 
 /// HE Capabilities element (ext ID 35): 6 MAC + 11 PHY capability octets and the
 /// supported HE-MCS/NSS set. Byte-golden from a `mac80211_hwsim` HE AP beacon.
+/// PHY generation advertised in beacons/responses. Cumulative and ordered:
+/// `Ht` (802.11n) < `Vht` (ac) < `He` (ax) < `Eht` (be) — `He` emits HT+VHT+HE.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum PhyMode {
+    Ht,
+    Vht,
+    He,
+    Eht,
+}
+
 pub fn he_capabilities() -> Vec<u8> {
     ext_ie(
         35,
@@ -282,19 +396,64 @@ pub fn he_capabilities() -> Vec<u8> {
     )
 }
 
+/// HE Operation element (ext ID 36) for 5 GHz / 2.4 GHz: neither the 6 GHz
+/// Operation Information (param bit 17) nor an embedded VHT Operation (bit 14) is
+/// present — the operating width comes from the separate HT/VHT Operation
+/// elements, while this element makes the BSS advertise 802.11ax (HE).
+pub fn he_operation_5ghz() -> Vec<u8> {
+    ext_ie(
+        36,
+        &[
+            0xf0, 0x3f, 0x00, // HE Operation Parameters (no 6 GHz / VHT info)
+            0x06, // BSS Color Information (color 6, NOT disabled — matches hostapd)
+            0xfc, 0xff, // Basic HE-MCS And NSS Set
+        ],
+    )
+}
+
 /// HE Operation element (ext ID 36) carrying the **6 GHz Operation Information**
 /// (the 6 GHz band has no HT/VHT Operation elements — this replaces them). The
 /// "6 GHz Operation Information Present" bit (param bit 17) is set.
-pub fn he_operation_6ghz(channel: u8) -> Vec<u8> {
+pub fn he_operation_6ghz(channel: u8, width: u16) -> Vec<u8> {
+    // 6 GHz Operation Information "Control" channel-width field: 0=20, 1=40,
+    // 2=80, 3=160 (HE caps at 160; 320 is carried by the EHT Operation element).
+    let (cw, seg0, seg1) = match width {
+        40 => (1u8, center_channel(channel, 40, true), 0u8),
+        80 => (2u8, center_channel(channel, 80, true), 0u8),
+        160 | 320 => (3u8, center_channel(channel, 80, true), center_channel(channel, 160, true)),
+        _ => (0u8, channel, 0u8),
+    };
     ext_ie(
         36,
         &[
             0xf0, 0x3f, 0x02, // HE Operation Parameters (bit 17 = 6 GHz info present)
-            0x86, // BSS Color Information
+            0x06, // BSS Color Information (color 6, NOT disabled — matches hostapd)
             0xfc, 0xff, // Basic HE-MCS And NSS Set
-            // 6 GHz Operation Information: primary, control(20 MHz, LPI),
-            // center seg0, center seg1, minimum rate.
-            channel, 0x00, channel, 0x00, 0x06,
+            // 6 GHz Operation Information: primary, control, seg0, seg1, min rate.
+            channel, cw, seg0, seg1, 0x06,
+        ],
+    )
+}
+
+/// 802.11be EHT Operation element (ext ID 106), carrying the EHT Operation
+/// Information needed for 320 MHz (and 160 MHz) on 6 GHz.
+pub fn eht_operation(channel: u8, width: u16, band6: bool) -> Vec<u8> {
+    // Control channel-width field: 0=20,1=40,2=80,3=160,4=320. CCFS1 is the
+    // center of the operating (widest) channel — the client reads center_freq1
+    // from it — and CCFS0 is the narrower (next-down) segment center.
+    let (cw, ccfs0, ccfs1) = match width {
+        320 => (4u8, center_channel(channel, 160, band6), center_channel(channel, 320, band6)),
+        160 => (3u8, center_channel(channel, 80, band6), center_channel(channel, 160, band6)),
+        80 => (2u8, center_channel(channel, 80, band6), 0u8),
+        40 => (1u8, center_channel(channel, 40, band6), 0u8),
+        _ => (0u8, channel, 0u8),
+    };
+    ext_ie(
+        106,
+        &[
+            0x01, // EHT Operation Parameters: EHT Operation Information Present
+            0x00, 0x00, 0x00, 0x00, // Basic EHT-MCS And NSS Set
+            cw, ccfs0, ccfs1, // EHT Operation Information: Control, CCFS0, CCFS1
         ],
     )
 }
@@ -325,10 +484,29 @@ pub fn multi_link_basic(mld_mac: &[u8; 6]) -> Vec<u8> {
 }
 
 /// EHT Capabilities element (ext ID 108) — minimal MAC/PHY capabilities so a
-/// Wi-Fi 7 client recognizes the BSS as EHT-capable.
-pub fn eht_capabilities() -> Vec<u8> {
-    // EHT MAC Capabilities (2) + EHT PHY Capabilities (9) + supported EHT-MCS/NSS.
-    ext_ie(108, &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22])
+/// Wi-Fi 7 client recognizes the BSS as EHT-capable. Bit 1 of the first EHT PHY
+/// Capabilities byte is "Support For 320 MHz In 6 GHz"; a station caps its width
+/// to this, so a 320 MHz BSS must set it (the EHT analogue of the VHT cap fix).
+pub fn eht_capabilities(width: u16) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::with_capacity(20);
+    data.extend_from_slice(&[0x00, 0x00]); // EHT MAC Capabilities (2)
+    let mut phy = [0u8; 9]; // EHT PHY Capabilities (9)
+    if width >= 320 {
+        phy[0] |= 0x02; // bit 1: Support For 320 MHz In 6 GHz
+    }
+    data.extend_from_slice(&phy);
+    // Supported EHT-MCS And NSS Set: one 3-byte map per bandwidth (Rx/Tx max NSS
+    // per MCS group; 0x22 = 2 streams). A 6 GHz AP carries the BW<=80 and 160
+    // maps, plus the 320 map when 320-capable — the length is derived from the
+    // PHY caps, so this must match or the whole element is discarded (client
+    // then falls back to the HE 160 MHz width).
+    let map = [0x22u8, 0x22, 0x22];
+    data.extend_from_slice(&map); // BW <= 80 MHz
+    data.extend_from_slice(&map); // BW = 160 MHz
+    if width >= 320 {
+        data.extend_from_slice(&map); // BW = 320 MHz
+    }
+    ext_ie(108, &data)
 }
 
 /// Reduced Neighbor Report element (ID 201): how a lower-band (2.4/5 GHz) AP
@@ -356,18 +534,25 @@ fn supported_operating_classes_6ghz() -> Vec<u8> {
 /// Beacon/probe/assoc IE block for a 6 GHz channel. 6 GHz is HE-only: no
 /// DSSS/HT/VHT, OFDM rates only, plus the HE Capabilities, HE Operation (with
 /// the 6 GHz Operation Information) and HE 6 GHz Band Capabilities elements.
-pub fn make_beacon_ies_6ghz(ssid: &[u8], channel: u8, country: &[u8; 2]) -> Vec<u8> {
+pub fn make_beacon_ies_6ghz(ssid: &[u8], channel: u8, country: &[u8; 2], width: u16, wmm: bool) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&ie(0, ssid)); // SSID
     v.extend_from_slice(&ie(1, &RATES_5GHZ)); // Supported Rates (OFDM)
     v.extend_from_slice(&country_ie(country, channel)); // Country
     v.extend_from_slice(&he_capabilities());
-    v.extend_from_slice(&he_operation_6ghz(channel));
+    v.extend_from_slice(&he_operation_6ghz(channel, width));
     v.extend_from_slice(&he_6ghz_band_capabilities());
+    // 802.11be: advertise EHT for 320 MHz (and 160) on 6 GHz.
+    if width >= 160 {
+        v.extend_from_slice(&eht_capabilities(width));
+        v.extend_from_slice(&eht_operation(channel, width, true));
+    }
     v.extend_from_slice(&extended_capabilities());
     v.extend_from_slice(&supported_operating_classes_6ghz());
     v.extend_from_slice(&rrm_enabled_capabilities());
-    v.extend_from_slice(&wmm_parameter());
+    if wmm {
+        v.extend_from_slice(&wmm_parameter());
+    }
     v
 }
 
@@ -396,7 +581,7 @@ fn rrm_enabled_capabilities() -> Vec<u8> {
 ///   * 2.4 GHz: DSSS/CCK + OFDM rates, a DS Parameter Set, and an Extended
 ///     Supported Rates element.
 ///   * 5 GHz: OFDM-only rates and no DSSS Parameter Set (DSSS is 2.4 GHz only).
-pub fn make_beacon_ies(ssid: &[u8], channel: u8, country: &[u8; 2]) -> Vec<u8> {
+pub fn make_beacon_ies(ssid: &[u8], channel: u8, country: &[u8; 2], width: u16, wmm: bool, phy: PhyMode) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&ie(0, ssid)); // SSID
     if is_5ghz(channel) {
@@ -410,18 +595,30 @@ pub fn make_beacon_ies(ssid: &[u8], channel: u8, country: &[u8; 2]) -> Vec<u8> {
     }
     // 802.11n HT
     v.extend_from_slice(&ht_capabilities());
-    v.extend_from_slice(&ht_operation(channel));
+    v.extend_from_slice(&ht_operation(channel, width, false));
     // 802.11ac VHT (5 GHz only)
-    if is_5ghz(channel) {
-        v.extend_from_slice(&vht_capabilities());
-        v.extend_from_slice(&vht_operation());
+    if is_5ghz(channel) && phy >= PhyMode::Vht {
+        v.extend_from_slice(&vht_capabilities(width));
+        v.extend_from_slice(&vht_operation(channel, width));
+    }
+    // 802.11ax HE
+    if phy >= PhyMode::He {
+        v.extend_from_slice(&he_capabilities());
+        v.extend_from_slice(&he_operation_5ghz());
+    }
+    // 802.11be EHT
+    if phy >= PhyMode::Eht {
+        v.extend_from_slice(&eht_capabilities(width));
+        v.extend_from_slice(&eht_operation(channel, width, false));
     }
     // Extended Capabilities (BTM, Beacon Protection), Operating Classes, RRM
     v.extend_from_slice(&extended_capabilities());
     v.extend_from_slice(&supported_operating_classes(channel));
     v.extend_from_slice(&rrm_enabled_capabilities());
     // WMM/QoS
-    v.extend_from_slice(&wmm_parameter());
+    if wmm {
+        v.extend_from_slice(&wmm_parameter());
+    }
     v
 }
 
@@ -449,13 +646,14 @@ fn llc_snap(ethertype: u16) -> [u8; 8] {
 // Management frames
 // ---------------------------------------------------------------------------
 
-pub fn build_beacon(bssid: &[u8; 6], ssid: &[u8], channel: u8, timestamp: u64, tail_ies: &[u8], country: &[u8; 2]) -> Vec<u8> {
+#[allow(clippy::too_many_arguments)]
+pub fn build_beacon(bssid: &[u8; 6], ssid: &[u8], channel: u8, timestamp: u64, tail_ies: &[u8], country: &[u8; 2], width: u16, wmm: bool, phy: PhyMode) -> Vec<u8> {
     let bcast = [0xffu8; 6];
     let mut v = dot11_header(TYPE_MGMT, SUBTYPE_BEACON, 0, &bcast, bssid, bssid, 0);
     v.extend_from_slice(&timestamp.to_le_bytes());
     v.extend_from_slice(&BEACON_INTERVAL_TU.to_le_bytes()); // beacon interval
     v.extend_from_slice(&CAP_3101);
-    v.extend_from_slice(&make_beacon_ies(ssid, channel, country));
+    v.extend_from_slice(&make_beacon_ies(ssid, channel, country, width, wmm, phy));
     v.extend_from_slice(&tim_element()); // TIM (beacon-only)
     v.extend_from_slice(tail_ies); // RSN (+ RSNXE for WPA3)
     v
@@ -464,25 +662,26 @@ pub fn build_beacon(bssid: &[u8; 6], ssid: &[u8], channel: u8, timestamp: u64, t
 /// Build a 6 GHz (HE-only) beacon. 6 GHz mandates WPA3, so `tail_ies` is the
 /// SAE/OWE RSN(+RSNXE). The capability field omits the "Privacy" short-slot
 /// bits that are 2.4/5 GHz specific.
-pub fn build_beacon_6ghz(bssid: &[u8; 6], ssid: &[u8], channel: u8, timestamp: u64, tail_ies: &[u8], country: &[u8; 2]) -> Vec<u8> {
+#[allow(clippy::too_many_arguments)]
+pub fn build_beacon_6ghz(bssid: &[u8; 6], ssid: &[u8], channel: u8, timestamp: u64, tail_ies: &[u8], country: &[u8; 2], width: u16, wmm: bool) -> Vec<u8> {
     let bcast = [0xffu8; 6];
     let mut v = dot11_header(TYPE_MGMT, SUBTYPE_BEACON, 0, &bcast, bssid, bssid, 0);
     v.extend_from_slice(&timestamp.to_le_bytes());
     v.extend_from_slice(&BEACON_INTERVAL_TU.to_le_bytes());
     v.extend_from_slice(&CAP_3101);
-    v.extend_from_slice(&make_beacon_ies_6ghz(ssid, channel, country));
+    v.extend_from_slice(&make_beacon_ies_6ghz(ssid, channel, country, width, wmm));
     v.extend_from_slice(&tim_element());
     v.extend_from_slice(tail_ies);
     v
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn build_probe_resp(bssid: &[u8; 6], dst: &[u8; 6], ssid: &[u8], channel: u8, timestamp: u64, sc: u16, tail_ies: &[u8], country: &[u8; 2]) -> Vec<u8> {
+pub fn build_probe_resp(bssid: &[u8; 6], dst: &[u8; 6], ssid: &[u8], channel: u8, timestamp: u64, sc: u16, tail_ies: &[u8], country: &[u8; 2], width: u16, band6: bool, wmm: bool, phy: PhyMode) -> Vec<u8> {
     let mut v = dot11_header(TYPE_MGMT, SUBTYPE_PROBE_RESP, 0, dst, bssid, bssid, sc);
     v.extend_from_slice(&timestamp.to_le_bytes());
     v.extend_from_slice(&BEACON_INTERVAL_TU.to_le_bytes());
     v.extend_from_slice(&CAP_3101);
-    v.extend_from_slice(&make_beacon_ies(ssid, channel, country));
+    v.extend_from_slice(&resp_ies(ssid, channel, country, width, band6, wmm, phy));
     v.extend_from_slice(tail_ies);
     v
 }
@@ -526,14 +725,36 @@ pub fn build_auth(bssid: &[u8; 6], dst: &[u8; 6], sc: u16) -> Vec<u8> {
     v
 }
 
+/// Build an open-system Authentication *rejection* (algo 0, seqnum 2) carrying a
+/// non-zero status code — e.g. status 13 (unsupported auth algorithm) when a
+/// SAE-only AP refuses an open-system request.
+pub fn build_auth_reject(bssid: &[u8; 6], dst: &[u8; 6], sc: u16, status: u16) -> Vec<u8> {
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_AUTH, 0, dst, bssid, bssid, sc);
+    v.extend_from_slice(&AUTH_ALG_OPEN.to_le_bytes());
+    v.extend_from_slice(&2u16.to_le_bytes());
+    v.extend_from_slice(&status.to_le_bytes());
+    v
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn build_assoc_resp(bssid: &[u8; 6], dst: &[u8; 6], ssid: &[u8], channel: u8, aid: u16, sc: u16, resp_subtype: u8, country: &[u8; 2]) -> Vec<u8> {
+pub fn build_assoc_resp(bssid: &[u8; 6], dst: &[u8; 6], ssid: &[u8], channel: u8, aid: u16, sc: u16, resp_subtype: u8, country: &[u8; 2], width: u16, band6: bool, wmm: bool, phy: PhyMode) -> Vec<u8> {
     let mut v = dot11_header(TYPE_MGMT, resp_subtype, 0, dst, bssid, bssid, sc);
     v.extend_from_slice(&CAP_3101);
     v.extend_from_slice(&0u16.to_le_bytes()); // status = success
     v.extend_from_slice(&aid.to_le_bytes());
-    v.extend_from_slice(&make_beacon_ies(ssid, channel, country));
+    v.extend_from_slice(&resp_ies(ssid, channel, country, width, band6, wmm, phy));
     v
+}
+
+/// IE block for a probe/association response: the band-correct beacon IEs (the
+/// HE-only 6 GHz set when `band6`, otherwise the 2.4/5 GHz HT/VHT set). A 6 GHz
+/// channel number (e.g. 37) also exists at 5 GHz, so we must not pick by channel.
+fn resp_ies(ssid: &[u8], channel: u8, country: &[u8; 2], width: u16, band6: bool, wmm: bool, phy: PhyMode) -> Vec<u8> {
+    if band6 {
+        make_beacon_ies_6ghz(ssid, channel, country, width, wmm)
+    } else {
+        make_beacon_ies(ssid, channel, country, width, wmm, phy)
+    }
 }
 
 pub fn build_deauth(bssid: &[u8; 6], dst: &[u8; 6], reason: u16) -> Vec<u8> {
@@ -918,12 +1139,14 @@ pub fn build_eapol_m1(bssid: &[u8; 6], sta: &[u8; 6], anonce: &[u8; 32], sc: u16
 /// Note: the reference `ap.py` appends a stray zero-length `DD 00` vendor
 /// element after the GTK; that is non-standard cruft and is intentionally not
 /// reproduced here.
-pub fn gtk_kde(gtk: &[u8]) -> Vec<u8> {
+pub fn gtk_kde(key_id: u8, gtk: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
     v.push(0xDD);
     v.push((gtk.len() + 6) as u8);
-    v.extend_from_slice(&[0x00, 0x0f, 0xac]);
-    v.extend_from_slice(&[0x01, 0x00, 0x00]);
+    // OUI(3) + KDE type(1 = GTK), then KeyInfo(1) + Reserved(1), then the GTK.
+    // KeyInfo bits 0-1 = Key ID, bit 2 = Tx.
+    v.extend_from_slice(&[0x00, 0x0f, 0xac, 0x01]);
+    v.extend_from_slice(&[key_id & 0x03, 0x00]);
     v.extend_from_slice(gtk);
     v
 }
@@ -1076,6 +1299,20 @@ pub fn bip_verify(igtk: &[u8; 16], fc0: u8, fc1: u8, a1: &[u8; 6], a2: &[u8; 6],
     crypto::constant_time_eq(&mic[..8], given)
 }
 
+/// Extract the 48-bit IPN (little-endian) from a frame's Management MIC element,
+/// for BIP replay protection. Returns `None` if no well-formed MME is present.
+pub fn bip_ipn(body_with_mme: &[u8]) -> Option<u64> {
+    if body_with_mme.len() < 18 {
+        return None;
+    }
+    let mme_off = body_with_mme.len() - 18;
+    if body_with_mme[mme_off] != EID_MME || body_with_mme[mme_off + 1] != 16 {
+        return None;
+    }
+    let p = &body_with_mme[mme_off + 4..mme_off + 10]; // KeyID(2) then IPN(6)
+    Some(u64::from_le_bytes([p[0], p[1], p[2], p[3], p[4], p[5], 0, 0]))
+}
+
 /// The BIGTK key-data encapsulation (KDE) for Beacon Protection: delivers the
 /// Beacon Integrity GTK. `DD len 00-0F-AC 14 KeyID(2 LE) IPN(6) BIGTK(16)`.
 pub fn bigtk_kde(key_id: u16, ipn: &[u8; 6], bigtk: &[u8; 16]) -> Vec<u8> {
@@ -1123,6 +1360,7 @@ pub fn build_eapol_m3(
     kck: &[u8],
     kek: &[u8],
     ap_rsn: &[u8],
+    gtk_key_id: u8,
     gtk: &[u8],
     igtk: Option<(u16, [u8; 6], [u8; 16])>,
     bigtk: Option<(u16, [u8; 6], [u8; 16])>,
@@ -1132,7 +1370,7 @@ pub fn build_eapol_m3(
 ) -> Vec<u8> {
     let mut plain = Vec::new();
     plain.extend_from_slice(ap_rsn);
-    plain.extend_from_slice(&gtk_kde(gtk));
+    plain.extend_from_slice(&gtk_kde(gtk_key_id, gtk));
     if let Some((key_id, ipn, ik)) = igtk {
         plain.extend_from_slice(&igtk_kde(key_id, &ipn, &ik));
     }
@@ -1247,12 +1485,21 @@ pub fn build_ccmp_data(
     tk: &[u8],
     ethertype: u16,
     inner_payload: &[u8],
+    qos_tid: Option<u8>,
 ) -> Vec<u8> {
-    let mut frame = dot11_header(TYPE_DATA, 0, flags, a1, a2, a3, sc);
+    // QoS Data (WMM) when a TID is given, else a plain Data frame.
+    let subtype = if qos_tid.is_some() { SUBTYPE_QOS_DATA } else { 0 };
+    let mut frame = dot11_header(TYPE_DATA, subtype, flags, a1, a2, a3, sc);
+    if let Some(tid) = qos_tid {
+        // QoS Control: TID (bits 0-3), normal ack, A-MSDU bit clear.
+        frame.push(tid & 0x0F);
+        frame.push(0x00);
+    }
 
     let fc_bytes = (frame[0], frame[1]);
-    let nonce = ccmp_get_nonce(0, a2, pn);
-    let aad = ccmp_get_aad(fc_bytes.0, fc_bytes.1, a1, a2, a3, sc, None);
+    let prio = qos_tid.unwrap_or(0);
+    let nonce = ccmp_get_nonce(prio, a2, pn);
+    let aad = ccmp_get_aad(fc_bytes.0, fc_bytes.1, a1, a2, a3, sc, qos_tid.map(|t| (t & 0x0F) as u16));
 
     let mut plaintext = Vec::with_capacity(8 + inner_payload.len());
     plaintext.extend_from_slice(&llc_snap(ethertype));
@@ -1293,6 +1540,12 @@ pub fn parse_igtk_kde(key_data: &[u8]) -> Option<(u16, [u8; 6], [u8; 16])> {
 
 /// Scan EAPOL key data for the GTK KDE (00-0F-AC type 1) and extract the GTK.
 pub fn parse_gtk_kde(key_data: &[u8]) -> Option<Vec<u8>> {
+    parse_gtk_kde_full(key_data).map(|(_, gtk)| gtk)
+}
+
+/// Like [`parse_gtk_kde`] but also returns the GTK Key ID (KeyInfo bits 0-1),
+/// so the receiver knows which CCMP key index the AP installed the GTK at.
+pub fn parse_gtk_kde_full(key_data: &[u8]) -> Option<(u8, Vec<u8>)> {
     let mut i = 0;
     while i + 2 <= key_data.len() {
         let id = key_data[i];
@@ -1303,7 +1556,8 @@ pub fn parse_gtk_kde(key_data: &[u8]) -> Option<Vec<u8>> {
         let body = &key_data[i + 2..i + 2 + len];
         if id == 0xDD && len >= 6 + 16 && body[..3] == [0x00, 0x0f, 0xac] && body[3] == 0x01 {
             // OUI(3) + type(1) + keyinfo(1) + reserved(1), then GTK
-            return Some(body[6..len].to_vec());
+            let key_id = body[4] & 0x03;
+            return Some((key_id, body[6..len].to_vec()));
         }
         i += 2 + len;
     }
@@ -1313,8 +1567,8 @@ pub fn parse_gtk_kde(key_data: &[u8]) -> Option<Vec<u8>> {
 /// Group Key Handshake message 1 (AP -> STA): delivers a fresh GTK (and IGTK)
 /// for rekeying, encrypted under the KEK and MIC'd with the KCK.
 #[allow(clippy::too_many_arguments)]
-pub fn build_group_key_msg1(bssid: &[u8; 6], sta: &[u8; 6], kck: &[u8], kek: &[u8], gtk: &[u8], igtk: Option<(u16, [u8; 6], [u8; 16])>, replay: u64, sc: u16, mic: KeyMic) -> Vec<u8> {
-    let mut plain = gtk_kde(gtk);
+pub fn build_group_key_msg1(bssid: &[u8; 6], sta: &[u8; 6], kck: &[u8], kek: &[u8], gtk_key_id: u8, gtk: &[u8], igtk: Option<(u16, [u8; 6], [u8; 16])>, replay: u64, sc: u16, mic: KeyMic) -> Vec<u8> {
+    let mut plain = gtk_kde(gtk_key_id, gtk);
     if let Some((kid, ipn, ik)) = igtk {
         plain.extend_from_slice(&igtk_kde(kid, &ipn, &ik));
     }
@@ -1388,6 +1642,13 @@ pub fn decrypt_ccmp(frame: &Dot11, tk: &[u8], from_ap: bool) -> Option<Vec<u8>> 
         return None;
     }
     if plaintext.len() < 8 {
+        return None;
+    }
+    // Require an RFC 1042 LLC/SNAP header (AA-AA-03-00-00-00) before trusting
+    // the EtherType. Without this, a decrypted payload that isn't SNAP-framed
+    // (e.g. a crafted A-MSDU subframe list) would be decapsulated with an
+    // attacker-chosen EtherType/destination — the A-MSDU/aggregation FragAttack.
+    if plaintext[..6] != [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00] {
         return None;
     }
     // LLC/SNAP: skip 6 bytes, ethertype at [6..8], L3 follows
@@ -1515,6 +1776,17 @@ pub fn build_assoc_resp_comeback(bssid: &[u8; 6], sta: &[u8; 6], comeback_ms: u3
     v.push(5);
     v.push(3);
     v.extend_from_slice(&comeback_ms.to_le_bytes());
+    v
+}
+
+/// An Association Response carrying a non-success status code and no AID — a
+/// plain rejection (e.g. status 1, unspecified failure, for the SAE/OWE
+/// anti-downgrade denial).
+pub fn build_assoc_resp_reject(bssid: &[u8; 6], sta: &[u8; 6], status: u16, resp_subtype: u8, sc: u16) -> Vec<u8> {
+    let mut v = dot11_header(TYPE_MGMT, resp_subtype, 0, sta, bssid, bssid, sc);
+    v.extend_from_slice(&CAP_3101);
+    v.extend_from_slice(&status.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes()); // AID 0
     v
 }
 
@@ -1687,6 +1959,18 @@ impl Dot11 {
     /// QoS priority/TID (`dot11_get_priority`): 0 when not a QoS frame.
     pub fn priority(&self) -> u16 {
         self.qos.map(|q| q & 0x000F).unwrap_or(0)
+    }
+
+    /// `true` if the QoS Control A-MSDU-Present bit (bit 7) is set, i.e. the
+    /// payload is an aggregated A-MSDU subframe list rather than a single MSDU.
+    pub fn is_amsdu(&self) -> bool {
+        self.qos.map(|q| q & 0x0080 != 0).unwrap_or(false)
+    }
+
+    /// `true` if this is a fragment: the More-Fragments bit is set, or the
+    /// Fragment Number (low 4 bits of the Sequence Control) is non-zero.
+    pub fn is_fragment(&self) -> bool {
+        (self.fc1 & 0x04) != 0 || (self.sc & 0x000F) != 0
     }
 
     /// `true` if this is an EAPOL frame (LLC/SNAP with ethertype 0x888E).

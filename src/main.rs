@@ -49,9 +49,17 @@ fn parse_args() -> Config {
             "--psk" => cfg.passphrase = next(i),
             "--mac" => cfg.mac = mac_to_bytes(&next(i)),
             "--channel" => cfg.channel = next(i).parse().unwrap_or(cfg.channel),
+            "--width" => cfg.width = next(i).parse().unwrap_or(cfg.width),
+            "--phy" => {
+                cfg.phy = barely_ap::config::parse_phy(&next(i)).unwrap_or_else(|e| {
+                    eprintln!("barely-ap: {e}");
+                    std::process::exit(1);
+                })
+            }
             "--ip" => cfg.ip = parse_ip(&next(i)).unwrap_or(cfg.ip),
             "--mode" => cfg.mode = next(i),
             "--iface" => cfg.iface = next(i),
+            "--ctrl" => cfg.ctrl_path = Some(next(i)),
             "--sae" => cfg.key_mgmt = KeyMgmt::Sae,
             "--owe" => cfg.key_mgmt = KeyMgmt::Owe,
             "--transition" => cfg.key_mgmt = KeyMgmt::SaeTransition,
@@ -64,6 +72,7 @@ fn parse_args() -> Config {
                 eprintln!("barely-ap [--config FILE.json] [--ssid NAME] [--psk PASS] [--mac MAC]");
                 eprintln!("          [--channel N] [--ip IP] [--mode stdio|iface|netlink] [--iface NAME]");
                 eprintln!("          [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--band6] [--per-sta-vif]");
+                eprintln!("          [--ctrl PATH]   (netlink: hostapd-style control socket; multi-BSS via config `bss`)");
                 std::process::exit(0);
             }
             other => {
@@ -79,6 +88,10 @@ fn parse_args() -> Config {
 
 fn main() {
     let cfg = parse_args();
+    if let Err(e) = cfg.validate() {
+        eprintln!("barely-ap: invalid configuration: {e}");
+        std::process::exit(1);
+    }
     let ap = cfg.build_ap();
     let net = FakeNet::new(cfg.mac, cfg.ip);
     let beacon_interval = Duration::from_millis(50);
@@ -106,7 +119,11 @@ fn main() {
     // The nl80211/"netlink" mode offloads beaconing + data-plane CCMP to the
     // kernel, so it drives the bare `Ap` (no userspace frame/event loop).
     if cfg.mode == "netlink" {
-        run_netlink(ap, &cfg.iface, channel);
+        let extra: Vec<Ap> = cfg.bss.iter().map(|b| cfg.build_bss_ap(b)).collect();
+        if !extra.is_empty() {
+            eprintln!("barely-ap: + {} additional BSS(es) on this radio", extra.len());
+        }
+        run_netlink(ap, extra, &cfg.iface, channel, cfg.ctrl_path.as_deref());
         return;
     }
 
@@ -145,15 +162,15 @@ fn run_iface(_node: ApNode, _iface: &str, _channel: u8, _band6: bool) {
 }
 
 #[cfg(target_os = "linux")]
-fn run_netlink(ap: Ap, iface: &str, channel: u8) {
-    if let Err(e) = barely_ap::netlink::run_offload_ap(ap, iface, channel) {
+fn run_netlink(ap: Ap, extra: Vec<Ap>, iface: &str, channel: u8, ctrl_path: Option<&str>) {
+    if let Err(e) = barely_ap::netlink::run_offload_aps(ap, extra, iface, channel, ctrl_path) {
         eprintln!("netlink AP failed on {iface}: {e}");
         std::process::exit(1);
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_netlink(_ap: Ap, _iface: &str, _channel: u8) {
+fn run_netlink(_ap: Ap, _extra: Vec<Ap>, _iface: &str, _channel: u8, _ctrl_path: Option<&str>) {
     eprintln!("netlink mode is only supported on Linux; use --mode stdio");
     std::process::exit(1);
 }

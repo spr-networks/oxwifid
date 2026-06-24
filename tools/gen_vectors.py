@@ -304,8 +304,10 @@ assert captured, "create_eapol_3 did not send message 3 (MIC check failed?)"
 
 # Then build the golden message 3 with a *standard* GTK KDE (the reference adds a
 # stray zero-length `DD 00` vendor element after the GTK; a real AP must not).
+# The GTK KDE KeyInfo byte advertises the GTK key id; group keys use index 1 (0
+# is the pairwise key), matching the CCMP index the AP TXes group frames at.
 GTK16 = FIXED_GTK_FULL[:16]
-gtk_kde_std = bytes([0xDD, len(GTK16) + 6]) + b"\x00\x0f\xac" + b"\x01\x00\x00" + GTK16
+gtk_kde_std = bytes([0xDD, len(GTK16) + 6]) + b"\x00\x0f\xac\x01" + b"\x01\x00" + GTK16
 m3_plain = pad_key_data(RSN + gtk_kde_std)
 m3_keydata = aes_wrap(PTK[16:32], m3_plain)  # KEK
 m3_ek = EAPOL_KEY(

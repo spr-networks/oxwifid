@@ -30,6 +30,13 @@ pub trait Link {
     fn try_recv(&mut self, timeout: Duration) -> Option<Vec<u8>>;
     /// Transmit a frame.
     fn send(&mut self, frame: &[u8]);
+    /// Whether the link has closed (e.g. stdin reached EOF). The event loop
+    /// stops when this is true; a transport that never closes (a raw socket)
+    /// keeps the default `false`. Without this, a closed channel makes
+    /// `try_recv` return immediately every iteration and the loop busy-spins.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 /// A protocol participant driven by the event loop.
@@ -63,6 +70,11 @@ pub fn run<L: Link, N: Node>(mut node: N, mut link: L) {
                 link.send(&f);
             }
         }
+        // Stop cleanly once the transport closes (stdin EOF) rather than
+        // busy-spinning on a disconnected channel.
+        if link.is_closed() {
+            break;
+        }
     }
 }
 
@@ -85,6 +97,12 @@ impl Node for ApNode {
         // without deauthing is otherwise never reaped.
         let mut frames = vec![self.ap.beacon_frame()];
         frames.extend(self.ap.prune_idle(Duration::from_secs(300)));
+        // Retransmit any pending EAPOL m1/m3 whose m2/m4 was lost (handshake
+        // reliability); deauth stations whose 4-way never completes.
+        frames.extend(self.ap.tick().frames);
+        for ev in self.ap.drain_events() {
+            eprintln!("{}", ev.to_line());
+        }
         frames
     }
     fn on_frame(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
@@ -94,6 +112,9 @@ impl Node for ApNode {
             for reply in self.net.input(eth) {
                 frames.extend(self.ap.deliver_to_station(&reply));
             }
+        }
+        for ev in self.ap.drain_events() {
+            eprintln!("{}", ev.to_line());
         }
         frames
     }
@@ -105,6 +126,9 @@ pub struct ClientNode {
     pub client: Client,
     pub tick: Duration,
     pub ping_gateway: Option<([u8; 6], [u8; 4], [u8; 4])>, // (gw_mac, src_ip, gw_ip)
+    /// IP ToS byte (DSCP << 2) stamped on the test ping, so the WMM classifier
+    /// picks the matching access category.
+    pub ping_tos: u8,
     announced: bool,
     pinged: bool,
 }
@@ -115,6 +139,7 @@ impl ClientNode {
             client,
             tick,
             ping_gateway,
+            ping_tos: 0,
             announced: false,
             pinged: false,
         }
@@ -134,7 +159,7 @@ impl Node for ClientNode {
         }
         if self.client.connected == 4 && !self.pinged {
             if let Some((gw_mac, src_ip, gw_ip)) = self.ping_gateway {
-                let eth = self.client.build_ping(&gw_mac, src_ip, gw_ip);
+                let eth = self.client.build_ping(&gw_mac, src_ip, gw_ip, self.ping_tos);
                 if let Some(f) = self.client.encrypt_uplink(&eth) {
                     frames.push(f);
                     self.pinged = true;
@@ -147,12 +172,22 @@ impl Node for ClientNode {
 
     fn on_frame(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
         let out = self.client.handle_incoming(frame);
+        let mut frames = out.frames;
         for eth in &out.to_network {
             if is_icmp_echo_reply(eth) {
                 eprintln!("PING_REPLY_OK");
             }
+            // Answer the AP's ARP request for our IP so it can route the ICMP
+            // echo reply back to us (the AP's kernel needs our MAC first).
+            if let Some((_, src_ip, _)) = self.ping_gateway {
+                if let Some(reply) = self.client.build_arp_reply(eth, src_ip) {
+                    if let Some(f) = self.client.encrypt_uplink(&reply) {
+                        frames.push(f);
+                    }
+                }
+            }
         }
-        out.frames
+        frames
     }
 }
 
@@ -194,6 +229,9 @@ pub(crate) fn extract_frames(buf: &[u8]) -> (Vec<Vec<u8>>, usize) {
 pub struct StdioLink {
     rx: Receiver<Vec<u8>>,
     out: std::io::Stdout,
+    /// Set once stdin reaches EOF (the reader thread exits and the channel
+    /// disconnects), so the event loop exits instead of busy-spinning.
+    closed: bool,
 }
 
 impl StdioLink {
@@ -223,6 +261,7 @@ impl StdioLink {
         StdioLink {
             rx,
             out: std::io::stdout(),
+            closed: false,
         }
     }
 }
@@ -235,7 +274,22 @@ impl Default for StdioLink {
 
 impl Link for StdioLink {
     fn try_recv(&mut self, timeout: Duration) -> Option<Vec<u8>> {
-        self.rx.recv_timeout(timeout).ok()
+        use std::sync::mpsc::RecvTimeoutError;
+        match self.rx.recv_timeout(timeout) {
+            Ok(frame) => Some(frame),
+            Err(RecvTimeoutError::Timeout) => None,
+            // stdin reached EOF: the reader thread exited and dropped the sender.
+            // Recording it lets the loop stop; otherwise `recv_timeout` returns
+            // immediately every call and the loop spins at 100% CPU.
+            Err(RecvTimeoutError::Disconnected) => {
+                self.closed = true;
+                None
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
     }
 
     fn send(&mut self, frame: &[u8]) {
@@ -250,6 +304,46 @@ impl Link for StdioLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression: a closed link (stdin EOF) must end the loop, not busy-spin.
+    #[test]
+    fn run_exits_when_link_closes() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        struct ClosedLink;
+        impl Link for ClosedLink {
+            fn try_recv(&mut self, _t: Duration) -> Option<Vec<u8>> {
+                None
+            }
+            fn send(&mut self, _f: &[u8]) {}
+            fn is_closed(&self) -> bool {
+                true
+            }
+        }
+        struct NoopNode;
+        impl Node for NoopNode {
+            fn tick_interval(&self) -> Duration {
+                Duration::from_millis(10)
+            }
+            fn on_tick(&mut self) -> Vec<Vec<u8>> {
+                vec![]
+            }
+            fn on_frame(&mut self, _f: &[u8]) -> Vec<Vec<u8>> {
+                vec![]
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            run(NoopNode, ClosedLink);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "run() must exit when the link closes (no busy-spin on stdin EOF)"
+        );
+    }
 
     #[test]
     fn frame_extraction_handles_partial_and_multiple() {

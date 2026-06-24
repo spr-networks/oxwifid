@@ -14,10 +14,25 @@ use crate::dot11;
 /// Per-station auth/assoc backoff (matches `BACKOFF = 0.25`).
 const BACKOFF: Duration = Duration::from_millis(250);
 
+/// Retransmit a pending EAPOL m1/m3 if its m2/m4 hasn't arrived within this long
+/// (hostapd's `wpa_group_update_count`/`eapol_key_timeout`), up to
+/// [`MAX_EAPOL_RETRIES`] times before giving up and deauthenticating.
+const EAPOL_TIMEOUT: Duration = Duration::from_millis(1000);
+const MAX_EAPOL_RETRIES: u8 = 4;
+
+/// Cap on the PMKSA (fast-reconnect PMK) cache. hostapd bounds + expires these;
+/// we cap the size so the cache can't grow without bound over a long uptime with
+/// many distinct clients. An evicted client simply re-runs the full SAE/auth.
+const PMKSA_CACHE_MAX: usize = 256;
+
 pub struct Station {
     pub mac: [u8; 6],
     pub associated: bool,
     pub eapol_ready: bool,
+    /// Keys derived from a valid m2 and m3 sent; awaiting the STA's m4 ACK.
+    /// `associated` is only set once m4's MIC verifies, so the AP (and the
+    /// kernel, in netlink mode) authorizes the station only after the full 4-way.
+    pub awaiting_m4: bool,
     pub anonce: Option<[u8; 32]>,
     pub kck: [u8; 16],
     pub kek: [u8; 16],
@@ -46,6 +61,27 @@ pub struct Station {
     /// Per-station GTK, used only in `per_sta_vif` mode so each station's VLAN
     /// has its own group key (broadcast isolation). Ignored otherwise.
     pub gtk: [u8; 16],
+    /// Fingerprint of the client's association characteristics, for the failure
+    /// log (set at association; 0 before then).
+    pub traits: u64,
+    /// Whether this station negotiated WMM (its (Re)Assoc Request carried the
+    /// WMM Information element); gates QoS Data frames on the downlink to it.
+    pub wmm: bool,
+    /// The IE block from the station's (Re)Assoc Request, so the netlink station
+    /// setup can hand the driver the station's HT/VHT/HE capabilities for rate
+    /// control. Empty until associated.
+    pub assoc_ies: Vec<u8>,
+    /// The last EAPOL m1/m3 (radiotap-prefixed) sent to this station that is
+    /// still awaiting its m2/m4. Retransmitted on a timer if no reply arrives,
+    /// so a single dropped handshake frame doesn't stall the 4-way forever.
+    pub pending_eapol: Option<Vec<u8>>,
+    /// When `pending_eapol` was last (re)transmitted, and how many times.
+    pub eapol_tx: Instant,
+    pub eapol_retries: u8,
+    /// Awaiting this station's Group Key Handshake message 2 (its ACK of a GTK
+    /// rekey). Cleared on msg 2; while any station has it set, a fresh rekey is
+    /// not started (hostapd coalesces — `GKeyDoneStations`).
+    pub group_rekeying: bool,
 }
 
 impl Station {
@@ -53,6 +89,7 @@ impl Station {
         Station {
             mac,
             associated: false,
+            awaiting_m4: false,
             eapol_ready: false,
             anonce: None,
             kck: [0; 16],
@@ -71,6 +108,13 @@ impl Station {
             owe: false,
             last_activity: Instant::now(),
             gtk: random_bytes::<16>(),
+            traits: 0,
+            wmm: false,
+            assoc_ies: Vec::new(),
+            pending_eapol: None,
+            eapol_tx: Instant::now(),
+            eapol_retries: 0,
+            group_rekeying: false,
         }
     }
 
@@ -99,12 +143,47 @@ impl Outgoing {
     }
 }
 
+/// A notable AP state change, surfaced to the control interface and the log —
+/// mirrors hostapd's `AP-STA-*` control events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApEvent {
+    /// A station completed the 4-way handshake and is authorized to pass data.
+    Connected { mac: [u8; 6] },
+    /// A previously-connected station was torn down (it left, was reaped for
+    /// inactivity, or was kicked).
+    Disconnected { mac: [u8; 6], reason: u16 },
+    /// A fingerprinted failed-auth / decryption attempt — the `count` is how many
+    /// times this identical (station, fingerprint, kind) tuple has been seen.
+    AuthFailed { mac: [u8; 6], kind: crate::failures::FailureKind, count: u64 },
+}
+
+impl ApEvent {
+    /// Render as a hostapd-style control line, e.g. `AP-STA-CONNECTED 02:..:01`.
+    pub fn to_line(&self) -> String {
+        use crate::util::bytes_to_mac;
+        match self {
+            ApEvent::Connected { mac } => format!("AP-STA-CONNECTED {}", bytes_to_mac(mac)),
+            ApEvent::Disconnected { mac, reason } => {
+                format!("AP-STA-DISCONNECTED {} reason={reason}", bytes_to_mac(mac))
+            }
+            ApEvent::AuthFailed { mac, kind, count } => {
+                format!("AP-STA-AUTH-FAILED {} kind={} count={count}", bytes_to_mac(mac), kind.label())
+            }
+        }
+    }
+}
+
 pub struct Ap {
     pub mac: [u8; 6],
     pub ssid: Vec<u8>,
     /// 2-letter regulatory country code advertised in the beacon Country IE.
     pub country: [u8; 2],
     pub channel: u8,
+    /// Channel width in MHz (20/40/80/160/320); 20 unless widened.
+    pub channel_width: u16,
+    /// PHY generation advertised on 2.4/5 GHz: ac (VHT), ax (HE), or be (EHT).
+    /// 6 GHz is always HE+. Defaults to VHT to match prior behaviour.
+    phy_mode: dot11::PhyMode,
     pub pmk: [u8; 32],
     /// Passphrase, retained for WPA3-SAE PWE derivation.
     password: Vec<u8>,
@@ -117,6 +196,10 @@ pub struct Ap {
     aid: u16,
     group_pn: u64,
     gtk: [u8; 16],
+    /// GTK key id (CCMP key index). Toggles 1<->2 on each group rekey so a fresh
+    /// GTK gets a fresh index (hostapd's two-phase group rekey); stations and the
+    /// kernel are told which index the current GTK lives at.
+    gtk_key_id: u8,
     /// Integrity GTK + key id + IPN, delivered to PMF stations for BIP.
     igtk: [u8; 16],
     igtk_key_id: u16,
@@ -139,6 +222,9 @@ pub struct Ap {
     /// Per-station VIF: each station gets its own GTK (for an nl80211 AP_VLAN),
     /// isolating broadcast/multicast traffic between stations.
     per_sta_vif: bool,
+    /// WMM/WME QoS: advertise the WMM parameter element and send QoS Data frames
+    /// to stations that negotiated WMM.
+    wmm: bool,
     /// Operating Channel Validation (OCV): include + validate the OCI KDE.
     ocv: bool,
     /// OWE (Opportunistic Wireless Encryption): open + DH key exchange.
@@ -147,6 +233,21 @@ pub struct Ap {
     /// PMKSA cache: PMKID -> (PMK, sha256) for fast reconnect (hostapd `okc`).
     pmksa_cache: HashMap<[u8; 16], ([u8; 32], bool)>,
     stations: HashMap<[u8; 6], Station>,
+    /// Deduplicated log of failed auth / decryption attempts, fingerprinted by
+    /// client (intrusion detection).
+    failures: crate::failures::FailureLog,
+    /// Queued control events (connect/disconnect/auth-fail) drained by the run
+    /// loop / control interface.
+    events: Vec<ApEvent>,
+    /// GTK rekey period (hostapd `wpa_group_rekey`, default 600 s; 0 disables).
+    group_rekey_secs: u64,
+    /// Rekey the GTK when an authorized station leaves so it can no longer read
+    /// group traffic (hostapd `wpa_strict_rekey`, default on).
+    strict_rekey: bool,
+    /// When the GTK was last rotated (drives the periodic group rekey).
+    last_group_rekey: Instant,
+    /// A strict rekey is queued (a station left); the next `tick` performs it.
+    group_rekey_due: bool,
     /// Deterministic randomness hook for tests; `None` uses the OS RNG.
     test_anonce: Option<[u8; 32]>,
 }
@@ -163,6 +264,18 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
     getrandom::getrandom(&mut b).expect("OS RNG available");
     b
+}
+
+/// Increment a 6-octet BIP IPN, which is a LITTLE-endian counter in the MME
+/// (octet 0 is least significant). Carries upward from octet 0, matching how
+/// `dot11::bip_ipn` decodes it.
+fn inc_ipn_le(ipn: &mut [u8; 6]) {
+    for b in ipn.iter_mut() {
+        *b = b.wrapping_add(1);
+        if *b != 0 {
+            break;
+        }
+    }
 }
 
 fn prepend_radiotap(frame: Vec<u8>) -> Vec<u8> {
@@ -182,6 +295,8 @@ impl Ap {
             ssid: ssid.as_bytes().to_vec(),
             country: *b"US",
             channel,
+            channel_width: 20,
+            phy_mode: dot11::PhyMode::Vht,
             pmk,
             password: psk.as_bytes().to_vec(),
             sae_enabled: false,
@@ -191,6 +306,7 @@ impl Ap {
             aid: 0,
             group_pn: 1,
             gtk,
+            gtk_key_id: 1, // GTK key ids are 1/2
             igtk: random_bytes::<16>(),
             igtk_key_id: 4, // IGTK key ids are 4/5
             igtk_ipn: [0; 6],
@@ -204,13 +320,32 @@ impl Ap {
             rnr_6ghz: None,
             band6: false,
             per_sta_vif: false,
+            wmm: true,
             ocv: false,
             owe: false,
             sa_query_id: 0,
             pmksa_cache: HashMap::new(),
+            failures: crate::failures::FailureLog::default(),
+            events: Vec::new(),
+            group_rekey_secs: 600,
+            strict_rekey: true,
+            last_group_rekey: Instant::now(),
+            group_rekey_due: false,
             stations: HashMap::new(),
             test_anonce: None,
         }
+    }
+
+    /// Configure the periodic GTK rekey interval in seconds (hostapd
+    /// `wpa_group_rekey`); 0 disables periodic group rekeying.
+    pub fn set_group_rekey(&mut self, secs: u64) {
+        self.group_rekey_secs = secs;
+    }
+
+    /// Enable/disable rekeying the GTK when an authorized station leaves
+    /// (hostapd `wpa_strict_rekey`).
+    pub fn set_strict_rekey(&mut self, on: bool) {
+        self.strict_rekey = on;
     }
 
     /// Enable WPA3-SAE (H2E) authentication on this AP.
@@ -236,7 +371,7 @@ impl Ap {
         self.bigtk
     }
 
-    fn security_mode(&self) -> dot11::SecurityMode {
+    pub fn security_mode(&self) -> dot11::SecurityMode {
         if self.owe {
             dot11::SecurityMode::Owe
         } else if self.transition {
@@ -307,6 +442,36 @@ impl Ap {
         self.country = country;
     }
 
+    /// Set the operating channel width in MHz (20/40/80/160/320).
+    pub fn set_width(&mut self, width: u16) {
+        self.channel_width = width;
+    }
+
+    /// Set the PHY generation advertised on 2.4/5 GHz (ac/ax/be).
+    pub fn set_phy(&mut self, phy: dot11::PhyMode) {
+        self.phy_mode = phy;
+    }
+
+    /// Enable/disable WMM (advertise the WMM element + exchange QoS Data).
+    pub fn set_wmm(&mut self, wmm: bool) {
+        self.wmm = wmm;
+    }
+
+    /// Whether WMM/QoS is enabled.
+    pub fn wmm(&self) -> bool {
+        self.wmm
+    }
+
+    /// The operating channel width in MHz.
+    pub fn width(&self) -> u16 {
+        self.channel_width
+    }
+
+    /// Whether the AP operates on the 6 GHz band (`channel` is a 6 GHz channel).
+    pub fn band6(&self) -> bool {
+        self.band6
+    }
+
     /// Give each station its own GTK (per-station VIF / nl80211 AP_VLAN), so a
     /// station cannot read broadcast/multicast addressed to another's VLAN.
     pub fn enable_per_sta_vif(&mut self) {
@@ -360,9 +525,9 @@ impl Ap {
         let ts = self.current_timestamp();
         let tail = dot11::security_tail(self.security_mode());
         let mut frame = if self.band6 {
-            dot11::build_beacon_6ghz(&self.mac, &self.ssid, self.channel, ts, &tail, &self.country)
+            dot11::build_beacon_6ghz(&self.mac, &self.ssid, self.channel, ts, &tail, &self.country, self.channel_width, self.wmm)
         } else {
-            dot11::build_beacon(&self.mac, &self.ssid, self.channel, ts, &tail, &self.country)
+            dot11::build_beacon(&self.mac, &self.ssid, self.channel, ts, &tail, &self.country, self.channel_width, self.wmm, self.phy_mode)
         };
         // Channel Switch Announcement (802.11h)
         if let Some((nch, count)) = self.pending_csa {
@@ -386,12 +551,8 @@ impl Ap {
         }
         if self.beacon_prot {
             // Protect the beacon body with a BIP Management MIC Element (BIGTK).
-            for b in self.bigtk_ipn.iter_mut().rev() {
-                *b = b.wrapping_add(1);
-                if *b != 0 {
-                    break;
-                }
-            }
+            // The BIGTK IPN is the same little-endian counter as the IGTK's.
+            inc_ipn_le(&mut self.bigtk_ipn);
             let (fc0, fc1) = (frame[0], frame[1]);
             let bcast = [0xffu8; 6];
             let body = dot11::bip_protect(&self.bigtk, self.bigtk_key_id, &self.bigtk_ipn, fc0, fc1, &bcast, &self.mac, &self.mac, &frame[24..]);
@@ -485,7 +646,7 @@ impl Ap {
     fn send_probe_resp(&mut self, dst: &[u8; 6], out: &mut Outgoing) {
         let sc = self.next_sc();
         let ts = self.current_timestamp();
-        let frame = dot11::build_probe_resp(&self.mac, dst, &self.ssid, self.channel, ts, sc, &dot11::security_tail(self.security_mode()), &self.country);
+        let frame = dot11::build_probe_resp(&self.mac, dst, &self.ssid, self.channel, ts, sc, &dot11::security_tail(self.security_mode()), &self.country, self.channel_width, self.band6, self.wmm, self.phy_mode);
         out.tx(frame);
     }
 
@@ -506,29 +667,46 @@ impl Ap {
             return;
         }
 
+        // Anti-downgrade: a SAE-*only* AP must reject open-system Authentication
+        // outright (status 13, unsupported auth algorithm). Without this a station
+        // that never starts SAE could open-auth + associate and reach the WPA2 PSK
+        // 4-way (`self.pmk`), defeating WPA3. Transition mode still accepts open
+        // (it offers a PSK fallback); OWE and PSK use open-system auth and have
+        // `sae_enabled == false`, so they are unaffected by this gate.
+        if self.sae_enabled && !self.transition {
+            let sc = self.next_sc();
+            out.tx(dot11::build_auth_reject(&self.mac, &sta, sc, dot11::STATUS_UNSUPPORTED_AUTH_ALG));
+            return;
+        }
+
         // Open-system authentication (algorithm 0) -- WPA2/PSK
         let now = Instant::now();
         {
             let entry = self.stations.entry(sta).or_insert_with(|| Station::new(sta));
-            if let Some(t) = entry.last_auth {
-                if now.duration_since(t) < BACKOFF {
-                    return;
-                }
+            // A duplicate auth within the backoff window is a retransmission (the
+            // STA didn't get our response and retried). Re-answer it idempotently
+            // — dropping it would stall a client over a lossy link — but do NOT
+            // restart the session (that's only for a genuinely new auth).
+            let retransmit = entry.last_auth.map(|t| now.duration_since(t) < BACKOFF).unwrap_or(false);
+            if !retransmit {
+                entry.last_auth = Some(now);
+                // A (re-)Authentication restarts the station's session, as in
+                // hostapd: drop any prior 4-way / association state so a
+                // reconnecting client derives a fresh PTK against a fresh ANonce.
+                // Without this, a station that left without a (seen) deauth keeps
+                // its stale ANonce and keys, and the reconnect's 4-way fails with
+                // a MIC/"wrong key".
+                entry.anonce = None;
+                entry.eapol_ready = false;
+                entry.awaiting_m4 = false;
+                entry.associated = false;
+                entry.eapol_replay = 0;
+                entry.kck = [0; 16];
+                entry.kek = [0; 16];
+                entry.tk = [0; 16];
+                entry.gtk = random_bytes::<16>();
+                entry.pending_eapol = None; // no stale m1/m3 to retransmit
             }
-            entry.last_auth = Some(now);
-            // A (re-)Authentication restarts the station's session, as in
-            // hostapd: drop any prior 4-way / association state so a reconnecting
-            // client derives a fresh PTK against a fresh ANonce. Without this, a
-            // station that left without a (seen) deauth keeps its stale ANonce
-            // and keys, and the reconnect's 4-way fails with a MIC/"wrong key".
-            entry.anonce = None;
-            entry.eapol_ready = false;
-            entry.associated = false;
-            entry.eapol_replay = 0;
-            entry.kck = [0; 16];
-            entry.kek = [0; 16];
-            entry.tk = [0; 16];
-            entry.gtk = random_bytes::<16>();
         }
 
         // recv_pkt resets the sequence counter on auth
@@ -556,14 +734,17 @@ impl Ap {
                 }
             };
             if sae.parse_peer_commit(payload).is_err() {
+                self.record_failure(sta, crate::failures::FailureKind::Sae);
                 return;
             }
             sae.prepare_commit(None);
             // Reject a reflected commit (peer echoing our own scalar + element).
             if sae.is_reflection() {
+                self.record_failure(sta, crate::failures::FailureKind::Sae);
                 return;
             }
             if sae.process_commit().is_err() {
+                self.record_failure(sta, crate::failures::FailureKind::Sae);
                 return;
             }
 
@@ -592,10 +773,25 @@ impl Ap {
             // it gates association (see `handle_assoc_req`) and is the point at
             // which the PMK becomes mutually authenticated, so the PMKSA is
             // cached *here*, not on the unconfirmed commit.
-            let confirmed = match self.stations.get(sta).and_then(|s| s.sae.as_ref()) {
-                Some(sae) if sae.check_confirm(payload).is_ok() => Some((sae.pmkid.clone(), sae.pmk.clone())),
-                _ => return,
-            };
+            let confirm_ok = self
+                .stations
+                .get(sta)
+                .and_then(|s| s.sae.as_ref())
+                .map(|sae| sae.check_confirm(payload).is_ok());
+            match confirm_ok {
+                Some(true) => {}
+                // Confirm present but invalid -> wrong password / forged confirm.
+                Some(false) => {
+                    self.record_failure(sta, crate::failures::FailureKind::Sae);
+                    return;
+                }
+                None => return,
+            }
+            let confirmed = self
+                .stations
+                .get(sta)
+                .and_then(|s| s.sae.as_ref())
+                .map(|sae| (sae.pmkid.clone(), sae.pmk.clone()));
             if let Some(s) = self.stations.get_mut(sta) {
                 s.sae_confirmed = true;
             }
@@ -605,7 +801,7 @@ impl Ap {
                     id.copy_from_slice(&pmkid);
                     let mut k = [0u8; 32];
                     k.copy_from_slice(&pmk);
-                    self.pmksa_cache.insert(id, (k, true));
+                    self.cache_pmksa(id, k, true);
                 }
             }
         }
@@ -618,10 +814,25 @@ impl Ap {
         let sta = frame.addr2;
         let reassoc = frame.subtype() == dot11::SUBTYPE_REASSOC_REQ;
 
-        // An SAE station must have completed a *verified* SAE confirm before it
-        // may associate. Otherwise the mutual authentication is incomplete and
-        // we would derive a PTK from an unconfirmed PMK — the SAE confirm is the
-        // step that proves the peer actually holds the password.
+        // Fingerprint the client from its association characteristics (for the
+        // failure log), and note whether it negotiated WMM (the IE block starts
+        // after the fixed fields: 4 bytes for Assoc, 10 for Reassoc).
+        let ap_wmm = self.wmm;
+        let ie_off = if reassoc { 10 } else { 4 };
+        let client_wmm = frame.body.len() > ie_off && dot11::has_wmm_ie(&frame.body[ie_off..]);
+        if let Some(s) = self.stations.get_mut(&sta) {
+            s.traits = crate::failures::client_traits(&frame.body);
+            s.wmm = ap_wmm && client_wmm;
+            // Remember the station's capability IEs (HT/VHT/HE/rates) so the
+            // netlink station setup can hand them to the driver for rate control.
+            s.assoc_ies = frame.body.get(ie_off..).unwrap_or(&[]).to_vec();
+        }
+
+        // A station that began SAE must have a *verified* confirm before it may
+        // associate — otherwise the mutual authentication is incomplete and we'd
+        // derive a PTK from an unconfirmed PMK. (The anti-downgrade check that a
+        // WPA3-only AP doesn't fall back to the PSK 4-way lives in `handle_eapol`,
+        // so PMKSA fast-reconnect — which skips SAE with a cached PMK — still works.)
         if let Some(s) = self.stations.get(&sta) {
             if s.sae.is_some() && !s.sae_confirmed {
                 return;
@@ -693,23 +904,51 @@ impl Ap {
         }
 
         let resp_subtype = if reassoc { 0x03 } else { dot11::SUBTYPE_ASSOC_RESP };
+
+        // Anti-downgrade: a WPA3-SAE-only or OWE-only AP must not associate a
+        // station that has no SAE/OWE/cached PMK — otherwise it would fall back
+        // to the bare PSK 4-way (`self.pmk`), defeating WPA3/OWE and exposing the
+        // password to offline attack. SAE sets `pmk` at auth; OWE sets it from the
+        // DH element above (so an OWE assoc that *omits* the DH Parameter element
+        // leaves `pmk` unset and is rejected here, never falling back to the PSK
+        // 4-way); PMKSA fast-reconnect sets it from the cache. A station that did
+        // none of those is denied with status 1. Transition/WPA2 modes intentionally
+        // still allow the PSK path.
+        if matches!(self.security_mode(), dot11::SecurityMode::Wpa3Sae | dot11::SecurityMode::Owe)
+            && self.stations.get(&sta).map(|s| s.pmk.is_none()).unwrap_or(true)
+        {
+            let sc = self.next_sc();
+            out.tx(dot11::build_assoc_resp_reject(&self.mac, &sta, dot11::STATUS_UNSPECIFIED_FAILURE, resp_subtype, sc));
+            return;
+        }
+
         let aid = self.next_aid();
         let sc = self.next_sc();
-        let mut assoc = dot11::build_assoc_resp(&self.mac, &sta, &self.ssid, self.channel, aid, sc, resp_subtype, &self.country);
+        let mut assoc = dot11::build_assoc_resp(&self.mac, &sta, &self.ssid, self.channel, aid, sc, resp_subtype, &self.country, self.channel_width, self.band6, self.wmm, self.phy_mode);
         // Advertise a BSS Max Idle Period (~300 s) so the STA sends keep-alives.
         assoc.extend_from_slice(&dot11::bss_max_idle_element(300));
         if let Some(dh) = owe_dh_resp {
             assoc.extend_from_slice(&dh); // OWE DH Parameter element
         }
 
-        // Prepare EAPOL message 1 with a FRESH ANonce for every 4-way (every
-        // (re)association). Reusing the ANonce would let an attacker who forces
-        // a reassociation replay the station's earlier Message 2 — it still
-        // verifies under the unchanged PTK — and make the AP reinstall that PTK
-        // with its packet number reset to 1, a KRACK-style keystream/nonce
-        // reuse. A fresh ANonce changes the PTK, so a replayed old m2 fails its
-        // MIC and is rejected.
-        let anonce = self.test_anonce.unwrap_or_else(random_bytes::<32>);
+        // Prepare EAPOL message 1. Use a FRESH ANonce for every *new* 4-way:
+        // reusing it across a *re*association would let an attacker replay the
+        // station's earlier Message 2 (still valid under the unchanged PTK) and
+        // force a PTK reinstall with a reset packet number — KRACK-style nonce
+        // reuse. BUT a *duplicate* Association Request for a handshake already in
+        // progress (the STA didn't get our assoc-resp/m1 and retried) must reuse
+        // the same ANonce, or the STA's m2 — computed against the first m1 — no
+        // longer matches. So: reuse only while still awaiting this station's m2.
+        let in_progress = self
+            .stations
+            .get(&sta)
+            .map(|s| s.eapol_ready && s.anonce.is_some())
+            .unwrap_or(false);
+        let anonce = if in_progress {
+            self.stations.get(&sta).and_then(|s| s.anonce).unwrap()
+        } else {
+            self.test_anonce.unwrap_or_else(random_bytes::<32>)
+        };
         {
             let entry = self.stations.get_mut(&sta).unwrap();
             entry.anonce = Some(anonce);
@@ -718,6 +957,13 @@ impl Ap {
         let (sha256, owe) = self.stations.get(&sta).map(|s| (s.sha256, s.owe)).unwrap_or((false, false));
         let m1_sc = self.next_sc();
         let m1 = dot11::build_eapol_m1(&self.mac, &sta, &anonce, m1_sc, dot11::KeyMic::select(sha256, owe));
+
+        // Cache m1 (radiotap-prefixed) so it can be retransmitted if m2 is lost.
+        if let Some(entry) = self.stations.get_mut(&sta) {
+            entry.pending_eapol = Some(prepend_radiotap(m1.clone()));
+            entry.eapol_tx = Instant::now();
+            entry.eapol_retries = 0;
+        }
 
         out.tx(assoc);
         out.tx(m1);
@@ -728,22 +974,69 @@ impl Ap {
         if frame.addr1 != self.mac {
             return;
         }
-        // station must exist and be expecting message 2
-        let (anonce, ready) = match self.stations.get(&sta) {
-            Some(s) => (s.anonce, s.eapol_ready),
+        let (anonce, ready, awaiting_m4, kck, sha256_m4, owe_m4, group_rekeying, eapol_replay) = match self.stations.get(&sta) {
+            Some(s) => (s.anonce, s.eapol_ready, s.awaiting_m4, s.kck, s.sha256, s.owe, s.group_rekeying, s.eapol_replay),
             None => return,
         };
-        if !ready {
-            return;
-        }
-        let Some(anonce) = anonce else { return };
 
         let Some(eapol_frame) = frame.eapol_frame() else { return };
         let Some(key_body) = frame.eapol_key_body() else { return };
         let Some(ek) = dot11::EapolKey::parse(key_body) else { return };
 
-        // EAPOL-Key replay-counter enforcement: message 2 must echo the replay
-        // counter the AP used in message 1 (1). This rejects replayed/forged m2.
+        // Group Key Handshake message 2: an associated station's ACK of a GTK
+        // rekey (its replay counter echoes the message 1 we sent). Verify the MIC,
+        // then clear its rekey state; once every station has ACKed, the BSS is
+        // fully on the new GTK (hostapd's GKeyDoneStations reaching 0).
+        if group_rekeying && ek.key_replay_counter == eapol_replay {
+            let mic_off = 4 + ek.mic_offset;
+            if eapol_frame.len() < mic_off + 16 {
+                return;
+            }
+            let mut to_check = eapol_frame.to_vec();
+            for b in to_check[mic_off..mic_off + 16].iter_mut() {
+                *b = 0;
+            }
+            let computed = dot11::KeyMic::select(sha256_m4, owe_m4).compute(&kck, &to_check);
+            if crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
+                if let Some(s) = self.stations.get_mut(&sta) {
+                    s.group_rekeying = false;
+                    s.pending_eapol = None;
+                    s.last_activity = Instant::now();
+                }
+            }
+            return;
+        }
+
+        // Message 4 (replay counter 2): the STA's final ACK. Verify its MIC with
+        // the installed KCK, then mark the station associated — only here is the
+        // 4-way actually complete, so the AP (and the kernel, in netlink mode)
+        // authorizes the station only after a verified m4.
+        if awaiting_m4 && ek.key_replay_counter == 2 {
+            let mic_off = 4 + ek.mic_offset;
+            if eapol_frame.len() < mic_off + 16 {
+                return;
+            }
+            let mut to_check = eapol_frame.to_vec();
+            for b in to_check[mic_off..mic_off + 16].iter_mut() {
+                *b = 0;
+            }
+            let computed = dot11::KeyMic::select(sha256_m4, owe_m4).compute(&kck, &to_check);
+            if crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
+                if let Some(s) = self.stations.get_mut(&sta) {
+                    s.associated = true;
+                    s.awaiting_m4 = false;
+                    s.pending_eapol = None; // 4-way complete, nothing to retransmit
+                    self.events.push(ApEvent::Connected { mac: sta });
+                }
+            }
+            return;
+        }
+
+        // Message 2 must be expected and echo the replay counter from message 1.
+        if !ready {
+            return;
+        }
+        let Some(anonce) = anonce else { return };
         if ek.key_replay_counter != 1 {
             return;
         }
@@ -754,6 +1047,14 @@ impl Ap {
 
         // Use the SAE-derived PMK + SHA-256 key descriptors when the station
         // authenticated via WPA3-SAE; otherwise the PSK (PBKDF2) PMK + SHA-1.
+        // Anti-downgrade backstop: on a WPA3-SAE-only or OWE-only AP, a station
+        // with no SAE/OWE-derived or cached PMK must not be silently keyed via
+        // the PSK 4-way fallback.
+        if matches!(self.security_mode(), dot11::SecurityMode::Wpa3Sae | dot11::SecurityMode::Owe)
+            && self.stations.get(&sta).map(|s| s.pmk.is_none()).unwrap_or(true)
+        {
+            return;
+        }
         let (pmk, sha256, owe) = self
             .stations
             .get(&sta)
@@ -783,10 +1084,11 @@ impl Ap {
         }
         let computed = dot11::KeyMic::select(sha256, owe).compute(&kck, &to_check).to_vec();
         if !crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
-            // bad MIC -> deauth and drop the station
+            // bad MIC -> wrong PSK: log the (fingerprinted) attempt, deauth, drop.
+            self.record_failure(&sta, crate::failures::FailureKind::FourWayMic);
             let deauth = dot11::build_deauth(&self.mac, &sta, 1);
             out.tx(deauth);
-            self.stations.remove(&sta);
+            self.disconnect(&sta, 1);
             return;
         }
 
@@ -840,13 +1142,22 @@ impl Ap {
             dot11::RSN.to_vec()
         };
         // In per-station-VIF mode each station gets its own GTK (broadcast
-        // isolation); otherwise all stations share the BSS-wide GTK.
+        // isolation) at the fixed index 1; otherwise all stations share the
+        // BSS-wide GTK, whose index follows the rekey toggle.
         let gtk = self.station_gtk(&sta);
-        let m3 = dot11::build_eapol_m3(&self.mac, &sta, &anonce, &kck, &kek, &ap_rsn, &gtk, igtk, bigtk, oci, sc, dot11::KeyMic::select(sha256, owe));
-        out.tx(m3);
+        let gtk_key_id = if self.per_sta_vif { 1 } else { self.gtk_key_id };
+        let m3 = dot11::build_eapol_m3(&self.mac, &sta, &anonce, &kck, &kek, &ap_rsn, gtk_key_id, &gtk, igtk, bigtk, oci, sc, dot11::KeyMic::select(sha256, owe));
+        // Keys are derived and m3 is sent, but the station is not authorized
+        // until its m4 ACK verifies (see the top of `handle_eapol`). Cache m3 so
+        // it can be retransmitted if m4 is lost (m2 arrived, so the m1 cache is
+        // replaced by m3).
         if let Some(s) = self.stations.get_mut(&sta) {
-            s.associated = true;
+            s.awaiting_m4 = true;
+            s.pending_eapol = Some(prepend_radiotap(m3.clone()));
+            s.eapol_tx = Instant::now();
+            s.eapol_retries = 0;
         }
+        out.tx(m3);
         // 802.11v auto-steer: send an (unprotected, WPA2) BSS Transition
         // Management Request once associated. For PMF (WPA3/OWE) the request must
         // be CCMP-protected and is sent via `btm_request()` after the STA has
@@ -866,19 +1177,32 @@ impl Ap {
         if bssid != self.mac {
             return;
         }
-        let key_id = frame.ccmp_key_id();
-        let tk = match key_id {
-            0 => match self.stations.get(&sta) {
-                Some(s) if s.associated => s.tk,
-                _ => {
-                    // unknown station -> deauth
-                    let deauth = dot11::build_deauth(&self.mac, &sta, 9);
-                    out.tx(deauth);
-                    return;
-                }
-            },
-            1 => self.gtk,
-            _ => return,
+        // Drop aggregated (A-MSDU) and fragmented frames: the AP neither
+        // de-aggregates nor reassembles, and silently mis-parsing either is the
+        // A-MSDU-injection / fragmentation (FragAttacks) primitive.
+        if frame.is_amsdu() || frame.is_fragment() {
+            return;
+        }
+        // Uplink unicast data must be pairwise-encrypted (key id 0). A station
+        // must never send to-DS data under the group key (no per-frame group
+        // replay counter exists, and it would let any STA forge group traffic).
+        if frame.ccmp_key_id() != 0 {
+            return;
+        }
+        let tk = match self.stations.get(&sta) {
+            Some(s) if s.associated => s.tk,
+            // Known but mid-handshake: drop the (premature) data without
+            // deauthing, so a data frame that races ahead of m4 on a reordering
+            // link doesn't tear down a handshake that's about to complete.
+            Some(_) => return,
+            // Truly unknown station: the client thinks it's associated but the AP
+            // has no state for it (the AP restarted, or pruned it). Deauth (reason
+            // 7: class-3 frame from a non-associated STA) so the client tears down
+            // and re-handshakes instead of sending into a black hole.
+            None => {
+                out.tx(dot11::build_deauth(&self.mac, &sta, 7));
+                return;
+            }
         };
 
         // CCMP replay protection: the packet number must strictly increase.
@@ -886,24 +1210,22 @@ impl Ap {
             Some(p) => p,
             None => return,
         };
-        if key_id == 0 {
-            if let Some(s) = self.stations.get(&sta) {
-                if pn <= s.last_rx_pn {
-                    return; // replayed / out-of-order frame
-                }
+        if let Some(s) = self.stations.get(&sta) {
+            if pn <= s.last_rx_pn {
+                return; // replayed / out-of-order frame
             }
         }
 
-        if let Some(eth) = dot11::decrypt_ccmp(frame, &tk, false) {
+        match dot11::decrypt_ccmp(frame, &tk, false) {
             // sanity: source MAC in the Ethernet frame must match the station
-            if eth.len() >= 12 && eth[6..12] == sta {
-                if key_id == 0 {
-                    if let Some(s) = self.stations.get_mut(&sta) {
-                        s.last_rx_pn = pn;
-                    }
+            Some(eth) if eth.len() >= 12 && eth[6..12] == sta => {
+                if let Some(s) = self.stations.get_mut(&sta) {
+                    s.last_rx_pn = pn;
                 }
                 out.to_network.push(eth);
             }
+            Some(_) => {} // decrypted, but spoofed source MAC — drop quietly
+            None => self.record_failure(&sta, crate::failures::FailureKind::CcmpData),
         }
     }
 
@@ -924,9 +1246,12 @@ impl Ap {
         let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
         let inner = &eth[14..];
 
-        let (key_id, pn, tk, a1) = if is_multicast(&dst) || is_broadcast(&dst) {
+        let (key_id, pn, tk, a1, qos_tid) = if is_multicast(&dst) || is_broadcast(&dst) {
             let pn = self.next_group_pn();
-            (1u8, pn, self.gtk, dst)
+            // Group-addressed: encrypt at the current GTK key index (toggles
+            // 1<->2 on rekey), the same index advertised in the GTK KDE and
+            // installed in the kernel, so receivers select the matching key.
+            (self.gtk_key_id, pn, self.gtk, dst, None)
         } else {
             match self.stations.get(&dst) {
                 Some(s) if s.associated => {}
@@ -934,7 +1259,10 @@ impl Ap {
             }
             let s = self.stations.get_mut(&dst).unwrap();
             let pn = s.next_client_pn();
-            (0u8, pn, s.tk, dst)
+            // QoS Data to a WMM station, with the user priority derived from the
+            // packet's DSCP (so voice/video/etc. land in the right access category).
+            let qos = if s.wmm { Some(dot11::wmm_tid(eth)) } else { None };
+            (0u8, pn, s.tk, dst, qos)
         };
 
         let sc = self.next_sc();
@@ -949,6 +1277,7 @@ impl Ap {
             &tk,
             ethertype,
             inner,
+            qos_tid,
         );
         let mut f = dot11::RADIOTAP_TX.to_vec();
         f.extend_from_slice(&frame);
@@ -966,7 +1295,8 @@ impl Ap {
         };
         if !pmf {
             // WPA2 (no PMF): Deauth/Disassoc are unprotected, so tear down.
-            self.stations.remove(&sta);
+            let reason = frame.body.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
+            self.disconnect(&sta, reason);
             return;
         }
         // PMF: only a CCMP-valid frame from a station that has *completed the
@@ -983,7 +1313,9 @@ impl Ap {
                     return;
                 }
                 if dot11::decrypt_ccmp_mgmt(frame, &tk).is_some() {
-                    self.stations.remove(&sta);
+                    self.disconnect(&sta, 0);
+                } else {
+                    self.record_failure(&sta, crate::failures::FailureKind::ProtectedMgmt);
                 }
             }
         }
@@ -1015,6 +1347,7 @@ impl Ap {
             return;
         }
         let Some(plain) = dot11::decrypt_ccmp_mgmt(frame, &tk) else {
+            self.record_failure(&sta, crate::failures::FailureKind::ProtectedMgmt);
             return;
         };
         if let Some(s) = self.stations.get_mut(&sta) {
@@ -1032,6 +1365,161 @@ impl Ap {
     /// Whether a station has completed the handshake.
     pub fn is_associated(&self, sta: &[u8; 6]) -> bool {
         self.stations.get(sta).map(|s| s.associated).unwrap_or(false)
+    }
+
+    /// Periodic maintenance for handshake reliability: retransmit any pending
+    /// EAPOL m1/m3 whose m2/m4 hasn't arrived within [`EAPOL_TIMEOUT`], and
+    /// deauthenticate (and drop) a station whose 4-way still hasn't completed
+    /// after [`MAX_EAPOL_RETRIES`]. The transport calls this on its tick so a
+    /// single dropped handshake frame self-heals instead of stalling forever.
+    pub fn tick(&mut self) -> Outgoing {
+        let mut out = Outgoing::default();
+        let now = Instant::now();
+
+        // Key lifecycle: a queued strict rekey (a station left) or the periodic
+        // `wpa_group_rekey` interval triggers a Group Key Handshake. rekey_gtk()
+        // coalesces if one is already in flight, and arms each msg 1 for
+        // retransmit through the loop below.
+        let periodic = self.group_rekey_secs > 0
+            && now.duration_since(self.last_group_rekey) >= Duration::from_secs(self.group_rekey_secs)
+            && self.stations.values().any(|s| s.associated);
+        if self.group_rekey_due || periodic {
+            self.group_rekey_due = false;
+            out.frames.extend(self.rekey_gtk());
+        }
+
+        let mut timed_out: Vec<[u8; 6]> = Vec::new();
+        for (mac, s) in self.stations.iter_mut() {
+            let Some(frame) = s.pending_eapol.as_ref() else { continue };
+            if now.duration_since(s.eapol_tx) < EAPOL_TIMEOUT {
+                continue;
+            }
+            if s.eapol_retries >= MAX_EAPOL_RETRIES {
+                timed_out.push(*mac);
+            } else {
+                out.frames.push(frame.clone()); // already radiotap-prefixed
+                s.eapol_tx = now;
+                s.eapol_retries += 1;
+            }
+        }
+        for mac in timed_out {
+            self.disconnect(&mac, 15);
+            let deauth = dot11::build_deauth(&self.mac, &mac, 15); // 4-way timeout
+            out.tx(deauth);
+        }
+        out
+    }
+
+    /// Test hook: age the group-rekey clock past `wpa_group_rekey` so the next
+    /// [`Ap::tick`] performs a periodic Group Key Handshake. Set a small
+    /// `wpa_group_rekey` first so the back-dated instant stays valid.
+    #[doc(hidden)]
+    pub fn test_expire_group_rekey(&mut self) {
+        let ago = Duration::from_secs(self.group_rekey_secs.saturating_add(1));
+        self.last_group_rekey = Instant::now().checked_sub(ago).unwrap_or(self.last_group_rekey);
+    }
+
+    /// Test hook: age every pending EAPOL frame past the retransmit timeout so a
+    /// subsequent [`Ap::tick`] retransmits (or times out) deterministically.
+    #[doc(hidden)]
+    pub fn test_expire_eapol(&mut self) {
+        let past = Instant::now() - EAPOL_TIMEOUT - Duration::from_millis(1);
+        for s in self.stations.values_mut() {
+            if s.pending_eapol.is_some() {
+                s.eapol_tx = past;
+            }
+        }
+    }
+
+    /// Log a failed authentication / decryption attempt, fingerprinted by the
+    /// client (its MAC plus the traits hash captured at association).
+    /// Insert a PMK into the PMKSA cache, evicting one entry when at capacity so
+    /// the cache stays bounded ([`PMKSA_CACHE_MAX`]) instead of growing forever.
+    fn cache_pmksa(&mut self, id: [u8; 16], pmk: [u8; 32], sha256: bool) {
+        if self.pmksa_cache.len() >= PMKSA_CACHE_MAX && !self.pmksa_cache.contains_key(&id) {
+            if let Some(victim) = self.pmksa_cache.keys().next().copied() {
+                self.pmksa_cache.remove(&victim);
+            }
+        }
+        self.pmksa_cache.insert(id, (pmk, sha256));
+    }
+
+    /// Test hook: insert a dummy PMKSA entry (exercises the cache bound).
+    #[doc(hidden)]
+    pub fn test_cache_pmksa(&mut self, id: [u8; 16]) {
+        self.cache_pmksa(id, [0u8; 32], true);
+    }
+
+    /// Number of cached PMKSA entries (for tests).
+    #[doc(hidden)]
+    pub fn pmksa_len(&self) -> usize {
+        self.pmksa_cache.len()
+    }
+
+    fn record_failure(&mut self, sta: &[u8; 6], kind: crate::failures::FailureKind) {
+        let traits = self.stations.get(sta).map(|s| s.traits).unwrap_or(0);
+        let count = self.failures.record(*sta, traits, kind);
+        self.events.push(ApEvent::AuthFailed { mac: *sta, kind, count });
+        eprintln!(
+            "AP: {} failure from {} (attempt #{count}, traits {:#018x})",
+            kind.label(),
+            crate::util::bytes_to_mac(sta),
+            traits
+        );
+    }
+
+    /// Remove a station, emitting a `Disconnected` event if it had completed the
+    /// 4-way — so connect/disconnect events pair up like hostapd's. A station
+    /// torn down mid-handshake never connected, so it produces no event.
+    fn disconnect(&mut self, sta: &[u8; 6], reason: u16) {
+        if let Some(s) = self.stations.remove(sta) {
+            if s.associated {
+                self.events.push(ApEvent::Disconnected { mac: *sta, reason });
+                // hostapd `wpa_strict_rekey`: an authorized station that held the
+                // GTK is leaving — rotate the GTK so it can't read future group
+                // traffic. Only worthwhile if other stations remain to receive
+                // the new key; the next tick performs the rekey.
+                if self.strict_rekey && self.stations.values().any(|o| o.associated) {
+                    self.group_rekey_due = true;
+                }
+            }
+        }
+    }
+
+    /// Drain the control events (connect/disconnect/auth-fail) queued since the
+    /// last call — consumed by the control interface and event logging.
+    pub fn drain_events(&mut self) -> Vec<ApEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// The MAC addresses of every known station (for the control interface).
+    pub fn station_macs(&self) -> Vec<[u8; 6]> {
+        self.stations.keys().copied().collect()
+    }
+
+    /// The capability IE block from a station's (Re)Assoc Request (HT/VHT/HE/
+    /// rates), for handing to the kernel on association so rate control works.
+    pub fn station_assoc_ies(&self, sta: &[u8; 6]) -> Option<&[u8]> {
+        self.stations.get(sta).map(|s| s.assoc_ies.as_slice())
+    }
+
+    /// Administratively deauthenticate a station: tears it down (emitting a
+    /// `Disconnected` event) and returns the radiotap-prefixed deauth to send,
+    /// or `None` if the station is unknown. PMF stations get a protected deauth.
+    pub fn kick(&mut self, mac: &[u8; 6]) -> Option<Vec<u8>> {
+        if !self.stations.contains_key(mac) {
+            return None;
+        }
+        let frame = self
+            .protected_deauth(mac, 3)
+            .unwrap_or_else(|| prepend_radiotap(dot11::build_deauth(&self.mac, mac, 3)));
+        self.disconnect(mac, 3);
+        Some(frame)
+    }
+
+    /// The deduplicated, fingerprinted log of failed auth / decryption attempts.
+    pub fn failures(&self) -> &crate::failures::FailureLog {
+        &self.failures
     }
 
     /// The *installed* pairwise key for a station: the TK only once the 4-way is
@@ -1099,7 +1587,7 @@ impl Ap {
                 f
             });
             frames.push(frame);
-            self.stations.remove(&sta);
+            self.disconnect(&sta, 4);
         }
         frames
     }
@@ -1114,14 +1602,53 @@ impl Ap {
         self.gtk
     }
 
+    /// The CCMP key index the current BSS-wide GTK is installed at (toggles
+    /// 1<->2 on each group rekey). Used by the netlink path to install the GTK
+    /// at the same index the stations were told.
+    pub fn gtk_key_id(&self) -> u8 {
+        self.gtk_key_id
+    }
+
+    /// The current IGTK key index (toggles 4<->5 on rekey) and IPN, so the
+    /// netlink path can install the IGTK in the kernel for BIP.
+    pub fn igtk_key_id(&self) -> u16 {
+        self.igtk_key_id
+    }
+
+    pub fn igtk_ipn(&self) -> [u8; 6] {
+        self.igtk_ipn
+    }
+
+    /// Whether this AP uses Management Frame Protection (PMF/802.11w): true for
+    /// SAE, OWE, and transition mode, where the kernel must be given the IGTK to
+    /// send/validate BIP-protected robust management frames.
+    pub fn is_pmf(&self) -> bool {
+        matches!(self.security_mode(), dot11::SecurityMode::Wpa3Sae | dot11::SecurityMode::Owe | dot11::SecurityMode::Transition)
+    }
+
     /// Rotate the GTK (and IGTK) and run the Group Key Handshake: send Group Key
     /// message 1 to every associated station. Returns the frames to transmit.
-    /// Mirrors hostapd's `wpa_group_rekey`.
+    /// Mirrors hostapd's `wpa_group_rekey`. Each message 1 is armed for retransmit
+    /// (`pending_eapol`) and the station is marked `group_rekeying` until it ACKs
+    /// with message 2, so a dropped rekey frame doesn't strand a station on the
+    /// old GTK. If a rekey is already in flight (any station still awaiting its
+    /// message 2) this is a no-op, matching hostapd's coalescing.
     pub fn rekey_gtk(&mut self) -> Vec<Vec<u8>> {
+        if self.stations.values().any(|s| s.group_rekeying) {
+            return Vec::new();
+        }
         let gtk_full = random_bytes::<32>();
         self.gtk.copy_from_slice(&gtk_full[..16]);
         self.group_pn = 1;
+        // Two-phase group rekey (hostapd): the rotated GTK/IGTK go in at the
+        // OTHER key index (toggle 1<->2 for the GTK, 4<->5 for the IGTK), so the
+        // new key is advertised + installed at a fresh index and the IPN may be
+        // reset (a fresh key id gets a fresh IPN).
+        self.gtk_key_id = if self.gtk_key_id == 1 { 2 } else { 1 };
         self.igtk = random_bytes::<16>();
+        self.igtk_key_id = if self.igtk_key_id == 4 { 5 } else { 4 };
+        self.igtk_ipn = [0; 6]; // fresh IGTK (new key id) gets a fresh IPN
+        self.last_group_rekey = Instant::now();
 
         let stations: Vec<[u8; 6]> = self
             .stations
@@ -1131,6 +1658,7 @@ impl Ap {
             .collect();
 
         let gtk = self.gtk;
+        let gtk_key_id = self.gtk_key_id;
         let igtk = self.igtk;
         let igtk_key_id = self.igtk_key_id;
         let igtk_ipn = self.igtk_ipn;
@@ -1144,9 +1672,15 @@ impl Ap {
             };
             let igtk_kde = if sha256 { Some((igtk_key_id, igtk_ipn, igtk)) } else { None };
             let sc = self.next_sc();
-            let frame = dot11::build_group_key_msg1(&self.mac, &sta, &kck, &kek, &gtk, igtk_kde, replay, sc, dot11::KeyMic::select(sha256, owe));
+            let frame = dot11::build_group_key_msg1(&self.mac, &sta, &kck, &kek, gtk_key_id, &gtk, igtk_kde, replay, sc, dot11::KeyMic::select(sha256, owe));
             let mut f = dot11::RADIOTAP_TX.to_vec();
             f.extend_from_slice(&frame);
+            if let Some(s) = self.stations.get_mut(&sta) {
+                s.pending_eapol = Some(f.clone());
+                s.eapol_tx = Instant::now();
+                s.eapol_retries = 0;
+                s.group_rekeying = true;
+            }
             frames.push(f);
         }
         frames
@@ -1155,13 +1689,8 @@ impl Ap {
     /// Emit a BIP-protected, group-addressed Deauthentication frame (PMF). PMF
     /// stations validate it with the IGTK delivered in EAPOL message 3.
     pub fn group_deauth(&mut self, reason: u16) -> Vec<u8> {
-        // advance the 48-bit IPN
-        for b in self.igtk_ipn.iter_mut().rev() {
-            *b = b.wrapping_add(1);
-            if *b != 0 {
-                break;
-            }
-        }
+        // advance the 48-bit IPN (little-endian, to match bip_ipn / the spec)
+        inc_ipn_le(&mut self.igtk_ipn);
         let sc = self.next_sc();
         let frame = dot11::build_group_deauth_bip(&self.mac, &self.igtk, self.igtk_key_id, &self.igtk_ipn, reason, sc);
         let mut f = dot11::RADIOTAP_TX.to_vec();

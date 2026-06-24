@@ -26,7 +26,7 @@ const FIXED_TS: u64 = 0x0011_2233_4455_6677;
 fn beacon_matches() {
     let v = vectors();
     let f = &v["frames"]["beacon"];
-    let built = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 1, FIXED_TS, &dot11::RSN, b"US");
+    let built = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 1, FIXED_TS, &dot11::RSN, b"US", 20, true, dot11::PhyMode::Vht);
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
 
@@ -34,7 +34,7 @@ fn beacon_matches() {
 fn beacon_5ghz_matches() {
     let v = vectors();
     let f = &v["frames"]["beacon_5ghz"];
-    let built = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 36, FIXED_TS, &dot11::RSN, b"US");
+    let built = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 36, FIXED_TS, &dot11::RSN, b"US", 20, true, dot11::PhyMode::Vht);
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
 
@@ -42,8 +42,8 @@ fn beacon_5ghz_matches() {
 fn band_aware_ies_differ_correctly() {
     // 2.4 GHz advertises a DS Parameter Set (id 3) and Extended Rates (id 50);
     // 5 GHz advertises neither and uses an OFDM-only rate set.
-    let ies_24 = dot11::make_beacon_ies(b"x", 6, b"US");
-    let ies_5 = dot11::make_beacon_ies(b"x", 36, b"US");
+    let ies_24 = dot11::make_beacon_ies(b"x", 6, b"US", 20, true, dot11::PhyMode::Vht);
+    let ies_5 = dot11::make_beacon_ies(b"x", 36, b"US", 20, true, dot11::PhyMode::Vht);
     assert!(has_ie(&ies_24, 3), "2.4 GHz must carry a DS Parameter Set");
     assert!(has_ie(&ies_24, 50), "2.4 GHz must carry Extended Supported Rates");
     assert!(!has_ie(&ies_5, 3), "5 GHz must not carry a DS Parameter Set");
@@ -61,7 +61,7 @@ fn band6_ies_are_he_only() {
     // Capabilities (ext 35), HE Operation (ext 36) and HE 6 GHz Band
     // Capabilities (ext 59) elements, plus operating class 131.
     assert_eq!(dot11::channel_to_freq_6ghz(37), 6135);
-    let ies = dot11::make_beacon_ies_6ghz(b"x", 37, b"US");
+    let ies = dot11::make_beacon_ies_6ghz(b"x", 37, b"US", 20, true);
     assert!(!has_ie(&ies, 3), "6 GHz must not carry a DS Parameter Set");
     assert!(!has_ie(&ies, 45), "6 GHz must not carry HT Capabilities");
     assert!(!has_ie(&ies, 191), "6 GHz must not carry VHT Capabilities");
@@ -74,7 +74,7 @@ fn band6_ies_are_he_only() {
 
 #[test]
 fn he_operation_6ghz_encodes_channel_and_present_bit() {
-    let op = dot11::he_operation_6ghz(37);
+    let op = dot11::he_operation_6ghz(37, 20);
     // ext_ie: [255, len, 36, params(3), bsscolor, basicmcs(2), 6ghz-info(5)]
     assert_eq!(op[0], 255);
     assert_eq!(op[2], 36, "HE Operation ext id");
@@ -96,10 +96,11 @@ fn multi_link_element_carries_mld_mac() {
     assert_eq!(ml[3] & 0x07, 0, "Multi-Link Control Type = Basic");
     assert_eq!(ml[5], 7, "Common Info length");
     assert_eq!(&ml[6..12], &mld, "Common Info carries the MLD MAC");
-    // EHT Capabilities present + well-formed
-    let eht = dot11::eht_capabilities();
+    // EHT Capabilities present + well-formed; 320 MHz support bit set when wide
+    let eht = dot11::eht_capabilities(320);
     assert_eq!(eht[0], 255);
     assert_eq!(eht[2], 108, "EHT Capabilities ext id");
+    assert_eq!(eht[5] & 0x02, 0x02, "EHT PHY caps must advertise 320 MHz in 6 GHz");
 }
 
 #[test]
@@ -210,7 +211,7 @@ fn beacon_carries_ht_wmm_tim() {
     // 802.11n HT (45/61), WMM (221), and a beacon-only TIM (5) must be present.
     // Beacon/probe-resp IEs begin after the 24-byte MAC header + 12-byte fixed
     // fields (timestamp 8 + interval 2 + capability 2).
-    let beacon = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 6, 0, &dot11::RSN, b"US");
+    let beacon = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"turtlenet", 6, 0, &dot11::RSN, b"US", 20, true, dot11::PhyMode::Vht);
     let bies = &beacon[36..];
     assert!(has_ie(bies, 45), "HT Capabilities element");
     assert!(has_ie(bies, 61), "HT Operation element");
@@ -220,7 +221,7 @@ fn beacon_carries_ht_wmm_tim() {
     assert_eq!(&ie_payload(bies, 221).unwrap()[..6], &[0x00, 0x50, 0xf2, 0x02, 0x01, 0x01]);
 
     // probe responses carry HT + WMM but NOT the beacon-only TIM.
-    let probe = dot11::build_probe_resp(&mac6("02:00:00:00:00:00"), &mac6("02:00:00:00:ab:cd"), b"x", 6, 0, 0, &dot11::RSN, b"US");
+    let probe = dot11::build_probe_resp(&mac6("02:00:00:00:00:00"), &mac6("02:00:00:00:ab:cd"), b"x", 6, 0, 0, &dot11::RSN, b"US", 20, false, true, dot11::PhyMode::Vht);
     let pies = &probe[36..];
     assert!(has_ie(pies, 45) && has_ie(pies, 221));
     assert!(!has_ie(pies, 5), "probe response must not include a TIM");
@@ -231,7 +232,7 @@ fn modern_ies_present() {
     // 5 GHz beacon advertises VHT (191/192); all advertise Extended Capabilities
     // (127, with BTM bit 19 + Beacon Protection bit 84), Supported Operating
     // Classes (59), and RRM Enabled Capabilities (70).
-    let b5 = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"x", 36, 0, &dot11::RSN, b"US");
+    let b5 = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"x", 36, 0, &dot11::RSN, b"US", 20, true, dot11::PhyMode::Vht);
     let ies5 = &b5[36..];
     assert!(has_ie(ies5, 191) && has_ie(ies5, 192), "5 GHz must advertise VHT");
     let extcap = ie_payload(ies5, 127).unwrap();
@@ -242,7 +243,7 @@ fn modern_ies_present() {
     assert!(has_ie(ies5, 70), "RRM Enabled Capabilities");
 
     // 2.4 GHz must NOT advertise VHT.
-    let b24 = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"x", 6, 0, &dot11::RSN, b"US");
+    let b24 = dot11::build_beacon(&mac6("02:00:00:00:00:00"), b"x", 6, 0, &dot11::RSN, b"US", 20, true, dot11::PhyMode::Vht);
     assert!(!has_ie(&b24[36..], 191), "2.4 GHz must not advertise VHT");
 }
 
@@ -288,6 +289,10 @@ fn probe_resp_matches() {
         16,
         &dot11::RSN,
         b"US",
+        20,
+        false,
+        true,
+        dot11::PhyMode::Vht,
     );
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
@@ -313,6 +318,10 @@ fn assoc_resp_matches() {
         16,
         dot11::SUBTYPE_ASSOC_RESP,
         b"US",
+        20,
+        false,
+        true,
+        dot11::PhyMode::Vht,
     );
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
@@ -334,7 +343,7 @@ fn eapol_m3_matches() {
     let kck = from_hex(f["kck"].as_str().unwrap());
     let kek = from_hex(f["kek"].as_str().unwrap());
     let gtk = from_hex(f["gtk"].as_str().unwrap());
-    let built = dot11::build_eapol_m3(&mac6("02:00:00:00:00:00"), &mac6(f["sta"].as_str().unwrap()), &anonce, &kck, &kek, &dot11::RSN, &gtk, None, None, None, 48, dot11::KeyMic::HmacSha1);
+    let built = dot11::build_eapol_m3(&mac6("02:00:00:00:00:00"), &mac6(f["sta"].as_str().unwrap()), &anonce, &kck, &kek, &dot11::RSN, 1, &gtk, None, None, None, 48, dot11::KeyMic::HmacSha1);
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
 
@@ -358,6 +367,7 @@ fn data_downlink_matches() {
         &tk,
         f["ethertype"].as_u64().unwrap() as u16,
         &inner,
+        None,
     );
     assert_eq!(to_hex(&built), f["bytes"].as_str().unwrap());
 }
@@ -395,7 +405,7 @@ fn ccmp_roundtrip_rust_only() {
     let sta = mac6("02:00:00:00:ab:cd");
     let ap = mac6("02:00:00:00:00:00");
     let inner = b"the quick brown fox jumps over the lazy dog";
-    let frame_bytes = dot11::build_ccmp_data(&sta, &ap, &ap, dot11::FC_FROMDS | dot11::FC_PROTECTED, 0x10, 0x42, 0, &tk, 0x0800, inner);
+    let frame_bytes = dot11::build_ccmp_data(&sta, &ap, &ap, dot11::FC_FROMDS | dot11::FC_PROTECTED, 0x10, 0x42, 0, &tk, 0x0800, inner, None);
     let frame = dot11::Dot11::parse(&frame_bytes).unwrap();
     let eth = dot11::decrypt_ccmp(&frame, &tk, true).expect("roundtrip decrypts");
     // dst=addr1=sta, src=addr3=ap, ethertype 0800, then inner
@@ -470,4 +480,103 @@ fn parse_eapol_m2() {
     assert_eq!(to_hex(&ek.key_mic), f["key_mic"].as_str().unwrap());
     assert_eq!(bytes_to_mac(&frame.addr1), f["addr1"].as_str().unwrap());
     assert_eq!(bytes_to_mac(&frame.addr2), f["addr2"].as_str().unwrap());
+}
+
+#[test]
+fn center_channel_math() {
+    use barely_ap::dot11::center_channel;
+    // 5 GHz 80 MHz: 36-48 -> 42, 52-64 -> 58
+    assert_eq!(center_channel(36, 80, false), 42);
+    assert_eq!(center_channel(48, 80, false), 42);
+    assert_eq!(center_channel(52, 80, false), 58);
+    // 5 GHz 160 MHz: 36-64 -> 50, 100-128 -> 114
+    assert_eq!(center_channel(36, 160, false), 50);
+    assert_eq!(center_channel(100, 160, false), 114);
+    // 5 GHz 40 MHz: HT40+ (36 -> 38), HT40- (40 -> 38)
+    assert_eq!(center_channel(36, 40, false), 38);
+    assert_eq!(center_channel(40, 40, false), 38);
+    // 6 GHz 80 MHz: 1-13 -> 7; 320 MHz: 1-61 -> 31
+    assert_eq!(center_channel(1, 80, true), 7);
+    assert_eq!(center_channel(1, 320, true), 31);
+    // 20 MHz: center == primary
+    assert_eq!(center_channel(36, 20, false), 36);
+}
+
+#[test]
+fn qos_data_frame_roundtrips() {
+    // A QoS Data frame (TID 0) encrypts + decrypts back to the same payload, and
+    // the WMM IE helpers detect/emit the WMM element.
+    let tk: [u8; 16] = from_hex("000102030405060708090a0b0c0d0e0f").try_into().unwrap();
+    let sta = mac6("02:00:00:00:00:01");
+    let bss = mac6("02:00:00:00:00:00");
+    let inner = b"qos payload over the air";
+    // A non-trivial user priority (AC_VI) must survive build -> parse -> decrypt:
+    // the TID feeds the CCMP nonce + AAD, so decryption only succeeds if the
+    // parsed TID matches what was encoded.
+    let frame = dot11::build_ccmp_data(&sta, &bss, &bss, dot11::FC_FROMDS | dot11::FC_PROTECTED, 0x10, 5, 0, &tk, 0x0800, inner, Some(5));
+    let parsed = dot11::Dot11::parse(&frame).unwrap();
+    assert_eq!(parsed.subtype(), dot11::SUBTYPE_QOS_DATA, "QoS Data subtype");
+    assert_eq!(parsed.priority(), 5, "user priority (TID) round-trips through parse");
+    let eth = dot11::decrypt_ccmp(&parsed, &tk, true).expect("QoS data decrypts at the parsed TID");
+    assert_eq!(&eth[14..], inner, "payload survives the QoS CCMP round-trip");
+    // a plain Data frame stays non-QoS
+    let plain = dot11::build_ccmp_data(&sta, &bss, &bss, dot11::FC_FROMDS | dot11::FC_PROTECTED, 0x10, 6, 0, &tk, 0x0800, inner, None);
+    assert!(dot11::Dot11::parse(&plain).unwrap().qos.is_none());
+    // WMM IE helpers
+    assert!(dot11::has_wmm_ie(&dot11::wmm_information()), "WMM info element detected");
+    assert!(!dot11::has_wmm_ie(&[221, 4, 0, 0, 0, 0]), "non-WMM vendor IE not matched");
+}
+
+#[test]
+fn wmm_element_gated_by_config() {
+    // The WMM parameter element is advertised only when WMM is enabled.
+    assert!(dot11::has_wmm_ie(&dot11::make_beacon_ies(b"x", 1, b"US", 20, true, dot11::PhyMode::Vht)), "WMM advertised when on");
+    assert!(!dot11::has_wmm_ie(&dot11::make_beacon_ies(b"x", 1, b"US", 20, false, dot11::PhyMode::Vht)), "no WMM element when off");
+    // same on 6 GHz
+    assert!(dot11::has_wmm_ie(&dot11::make_beacon_ies_6ghz(b"x", 37, b"US", 20, true)));
+    assert!(!dot11::has_wmm_ie(&dot11::make_beacon_ies_6ghz(b"x", 37, b"US", 20, false)));
+}
+
+#[test]
+fn phy_mode_gates_he_and_eht() {
+    use barely_ap::dot11::PhyMode;
+    let ac = dot11::make_beacon_ies(b"x", 36, b"US", 80, true, PhyMode::Vht);
+    let ax = dot11::make_beacon_ies(b"x", 36, b"US", 80, true, PhyMode::He);
+    let be = dot11::make_beacon_ies(b"x", 36, b"US", 80, true, PhyMode::Eht);
+    // ac (11ac/VHT): VHT Operation (id 192) but no HE.
+    assert!(has_ie(&ac, 192), "ac advertises VHT Operation");
+    assert!(!has_ext_ie(&ac, 35), "ac must not advertise HE Capabilities");
+    // ax (11ax/HE): HE Capabilities (ext 35) + HE Operation (ext 36), no EHT.
+    assert!(has_ext_ie(&ax, 35), "ax advertises HE Capabilities");
+    assert!(has_ext_ie(&ax, 36), "ax advertises HE Operation");
+    assert!(!has_ext_ie(&ax, 106), "ax must not advertise EHT Operation");
+    // be (11be/EHT): HE still present plus EHT Operation (ext 106).
+    assert!(has_ext_ie(&be, 35), "be still advertises HE");
+    assert!(has_ext_ie(&be, 106), "be advertises EHT Operation");
+}
+
+#[test]
+fn wmm_tid_from_dscp() {
+    // UP = ToS >> 5 (DSCP precedence). ToS = DSCP << 2.
+    let mk = |ethertype: [u8; 2], tos: u8| {
+        let mut e = vec![0u8; 16];
+        e[12] = ethertype[0]; e[13] = ethertype[1];
+        e[14] = 0x45; e[15] = tos; // IPv4 ver/IHL + ToS
+        e
+    };
+    assert_eq!(dot11::wmm_tid(&mk([0x08, 0x00], 0)), 0, "DSCP 0 -> BE (UP 0)");
+    assert_eq!(dot11::wmm_tid(&mk([0x08, 0x00], 40 << 2)), 5, "DSCP 40 (CS5) -> UP 5 (AC_VI)");
+    assert_eq!(dot11::wmm_tid(&mk([0x08, 0x00], 48 << 2)), 6, "DSCP 48 (CS6) -> UP 6 (AC_VO)");
+    // ARP (non-IP) -> best effort
+    let arp = { let mut e = vec![0u8; 16]; e[12] = 0x08; e[13] = 0x06; e };
+    assert_eq!(dot11::wmm_tid(&arp), 0, "ARP -> UP 0");
+}
+
+#[test]
+fn qos_tid_written_to_frame() {
+    let tk = [0u8; 16];
+    let f = dot11::build_ccmp_data(&[1u8;6], &[2u8;6], &[3u8;6], dot11::FC_TODS | dot11::FC_PROTECTED, 0x10, 1, 0, &tk, 0x0800, b"x", Some(6));
+    // 24-byte 3-address header, then QoS Control: byte 24 low nibble = TID.
+    assert_eq!(f[0] & 0xF0, 0x80, "subtype QoS Data");
+    assert_eq!(f[24] & 0x0F, 6, "QoS Control TID byte");
 }

@@ -13,6 +13,15 @@ fn repo_root() -> PathBuf {
 }
 
 fn python_with_scapy() -> Option<String> {
+    // These tests bridge against the *reference* Python implementation under
+    // ../barely-ap/src (ap.py, ccmp.py, client.py). Skip gracefully if that
+    // reference tree isn't checked out next to this repo, or if scapy is
+    // missing — otherwise the tests would fail on a Python ImportError that has
+    // nothing to do with the Rust code under test.
+    if !repo_root().join("barely-ap/src/ap.py").exists() {
+        eprintln!("SKIP: reference Python tree (barely-ap/src) not present");
+        return None;
+    }
     for py in ["python3", "python"] {
         let ok = Command::new(py)
             .args(["-c", "import scapy"])

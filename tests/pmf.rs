@@ -97,7 +97,7 @@ fn ccmp_replay_is_rejected() {
     let ap_mac = mac_to_bytes(AP_MAC);
 
     // uplink data frame #1 (PN increasing) is accepted by the AP
-    let ping = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1]);
+    let ping = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1], 0);
     let f1 = sta.encrypt_uplink(&ping).expect("uplink");
     let out1 = ap.handle_incoming(&f1);
     assert_eq!(out1.to_network.len(), 1, "first frame accepted");
@@ -107,7 +107,7 @@ fn ccmp_replay_is_rejected() {
     assert!(out2.to_network.is_empty(), "replayed CCMP frame must be dropped");
 
     // a fresh frame with a higher PN is accepted again
-    let ping2 = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1]);
+    let ping2 = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1], 0);
     let f2 = sta.encrypt_uplink(&ping2).expect("uplink2");
     let out3 = ap_step(&mut ap, &mut net, &f2);
     let _ = out3; // (the reply path is exercised; the point is f2 was not a replay)

@@ -246,10 +246,56 @@ workaround"), 4-way over the nl80211 control port, PTK/GTK install, authorize,
 and CCMP data both directions (**ping works**, STA in a netns). See
 `tools/hwsim/README.md`.
 
+It picks the `START_AP` RSN AKM from the AP's security mode — **WPA2-PSK,
+WPA3-SAE, or OWE** — so it is no longer PSK-only. The SAE/OWE exchange runs in
+userspace (the kernel frames the BSS with `AUTH_TYPE=OPEN`, MFP signalled by the
+beacon RSN), which is what makes a **6 GHz** AP possible (6 GHz mandates WPA3).
+A WPA3-SAE 6 GHz AP at **320 MHz** is verified end-to-end (`scen_nl_320ping.sh`).
+
+**Channel width** (`width` config / `--width`): 20/40/80/160/320 MHz. The HT/VHT
+operation + capabilities (5 GHz) and HE/EHT operation + capabilities (6 GHz)
+elements encode the width and center channel — including the VHT "Supported
+Channel Width Set" and EHT "320 MHz in 6 GHz" capability bits, which a station
+caps itself to regardless of the Operation element — and `START_AP` sets
+`NL80211_ATTR_CHANNEL_WIDTH` + `CENTER_FREQ1`.
+
+**80, 160 and 320 MHz are all verified end-to-end** on hwsim (AP + client both
+report the same `width`):
+
+- **80 MHz** (5 GHz) — direct.
+- **160 MHz** (5 GHz) — needs the `hwsim6g` module to clear the DFS `RADAR`/
+  `NO-IR` flags first (every 5 GHz 160 MHz block spans radar channels 52–64,
+  which the kernel won't beacon on without a CAC).
+- **320 MHz** (6 GHz, 802.11be) — AP + client both `width: 320 MHz, center1:
+  6105`, **encrypted ping 3/3**. This required WPA3-SAE on the netlink path (6
+  GHz mandates WPA3), the `hwsim6g` NO-IR clear, the EHT Capabilities advertising
+  the "320 MHz in 6 GHz" bit with the correct per-bandwidth MCS maps, and the EHT
+  Operation CCFS0/CCFS1 ordering (CCFS1 = the 320 MHz center). The
+  `nl80211_chan_width` value for 320 is `13`, not the position-counted `6`.
+
+The 6 GHz / 320 MHz path uses the **WPA3-SAE netlink AP** below.
+
 Verified to scale and recover: **5 concurrent stations** all reach
 `COMPLETED`/keyed, and a **client that disconnects and rejoins** re-handshakes
 and passes data again. Reliability properties borrowed from hostapd:
 
+- **EAPOL m1/m3 retransmission + 4-way timeout** — the AP caches the m1/m3 it
+  last sent and, on a tick, retransmits it if the matching m2/m4 hasn't arrived
+  within `EAPOL_TIMEOUT` (up to `MAX_EAPOL_RETRIES`), then deauthenticates and
+  drops a station whose 4-way never completes. A single dropped handshake frame
+  self-heals instead of stalling the association forever (the #1 flaky-link
+  failure). Wired into both the raw `on_tick` and the netlink event loop.
+- **Duplicate (re)Association tolerance** — a retried Assoc for a handshake
+  already in progress re-sends the assoc-response and the **same** m1 (the ANonce
+  is reused *only* while still awaiting that station's m2, which stays KRACK-safe
+  because a genuine reassociation still gets a fresh ANonce).
+- **Idempotent Authentication re-answer** — a retransmitted Auth within the
+  backoff window is re-answered instead of dropped, so a lost auth-response
+  doesn't stall a client over a lossy link, without restarting the session.
+- **Disconnect/resync detection** — an encrypted data frame from a station the
+  AP has *no* state for (it restarted or pruned the STA) triggers a deauth so the
+  client tears down and re-handshakes rather than sending into a black hole; a
+  data frame from a station still mid-handshake is dropped, not deauthed.
 - **Separate command vs event netlink sockets** — synchronous commands
   (`NEW_STATION`/`NEW_KEY`/…) run on their own socket so their ACK read-loop
   never swallows an async auth/assoc/EAPOL frame on the event socket.
@@ -258,6 +304,9 @@ and passes data again. Reliability properties borrowed from hostapd:
   could see still re-handshakes cleanly (otherwise the reconnect 4-way fails
   with a MIC/"wrong key" against stale state). Group key is installed once
   (BSS-wide), not per-station, so a rejoin doesn't reset the group PN.
+- **Idle reaping** (`prune_idle`, hostapd `ap_max_inactivity`) — a station that
+  vanishes without deauthing is disassociated after the advertised BSS Max Idle
+  period so it doesn't leak state forever.
 
 #### Per-station VIF / AP_VLAN (`--per-sta-vif`)
 
@@ -268,6 +317,76 @@ station cannot read broadcast/multicast addressed to another. Verified on hwsim:
 two stations land on `apvlan1`/`apvlan2` (each its own group key), per-VLAN data
 plane passes traffic (**ping works through the VLAN**), and rejoin recreates the
 VLAN cleanly.
+
+#### Intrusion logging (`failures.rs`)
+
+Failed credential and decryption attempts are recorded in a fingerprinted,
+deduplicated log (`Ap::failures()`): wrong-PSK (4-way m2 MIC mismatch), SAE
+commit/confirm failures, CCMP data-frame MIC failures, and protected-management
+(BIP/CMAC) failures. Each entry is keyed by a client fingerprint — its MAC plus
+an FNV-1a hash of the association IEs, so a MAC-spoofing attacker is still
+distinguishable — and a [`FailureKind`]. The log keeps the 25 most recent
+*distinct* keys; an identical repeat bumps a counter (and the per-event log line
+prints the running attempt number) instead of consuming a slot, so one client
+hammering the AP can't evict the history of every other client.
+
+#### WMM / WME QoS (`wmm` config, default on)
+
+WMM is a config setting (`wmm` / `--width` companion). When on, the AP advertises
+the WMM parameter element and the client advertises the WMM Information element in
+its (Re)Assoc Request; both then exchange **QoS Data** frames (subtype 8, AC_BE /
+TID 0), whose 2-byte QoS Control feeds the CCMP nonce + AAD. The AP only sends
+QoS Data to a station that negotiated WMM (`Station.wmm`), falling back to plain
+Data otherwise. Verified on hwsim: with a real `wpa_supplicant` client every data
+frame to/from the Rust AP is QoS Data (`wlan.fc.type_subtype == 0x28`, both ToDS
+and FromDS) and the ping passes; the Rust client's (Re)Assoc Request carries the
+WMM IE (`dd07 0050f2 02 00 01`). Setting `wmm: false` omits the element and uses
+plain Data both directions.
+
+#### Runtime control interface (`--ctrl PATH` / `ctrl_path`)
+
+A hostapd-style control socket (Unix datagram) for live management + monitoring
+of the netlink AP. Clients send text commands and get replies; `ATTACH`
+subscribes to the event stream. Commands: `PING`, `STATUS` (ssid / channel /
+station counts), `STA-DUMP`, `DEAUTH <mac>` (admin kick), `FAILURES` (dump the
+intrusion log), `ATTACH`/`DETACH`. The AP emits hostapd-style events —
+`AP-STA-CONNECTED <mac>` (after a verified 4-way), `AP-STA-DISCONNECTED <mac>
+reason=<n>`, `AP-STA-AUTH-FAILED <mac> kind=<k> count=<n>` — to the log in every
+mode and to attached clients on the socket. Verified on hwsim: a `wpa_supplicant`
+client connecting logs `AP-STA-CONNECTED`, `STATUS`/`STA-DUMP` report it, an admin
+`DEAUTH` kicks it, and the attached client receives the live
+`AP-STA-DISCONNECTED` event. The command layer (`control::handle_command`) is
+portable and unit-tested.
+
+#### Multiple BSSes (`bss` config array)
+
+Several SSIDs on one radio. Each `bss` entry (its own `ssid`, `bssid`/`mac`, and
+optional `key_mgmt`/`passphrase` — inheriting the primary's when omitted) gets
+its own AP netdev (`NEW_INTERFACE` iftype AP on the primary's wiphy, assigned the
+BSS's BSSID) and runs an **independent** `run_offload_ap` on its own thread — its
+own 4-way, keys, and stations — so each BSS reuses the verified single-BSS path
+unchanged. BSSIDs must be distinct; multi-BSS is netlink-only. Config parsing +
+radio-parameter inheritance are unit-tested; the live netdev bring-up is pending
+hwsim verification.
+
+#### DFS — 5 GHz radar channels (CAC + radar response)
+
+Before beaconing on a DFS chandef (any 20 MHz subchannel in 52-64 / 100-144), the
+AP runs the Channel Availability Check: `NL80211_CMD_RADAR_DETECT` → wait for the
+`RADAR_CAC_FINISHED` event (60 s, or 600 s on ETSI weather channels) → `START_AP`.
+A `RADAR_DETECTED` event during operation vacates the channel (`STOP_AP`) within
+the move time and exits with a recommended non-DFS fallback channel
+(`fallback_channel`, UNII-1/UNII-3) named in the log + error, so a supervisor can
+restart there without a CAC. The kernel/driver performs the actual radar
+detection; userspace only orchestrates the CAC and the response — no radar DSP in
+userspace. `chandef_is_dfs` and `fallback_channel` are unit-tested.
+
+Two pieces are deliberately box-gated and not yet done: (1) the live
+`RADAR_DETECT` round-trip — the test radio returned `EOPNOTSUPP` (driver-dependent;
+needs an strace-diff against hostapd to confirm message vs. driver support); and
+(2) an *in-process* channel switch on radar (vs. the current vacate-and-exit),
+which would restructure the verified beaconing loop and is only worth doing once
+the CAC itself is confirmed on hardware.
 
 ### 6 GHz and 802.11be / MLD
 

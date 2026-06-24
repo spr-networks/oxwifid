@@ -301,6 +301,13 @@ pub fn aes_wrap(kek: &[u8], plain: &[u8]) -> Vec<u8> {
 }
 
 pub fn aes_unwrap(kek: &[u8], wrapped: &[u8]) -> Option<Vec<u8>> {
+    // AES Key Wrap (RFC 3394) input must be a multiple of 8 and at least two
+    // blocks (64-bit IV + >=1 data block). Reject anything else up front, or the
+    // `len/8 - 1` below underflows and `wrapped[..8]` panics on a short, valid-MIC
+    // key-data field from a malicious peer.
+    if wrapped.len() < 16 || wrapped.len() & 7 != 0 {
+        return None;
+    }
     let n = (wrapped.len() / 8) - 1;
     let mut a = {
         let mut hi = [0u8; 8];

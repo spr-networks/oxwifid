@@ -37,13 +37,30 @@ pub struct Client {
     kck: [u8; 16],
     kek: [u8; 16],
     tk: [u8; 16],
+    /// Whether the pairwise key (`tk`) has actually been installed by the 4-way
+    /// handshake. Until then `tk` is all zeros and must NOT be used to validate
+    /// protected management frames (otherwise a forged "NULL-key" Deauth would
+    /// be accepted mid-handshake once SAE/OWE has set `sae_pmk`/PMF).
+    ptk_installed: bool,
     gtk: [u8; 16],
+    /// The CCMP key index the current GTK is installed at (1 or 2, toggled by the
+    /// AP on each group rekey), so group-addressed downlink is matched to it.
+    gtk_key_id: u8,
     sc: i32,
     client_pn: u64,
     /// Replay protection: highest received pairwise / group CCMP packet numbers,
     /// and the highest EAPOL-Key replay counter seen from the AP.
     last_rx_pn: u64,
     last_rx_gpn: u64,
+    /// Highest received PN/IPN for protected management frames (unicast CCMP and
+    /// group BIP), so a captured protected Deauth/Disassoc/Action/BTM can't be
+    /// replayed.
+    last_rx_mgmt_pn: u64,
+    /// Highest received IGTK IPN, tracked together with the IGTK key id it
+    /// belongs to: a new IGTK (new key id) on rekey resets the per-key replay
+    /// window, so a post-rekey BIP frame with a fresh IPN isn't wrongly rejected.
+    last_rx_igtk_ipn: u64,
+    igtk_key_id: Option<u16>,
     eapol_replay: u64,
     test_snonce: Option<[u8; 32]>,
     // WPA3-SAE
@@ -68,6 +85,12 @@ pub struct Client {
     owe: bool,
     owe_priv: Option<num_bigint::BigUint>,
     owe_pub: Option<Vec<u8>>,
+    /// WMM/WME QoS: advertise the WMM element in (Re)Assoc Requests and send QoS
+    /// Data uplink. Default on.
+    wmm: bool,
+    /// Test override: force this WMM user priority (TID 0-7) on all uplink data
+    /// instead of deriving it from each packet's DSCP. `None` = derive per packet.
+    wmm_tid_override: Option<u8>,
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -91,11 +114,16 @@ impl Client {
             kck: [0; 16],
             kek: [0; 16],
             tk: [0; 16],
+            ptk_installed: false,
             gtk: [0; 16],
+            gtk_key_id: 1,
             sc: 0,
             client_pn: 1,
             last_rx_pn: 0,
             last_rx_gpn: 0,
+            last_rx_mgmt_pn: 0,
+            last_rx_igtk_ipn: 0,
+            igtk_key_id: None,
             eapol_replay: 0,
             test_snonce: None,
             password: psk.as_bytes().to_vec(),
@@ -112,7 +140,28 @@ impl Client {
             owe: false,
             owe_priv: None,
             owe_pub: None,
+            wmm: true,
+            wmm_tid_override: None,
         }
+    }
+
+    /// Enable/disable WMM (advertise the WMM element + send QoS Data uplink).
+    pub fn set_wmm(&mut self, wmm: bool) {
+        self.wmm = wmm;
+    }
+
+    /// Test override: force a fixed WMM user priority (TID 0-7) on uplink data,
+    /// regardless of the packet's DSCP. `None` restores per-packet classification.
+    pub fn set_wmm_tid(&mut self, tid: Option<u8>) {
+        self.wmm_tid_override = tid.map(|t| t & 0x07);
+    }
+
+    /// Append the WMM Information element to a (Re)Assoc Request when WMM is on.
+    fn with_wmm(&self, mut frame: Vec<u8>) -> Vec<u8> {
+        if self.wmm {
+            frame.extend_from_slice(&dot11::wmm_information());
+        }
+        frame
     }
 
     /// Enable Operating Channel Validation (anti-MITM).
@@ -227,7 +276,7 @@ impl Client {
             let ssid = self.ssid.clone();
             if self.pmksa_reconnect {
                 if let Some((_, pmkid, _)) = self.cached_pmksa {
-                    out.tx(dot11::build_assoc_req_pmkid(&bssid, &self.mac, &ssid, &pmkid, sc));
+                    out.tx(self.with_wmm(dot11::build_assoc_req_pmkid(&bssid, &self.mac, &ssid, &pmkid, sc)));
                     return out;
                 }
             }
@@ -237,10 +286,10 @@ impl Client {
                 let dh = dot11::build_dh_param_element(19, &pub_b);
                 self.owe_priv = Some(priv_k);
                 self.owe_pub = Some(pub_b);
-                out.tx(dot11::build_assoc_req_owe(&bssid, &self.mac, &ssid, &dh, sc));
+                out.tx(self.with_wmm(dot11::build_assoc_req_owe(&bssid, &self.mac, &ssid, &dh, sc)));
                 return out;
             }
-            out.tx(dot11::build_assoc_req(&bssid, &self.mac, &ssid, sc));
+            out.tx(self.with_wmm(dot11::build_assoc_req(&bssid, &self.mac, &ssid, sc)));
             return out;
         }
 
@@ -286,15 +335,28 @@ impl Client {
         // Encrypted downlink data
         if self.connected > 3 && frame.frame_type() == dot11::TYPE_DATA && frame.protected() && frame.from_ds() {
             let key_id = frame.ccmp_key_id();
-            let tk = if key_id == 1 { self.gtk } else { self.tk };
+            let group_ra = frame.addr1[0] & 0x01 != 0; // multicast/broadcast RA
+            // The GTK (a group key, key id 1/2) may only decrypt group-addressed
+            // frames. A unicast frame addressed to us must use the pairwise key
+            // (key id 0); a unicast frame arriving under a group key id is forged
+            // (any peer that knows the GTK could otherwise inject AP-sourced
+            // unicast), so drop it.
+            let use_group = key_id == self.gtk_key_id && key_id != 0;
+            if use_group && !group_ra {
+                return out; // unicast under a group key id — reject
+            }
+            if !use_group && (group_ra || key_id != 0) {
+                return out; // group-addressed under a non-group key, or unknown key id
+            }
+            let tk = if use_group { self.gtk } else { self.tk };
             let Some(pn) = frame.ccmp_pn() else { return out };
             // CCMP replay protection (separate counters for pairwise and group).
-            let last = if key_id == 1 { self.last_rx_gpn } else { self.last_rx_pn };
+            let last = if use_group { self.last_rx_gpn } else { self.last_rx_pn };
             if pn <= last {
                 return out; // replayed frame
             }
             if let Some(eth) = dot11::decrypt_ccmp(&frame, &tk, true) {
-                if key_id == 1 {
+                if use_group {
                     self.last_rx_gpn = pn;
                 } else {
                     self.last_rx_pn = pn;
@@ -315,25 +377,32 @@ impl Client {
         let group = frame.addr1[0] & 0x01 != 0;
 
         if frame.subtype() == dot11::SUBTYPE_ACTION {
-            // Only SA Query is handled, and only when PMF-protected.
-            if !pmf || !frame.protected() {
+            // Only SA Query is handled, and only when PMF-protected. Require the
+            // PTK to be installed (never validate with the all-zero placeholder
+            // key) and reject replays (PN must strictly increase).
+            if !pmf || !frame.protected() || !self.ptk_installed {
                 return;
             }
-            if let Some(plain) = dot11::decrypt_ccmp_mgmt(frame, &self.tk) {
-                // 802.11v BTM request: disassociate on disassoc-imminent.
-                if plain.len() >= 4 && plain[0] == dot11::ACTION_CATEGORY_WNM && plain[1] == dot11::WNM_BTM_REQUEST {
-                    if plain[3] & 0x04 != 0 {
-                        self.disconnect();
-                    }
-                    return;
+            let Some(plain) = dot11::decrypt_ccmp_mgmt(frame, &self.tk) else {
+                return;
+            };
+            match frame.ccmp_pn() {
+                Some(pn) if pn > self.last_rx_mgmt_pn => self.last_rx_mgmt_pn = pn,
+                _ => return, // replay or missing PN
+            }
+            // 802.11v BTM request: disassociate on disassoc-imminent.
+            if plain.len() >= 4 && plain[0] == dot11::ACTION_CATEGORY_WNM && plain[1] == dot11::WNM_BTM_REQUEST {
+                if plain[3] & 0x04 != 0 {
+                    self.disconnect();
                 }
-                if let Some((action, trans_id)) = dot11::parse_sa_query(&plain) {
-                    if action == dot11::SA_QUERY_REQUEST {
-                        if let Some(bssid) = self.bssid {
-                            let pn = self.next_client_pn();
-                            let sc = self.next_sc();
-                            out.tx(dot11::build_protected_sa_query(&bssid, &self.mac, true, true, trans_id, sc, pn, &self.tk));
-                        }
+                return;
+            }
+            if let Some((action, trans_id)) = dot11::parse_sa_query(&plain) {
+                if action == dot11::SA_QUERY_REQUEST {
+                    if let Some(bssid) = self.bssid {
+                        let pn = self.next_client_pn();
+                        let sc = self.next_sc();
+                        out.tx(dot11::build_protected_sa_query(&bssid, &self.mac, true, true, trans_id, sc, pn, &self.tk));
                     }
                 }
             }
@@ -344,14 +413,68 @@ impl Client {
         let accept = if !pmf {
             true // legacy WPA2: no PMF, honour the frame
         } else if group {
-            self.igtk
-                .map(|igtk| dot11::bip_verify(&igtk, frame.fc0, frame.fc1, &frame.addr1, &frame.addr2, &frame.addr3, &frame.body))
-                .unwrap_or(false)
+            // Group-addressed: BIP-protected; verify the MIC, then require a
+            // strictly increasing IPN (reject a replayed protected deauth).
+            match self.igtk {
+                Some(igtk)
+                    if dot11::bip_verify(&igtk, frame.fc0, frame.fc1, &frame.addr1, &frame.addr2, &frame.addr3, &frame.body) =>
+                {
+                    match dot11::bip_ipn(&frame.body) {
+                        Some(ipn) if ipn > self.last_rx_igtk_ipn => {
+                            self.last_rx_igtk_ipn = ipn;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
         } else {
-            frame.protected() && dot11::decrypt_ccmp_mgmt(frame, &self.tk).is_some()
+            // Unicast: only with an installed PTK, valid CCMP MIC, and a
+            // strictly increasing PN (anti replay).
+            if self.ptk_installed && frame.protected() && dot11::decrypt_ccmp_mgmt(frame, &self.tk).is_some() {
+                match frame.ccmp_pn() {
+                    Some(pn) if pn > self.last_rx_mgmt_pn => {
+                        self.last_rx_mgmt_pn = pn;
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
         };
         if accept {
             self.disconnect();
+        }
+    }
+
+    /// Install the GTK / IGTK / BIGTK KDEs from an unwrapped EAPOL key-data
+    /// blob (shared by EAPOL m3 and Group Key msg1). Tracks the GTK key index so
+    /// group downlink is matched to it, and resets the BIP replay window when a
+    /// new IGTK (new key id) is installed so a post-rekey frame whose IPN was
+    /// reset isn't mistaken for a replay.
+    fn install_group_keys(&mut self, unwrapped: &[u8], reset_group_pn: bool) {
+        if let Some((key_id, gtk)) = dot11::parse_gtk_kde_full(unwrapped) {
+            if gtk.len() == 16 {
+                self.gtk.copy_from_slice(&gtk);
+                self.gtk_key_id = key_id;
+                if reset_group_pn {
+                    self.last_rx_gpn = 0;
+                }
+            }
+        }
+        if let Some((id, _ipn, igtk)) = dot11::parse_igtk_kde(unwrapped) {
+            self.igtk = Some(igtk);
+            // A fresh IGTK key id starts a fresh IPN window (per-key replay
+            // protection); only then is resetting the counter safe.
+            if self.igtk_key_id != Some(id) {
+                self.igtk_key_id = Some(id);
+                self.last_rx_igtk_ipn = 0;
+            }
+        }
+        if let Some((_id, _ipn, bigtk)) = dot11::parse_bigtk_kde(unwrapped) {
+            self.bigtk = Some(bigtk);
         }
     }
 
@@ -381,17 +504,10 @@ impl Client {
         }
         self.eapol_replay = ek.key_replay_counter;
 
-        // install the new GTK (and IGTK), resetting the group replay counter
+        // install the new GTK (and IGTK), resetting the group replay counter and
+        // the per-key BIP replay window
         if let Some(unwrapped) = crypto::aes_unwrap(&self.kek, &ek.key_data) {
-            if let Some(gtk) = dot11::parse_gtk_kde(&unwrapped) {
-                if gtk.len() == 16 {
-                    self.gtk.copy_from_slice(&gtk);
-                    self.last_rx_gpn = 0;
-                }
-            }
-            if let Some((_id, _ipn, igtk)) = dot11::parse_igtk_kde(&unwrapped) {
-                self.igtk = Some(igtk);
-            }
+            self.install_group_keys(&unwrapped, true);
         }
 
         let sc = self.next_sc();
@@ -402,6 +518,11 @@ impl Client {
     fn disconnect(&mut self) {
         self.connected = 0;
         self.eapol_state = 0;
+        self.ptk_installed = false;
+        self.last_rx_mgmt_pn = 0;
+        self.last_rx_igtk_ipn = 0;
+        self.igtk_key_id = None;
+        self.gtk_key_id = 1;
         self.tk = [0; 16];
         self.gtk = [0; 16];
         self.igtk = None;
@@ -465,7 +586,7 @@ impl Client {
                 let ssid = self.ssid.clone();
                 // SAE associations must advertise the SAE AKM, not WPA2-PSK,
                 // otherwise the AP rejects with "Invalid AKMP".
-                out.tx(dot11::build_assoc_req_sae(&bssid, &self.mac, &ssid, sc));
+                out.tx(self.with_wmm(dot11::build_assoc_req_sae(&bssid, &self.mac, &ssid, sc)));
             }
             _ => {}
         }
@@ -548,20 +669,12 @@ impl Client {
         self.eapol_replay = ek.key_replay_counter;
 
         // unwrap and install the GTK by parsing the GTK KDE (the RSN element
-        // that precedes it varies in length: 22 for WPA2, 28+ for SAE/OWE).
+        // that precedes it varies in length: 22 for WPA2, 28+ for SAE/OWE), plus
+        // the IGTK (PMF) and BIGTK (Beacon Protection) when delivered.
         if let Some(unwrapped) = crypto::aes_unwrap(&self.kek, &ek.key_data) {
-            if let Some(gtk) = dot11::parse_gtk_kde(&unwrapped) {
-                if gtk.len() == 16 {
-                    self.gtk.copy_from_slice(&gtk);
-                }
-            }
-            // Install the IGTK (PMF) and BIGTK (Beacon Protection) if delivered.
-            if let Some((_id, _ipn, igtk)) = dot11::parse_igtk_kde(&unwrapped) {
-                self.igtk = Some(igtk);
-            }
-            if let Some((_id, _ipn, bigtk)) = dot11::parse_bigtk_kde(&unwrapped) {
-                self.bigtk = Some(bigtk);
-            }
+            // Initial install: don't reset last_rx_gpn (it's already 0 and the
+            // first downlink frame must be accepted).
+            self.install_group_keys(&unwrapped, false);
             // Operating Channel Validation: message 3's OCI must match.
             if self.ocv {
                 let want = (dot11::operating_class(self.channel), self.channel);
@@ -576,6 +689,9 @@ impl Client {
         let kck = self.kck;
         out.tx(dot11::build_eapol_m4(&bssid, &self.mac, &kck, sc, dot11::KeyMic::select(sha256, self.owe)));
         self.connected = 4;
+        // The pairwise key is now installed (m3 verified, m4 sent); only from
+        // here may protected unicast management frames be validated with `tk`.
+        self.ptk_installed = true;
         self.eapol_state = 2;
     }
 
@@ -592,6 +708,14 @@ impl Client {
         let pn = self.next_client_pn();
         let sc = self.next_sc();
         let tk = self.tk;
+        // QoS Data when WMM is on: force the test override TID if set, else
+        // derive the user priority from the packet's DSCP. Plain Data otherwise.
+        let qos_tid = if self.wmm {
+            Some(self.wmm_tid_override.unwrap_or_else(|| dot11::wmm_tid(eth)))
+        } else {
+            None
+        };
+        eprintln!("DBG uplink wmm={} override={:?} qos_tid={:?} ethertype={ethertype:#06x}", self.wmm, self.wmm_tid_override, qos_tid);
         let frame = dot11::build_ccmp_data(
             &bssid,
             &self.mac,
@@ -603,6 +727,7 @@ impl Client {
             &tk,
             ethertype,
             inner,
+            qos_tid,
         );
         let mut f = dot11::RADIOTAP_TX.to_vec();
         f.extend_from_slice(&frame);
@@ -611,7 +736,7 @@ impl Client {
 
     /// Build a ping (ICMP echo) Ethernet frame from `src_ip` to `dst_ip` for the
     /// gateway MAC.
-    pub fn build_ping(&self, dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4]) -> Vec<u8> {
+    pub fn build_ping(&self, dst_mac: &[u8; 6], src_ip: [u8; 4], dst_ip: [u8; 4], tos: u8) -> Vec<u8> {
         let mut icmp = vec![8u8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01];
         icmp.extend_from_slice(b"barely-ap-rust-ping");
         let ck = inet_checksum(&icmp);
@@ -619,7 +744,8 @@ impl Client {
 
         let total = 20 + icmp.len();
         let mut ip = Vec::with_capacity(total);
-        ip.extend_from_slice(&[0x45, 0x00]);
+        // `tos` carries the DSCP (DSCP << 2) so the WMM classifier can derive UP.
+        ip.extend_from_slice(&[0x45, tos]);
         ip.extend_from_slice(&(total as u16).to_be_bytes());
         ip.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 64, 1, 0, 0]);
         ip.extend_from_slice(&src_ip);
@@ -634,6 +760,34 @@ impl Client {
         eth.extend_from_slice(&[0x08, 0x00]);
         eth.extend_from_slice(&ip);
         eth
+    }
+
+    /// If `req_eth` is an ARP request for `my_ip`, build the ARP reply Ethernet
+    /// frame (sender = us). The AP's kernel ARPs for our IP before it can route
+    /// the ICMP echo *reply* back to us, so without this the ping never returns.
+    pub fn build_arp_reply(&self, req_eth: &[u8], my_ip: [u8; 4]) -> Option<Vec<u8>> {
+        if req_eth.len() < 14 + 28 || req_eth[12..14] != [0x08, 0x06] {
+            return None; // not ARP
+        }
+        let arp = &req_eth[14..14 + 28];
+        if arp[0..2] != [0x00, 0x01] || arp[2..4] != [0x08, 0x00] || arp[6..8] != [0x00, 0x01] {
+            return None; // not an Ethernet/IPv4 ARP *request*
+        }
+        if arp[24..28] != my_ip {
+            return None; // not asking for our IP
+        }
+        let sender_mac = &arp[8..14];
+        let sender_ip = &arp[14..18];
+        let mut eth = Vec::with_capacity(42);
+        eth.extend_from_slice(sender_mac); // dst = requester
+        eth.extend_from_slice(&self.mac); // src = us
+        eth.extend_from_slice(&[0x08, 0x06]); // ARP
+        eth.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x02]); // reply
+        eth.extend_from_slice(&self.mac); // sender hw = us
+        eth.extend_from_slice(&my_ip); // sender ip = us
+        eth.extend_from_slice(sender_mac); // target hw = requester
+        eth.extend_from_slice(sender_ip); // target ip = requester
+        Some(eth)
     }
 
     pub fn bssid(&self) -> Option<[u8; 6]> {

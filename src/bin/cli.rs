@@ -34,6 +34,9 @@ fn main() {
     let mut hnp = false;
     let mut owe = false;
     let mut ocv = false;
+    let mut wmm = true;
+    let mut wmm_tid: Option<u8> = None; // test override for the WMM user priority
+    let mut dscp: u8 = 0; // DSCP stamped on the test ping (drives WMM classification)
     let mut gw_mac = mac_to_bytes("02:00:00:00:00:00");
     let mut src_ip = [10, 10, 10, 2];
     let mut gw_ip = [10, 10, 10, 1];
@@ -59,6 +62,9 @@ fn main() {
             }
             "--owe" => owe = true,
             "--ocv" => ocv = true,
+            "--no-wmm" => wmm = false,
+            "--tid" | "--up" => wmm_tid = next(i).parse().ok().map(|t: u8| t & 0x07),
+            "--dscp" => dscp = next(i).parse::<u8>().map(|d| d << 2).unwrap_or(0),
             "--mode" => mode = next(i),
             "--iface" => iface = next(i),
             "--channel" => channel = next(i).parse().unwrap_or(1),
@@ -68,7 +74,7 @@ fn main() {
     }
 
     eprintln!(
-        "barely-cli: ssid={ssid:?} mac={} ping={ping} {}",
+        "barely-cli: ssid={ssid:?} mac={} ping={ping} wmm_tid={wmm_tid:?} dscp={dscp} {}",
         barely_ap::util::bytes_to_mac(&mac),
         if sae { "WPA3-SAE" } else { "WPA2-PSK" },
     );
@@ -86,8 +92,11 @@ fn main() {
     if ocv {
         client.enable_ocv();
     }
+    client.set_wmm(wmm);
+    client.set_wmm_tid(wmm_tid);
     let ping_cfg = if ping { Some((gw_mac, src_ip, gw_ip)) } else { None };
-    let node = ClientNode::new(client, Duration::from_millis(20), ping_cfg);
+    let mut node = ClientNode::new(client, Duration::from_millis(20), ping_cfg);
+    node.ping_tos = dscp;
     match mode.as_str() {
         "stdio" => raw_frames::run(node, StdioLink::new()),
         "iface" => run_iface(node, &iface, channel),

@@ -2,8 +2,10 @@
 //! Python/Scapy reference implementation.
 
 pub mod config;
+pub mod control;
 pub mod crypto;
 pub mod dot11;
+pub mod failures;
 pub mod fakenet;
 pub mod ap;
 pub mod client;

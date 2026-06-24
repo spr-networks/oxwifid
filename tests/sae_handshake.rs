@@ -59,7 +59,7 @@ fn wpa3_sae_h2e_full_handshake_and_ping() {
     assert!(ap.is_associated(&sta_mac), "AP must consider the SAE station associated");
 
     // Now exchange a ping over the SAE-keyed CCMP link.
-    let ping = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1]);
+    let ping = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1], 0);
     let ping_frame = sta.encrypt_uplink(&ping).expect("uplink encrypts");
     let replies = ap_step(&mut ap, &mut net, &ping_frame);
     assert!(!replies.is_empty(), "AP should answer the ping");
@@ -309,4 +309,41 @@ fn wrong_password_sae_fails_to_associate() {
     // full authentication.
     assert!(sta.connected < 4, "mismatched password must not authenticate");
     assert!(!ap.is_associated(&sta_mac));
+}
+
+/// Anti-downgrade: a WPA3-SAE-only AP must reject open-system Authentication
+/// (status 13) so a station that never starts SAE cannot reach the WPA2 PSK
+/// 4-way using the AP's PSK-derived PMK.
+#[test]
+fn sae_only_ap_rejects_open_system_auth() {
+    use barely_ap::dot11;
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    ap.enable_sae();
+
+    // Open-system Authentication request (algo 0) from a downgrade attacker.
+    let sc = 0u16;
+    let req = dot11::build_auth_req(&ap_mac, &sta_mac, sc);
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.extend_from_slice(&req);
+    let out = ap.handle_incoming(&framed);
+
+    // The AP must answer with an Authentication reject (status != success), not
+    // a success that would let the station proceed to associate + 4-way.
+    assert_eq!(out.frames.len(), 1, "SAE-only AP must answer open auth with one reject frame");
+    let body = dot11::strip_radiotap(&out.frames[0]).expect("radiotap");
+    let frame = dot11::Dot11::parse(body).expect("parse");
+    let auth = dot11::parse_auth(&frame.body).expect("auth body");
+    assert_eq!(auth.algo, dot11::AUTH_ALG_OPEN, "reject echoes the open-system algorithm");
+    assert_eq!(auth.status, dot11::STATUS_UNSUPPORTED_AUTH_ALG, "status 13 (unsupported auth algorithm)");
+
+    // A subsequent association attempt must not associate (no PMK was derived).
+    let ssid = b"turtlenet";
+    let assoc = dot11::build_assoc_req(&ap_mac, &sta_mac, ssid, 16);
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.extend_from_slice(&assoc);
+    ap.handle_incoming(&framed);
+    assert!(!ap.is_associated(&sta_mac), "downgrade station must never associate on a SAE-only AP");
 }

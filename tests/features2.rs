@@ -84,7 +84,7 @@ fn owe_handshake_and_ping() {
     assert!(ap.is_associated(&sta_mac));
 
     // Data round-trips over the OWE-keyed CCMP link.
-    let ping = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1]);
+    let ping = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1], 0);
     let f = sta.encrypt_uplink(&ping).expect("uplink");
     let replies = ap_step(&mut ap, &mut net, &f);
     let mut got = false;
@@ -190,4 +190,18 @@ fn multiple_bssid_element_advertised() {
     ap.enable_multi_bssid();
     let b1 = parse(&ap.beacon_frame());
     assert!(dot11::find_ie(&b1.body[12..], 71).is_some(), "Multiple BSSID element must be advertised when enabled");
+}
+
+#[test]
+fn pmksa_cache_is_bounded() {
+    let mut ap = Ap::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:00:00"), 1);
+    // Insert far more distinct PMKSA entries than the cap. The cache must stay
+    // bounded (evicting to within PMKSA_CACHE_MAX = 256) rather than growing
+    // without bound over a long uptime with many distinct clients.
+    for i in 0..2000u32 {
+        let mut id = [0u8; 16];
+        id[..4].copy_from_slice(&i.to_be_bytes());
+        ap.test_cache_pmksa(id);
+    }
+    assert!(ap.pmksa_len() <= 256, "PMKSA cache must stay bounded, got {}", ap.pmksa_len());
 }

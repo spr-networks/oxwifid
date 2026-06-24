@@ -77,6 +77,13 @@ impl Link for IfaceLink {
             if r <= 0 {
                 return None;
             }
+            if pfd.revents & libc::POLLIN == 0 {
+                // POLLERR/POLLHUP (e.g. the monitor interface was removed) without
+                // data: poll returns immediately forever, so sleep out the interval
+                // instead of spinning on a dead fd at 100% CPU.
+                std::thread::sleep(timeout);
+                return None;
+            }
             let mut buf = vec![0u8; 4096];
             let n = libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
             if n <= 0 {
