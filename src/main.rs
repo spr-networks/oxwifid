@@ -57,6 +57,12 @@ fn parse_args() -> Config {
                 })
             }
             "--ip" => cfg.ip = parse_ip(&next(i)).unwrap_or(cfg.ip),
+            "--country" => {
+                cfg.country = barely_ap::config::parse_country(&next(i)).unwrap_or_else(|e| {
+                    eprintln!("barely-ap: {e}");
+                    std::process::exit(1);
+                })
+            }
             "--mode" => cfg.mode = next(i),
             "--iface" => cfg.iface = next(i),
             "--ctrl" => cfg.ctrl_path = Some(next(i)),
@@ -73,6 +79,7 @@ fn parse_args() -> Config {
                 eprintln!("          [--channel N] [--ip IP] [--mode stdio|iface|netlink] [--iface NAME]");
                 eprintln!("          [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--band6] [--per-sta-vif]");
                 eprintln!("          [--ctrl PATH]   (netlink: hostapd-style control socket; multi-BSS via config `bss`)");
+                eprintln!("          [--country CC]  (2-letter regulatory code for the Country IE; default US)");
                 std::process::exit(0);
             }
             other => {
@@ -96,7 +103,9 @@ fn main() {
     let net = FakeNet::new(cfg.mac, cfg.ip);
     let beacon_interval = Duration::from_millis(50);
 
-    let security = match cfg.key_mgmt {
+    // EHT (--phy be) mandates PMF, so a non-MFPR mode is upgraded to WPA3-SAE
+    // (see Config::effective_key_mgmt); report what the AP will actually advertise.
+    let security = match cfg.effective_key_mgmt() {
         KeyMgmt::Psk => "WPA2-PSK",
         KeyMgmt::Sae => "WPA3-SAE",
         KeyMgmt::SaeTransition => "WPA3-SAE/WPA2 transition",

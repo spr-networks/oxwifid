@@ -65,6 +65,10 @@ pub struct Config {
     pub band6: bool,
     /// Per-station VIF: each station gets its own AP_VLAN + GTK (netlink mode).
     pub per_sta_vif: bool,
+    /// One credential file of `MAC passphrase` lines (`00:00:00:00:00:00` =
+    /// wildcard onboarding). Unlike hostapd's split `wpa_psk_file`/`sae_psk_file`,
+    /// this single file serves all key-mgmt.
+    pub psk_file: Option<String>,
     /// WMM (Wi-Fi Multimedia / WME QoS): advertise the WMM parameter element and
     /// exchange QoS Data frames with stations that negotiate it. Default on.
     pub wmm: bool,
@@ -111,6 +115,7 @@ impl Default for Config {
             rnr: false,
             band6: false,
             per_sta_vif: false,
+            psk_file: None,
             wmm: true,
             ctrl_path: None,
             bss: Vec::new(),
@@ -159,6 +164,7 @@ impl Config {
             "rnr" => self.rnr = as_bool(key, val)?,
             "band6" => self.band6 = as_bool(key, val)?,
             "per_sta_vif" => self.per_sta_vif = as_bool(key, val)?,
+            "psk_file" => self.psk_file = Some(as_str(key, val)?.to_string()),
             "wmm" | "wme" => self.wmm = as_bool(key, val)?,
             "ctrl_path" | "ctrl_interface" => self.ctrl_path = Some(as_str(key, val)?.to_string()),
             "wpa_group_rekey" | "group_rekey" => {
@@ -231,6 +237,25 @@ impl Config {
         Ok(())
     }
 
+    /// The key-management mode the AP will actually advertise, after applying the
+    /// PMF mandates of the chosen band/PHY.
+    ///
+    /// 802.11be (EHT, `--phy be`) **requires** Management Frame Protection: a
+    /// spec-compliant client rejects an EHT BSS whose RSN element is not PMF-capable
+    /// (`MFPC`)/required (`MFPR`) — it logs "skip RSN IE - no mgmt frame protection"
+    /// and never associates. WPA2-PSK and SAE-transition advertise a non-MFPR RSN,
+    /// so under EHT they are upgraded to WPA3-SAE (which advertises MFPR|MFPC + the
+    /// BIP group-management cipher). This mirrors the existing 6 GHz rule, where
+    /// `band6` likewise forces SAE because 6 GHz mandates WPA3. OWE is already
+    /// PMF-protected and is left as-is.
+    pub fn effective_key_mgmt(&self) -> KeyMgmt {
+        if self.phy == crate::dot11::PhyMode::Eht && matches!(self.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition) {
+            KeyMgmt::Sae
+        } else {
+            self.key_mgmt
+        }
+    }
+
     /// Construct and fully configure an [`Ap`] from this configuration.
     pub fn build_ap(&self) -> Ap {
         let mut ap = Ap::new(&self.ssid, &self.passphrase, self.mac, self.channel);
@@ -240,7 +265,7 @@ impl Config {
         ap.set_wmm(self.wmm);
         ap.set_group_rekey(self.group_rekey);
         ap.set_strict_rekey(self.strict_rekey);
-        apply_security(&mut ap, self.key_mgmt);
+        apply_security(&mut ap, self.effective_key_mgmt());
         if self.ocv {
             ap.enable_ocv();
         }
@@ -257,6 +282,12 @@ impl Config {
         if self.per_sta_vif {
             ap.enable_per_sta_vif();
         }
+        if let Some(path) = &self.psk_file {
+            match parse_psk_file(path) {
+                Ok(entries) => ap.set_psk_file(&entries),
+                Err(e) => eprintln!("barely-ap: psk_file {path:?}: {e}"),
+            }
+        }
         ap
     }
 
@@ -270,7 +301,14 @@ impl Config {
         ap.set_wmm(self.wmm);
         ap.set_group_rekey(self.group_rekey);
         ap.set_strict_rekey(self.strict_rekey);
-        apply_security(&mut ap, bss.key_mgmt);
+        // EHT mandates PMF for every BSS on the radio, the same way `band6` does
+        // below — upgrade a non-MFPR mode to SAE (see `effective_key_mgmt`).
+        let km = if self.phy == crate::dot11::PhyMode::Eht && matches!(bss.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition) {
+            KeyMgmt::Sae
+        } else {
+            bss.key_mgmt
+        };
+        apply_security(&mut ap, km);
         if self.band6 {
             ap.enable_band6();
             ap.enable_sae();
@@ -326,7 +364,39 @@ fn parse_bss(item: &Value, default_pass: &str, default_km: KeyMgmt) -> Result<Bs
     Ok(b)
 }
 
-fn parse_country(s: &str) -> Result<[u8; 2], String> {
+/// One credential-file entry: `(MAC filter, passphrase)`, `None` MAC = wildcard.
+pub type PskEntry = (Option<[u8; 6]>, String);
+
+/// Parse a hostapd-format `wpa_psk_file`: one `MAC passphrase` per line, `#`
+/// comments and blank lines ignored. `00:00:00:00:00:00` is the wildcard
+/// (onboarding) MAC — returned as `None`.
+pub fn parse_psk_file(path: &str) -> Result<Vec<PskEntry>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // MAC is the first token that looks like a MAC; the rest is the passphrase.
+        let (mac_tok, pass) = match line.split_once(char::is_whitespace) {
+            Some((m, p)) => (m, p.trim()),
+            None => continue,
+        };
+        if pass.is_empty() {
+            continue;
+        }
+        let mac = if mac_tok == "00:00:00:00:00:00" {
+            None
+        } else {
+            Some(mac_to_bytes(mac_tok))
+        };
+        out.push((mac, pass.to_string()));
+    }
+    Ok(out)
+}
+
+pub fn parse_country(s: &str) -> Result<[u8; 2], String> {
     let b = s.as_bytes();
     if b.len() != 2 || !b[0].is_ascii_alphabetic() || !b[1].is_ascii_alphabetic() {
         return Err(format!("country must be a 2-letter code, got {s:?}"));
@@ -396,6 +466,34 @@ mod tests {
         assert_eq!(c.ssid, "turtlenet");
         assert!(!c.per_sta_vif);
         assert!(c.bss.is_empty());
+    }
+
+    #[test]
+    fn eht_mandates_pmf_upgrading_non_mfpr_modes_to_sae() {
+        use crate::dot11::{PhyMode, SecurityMode};
+        // 802.11be (EHT) requires PMF: a non-MFPR mode (WPA2-PSK / SAE-transition)
+        // is upgraded to WPA3-SAE, so the AP advertises an MFPR|MFPC RSN that a
+        // spec-compliant Wi-Fi 7 client will accept.
+        let mut c = Config { phy: PhyMode::Eht, ..Config::default() };
+        assert_eq!(c.key_mgmt, KeyMgmt::Psk);
+        assert_eq!(c.effective_key_mgmt(), KeyMgmt::Sae, "EHT + PSK must advertise SAE/PMF");
+        assert_eq!(c.build_ap().security_mode(), SecurityMode::Wpa3Sae);
+
+        c.key_mgmt = KeyMgmt::SaeTransition; // transition is only MFPC, not MFPR
+        assert_eq!(c.effective_key_mgmt(), KeyMgmt::Sae, "EHT + transition must advertise SAE/PMF");
+
+        // OWE is already PMF-protected; SAE is already correct — both unchanged.
+        c.key_mgmt = KeyMgmt::Owe;
+        assert_eq!(c.effective_key_mgmt(), KeyMgmt::Owe);
+        c.key_mgmt = KeyMgmt::Sae;
+        assert_eq!(c.effective_key_mgmt(), KeyMgmt::Sae);
+
+        // Non-EHT PHYs keep WPA2-PSK (PMF is not mandated below 11be).
+        for phy in [PhyMode::Ht, PhyMode::Vht, PhyMode::He] {
+            let c = Config { phy, key_mgmt: KeyMgmt::Psk, ..Config::default() };
+            assert_eq!(c.effective_key_mgmt(), KeyMgmt::Psk, "{phy:?} must stay WPA2-PSK");
+            assert_eq!(c.build_ap().security_mode(), SecurityMode::Wpa2);
+        }
     }
 
     #[test]
@@ -541,5 +639,26 @@ mod tests {
         assert_eq!(Config::from_json(r#"{"country_code": "JP"}"#).unwrap().country, *b"JP");
         assert!(Config::from_json(r#"{"country": "USA"}"#).is_err()); // not 2 letters
         assert!(Config::from_json(r#"{"country": "U1"}"#).is_err()); // not alphabetic
+    }
+
+    #[test]
+    fn psk_file_parses_wildcard_and_per_mac() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("barely_psk_{}.txt", std::process::id()));
+        std::fs::write(
+            &path,
+            "# onboarding\n\
+             00:00:00:00:00:00 onboardpass\n\
+             \n\
+             aa:bb:cc:dd:ee:ff devicepass\n",
+        )
+        .unwrap();
+        let e = parse_psk_file(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0], (None, "onboardpass".to_string())); // wildcard
+        assert_eq!(e[1], (Some(mac_to_bytes("aa:bb:cc:dd:ee:ff")), "devicepass".to_string()));
+        let c = Config::from_json(r#"{"psk_file": "/x"}"#).unwrap();
+        assert_eq!(c.psk_file.as_deref(), Some("/x"));
     }
 }

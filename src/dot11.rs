@@ -111,8 +111,22 @@ const RATES_5GHZ: [u8; 8] = [0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c];
 /// Country Information element (ID 7): the 2-letter `country` code + the
 /// all-environments indicator, then a band-appropriate (first-channel,
 /// num-channels, max-tx-power dBm) triplet.
-fn country_ie(country: &[u8; 2], channel: u8) -> Vec<u8> {
-    let triplet: [u8; 3] = if is_5ghz(channel) { [36, 4, 23] } else { [1, 11, 30] };
+fn country_ie(country: &[u8; 2], channel: u8, width: u16, band6: bool) -> Vec<u8> {
+    // The triplet must cover the channels the BSS actually operates on (a
+    // strict 802.11d client treats uncovered channels as unusable): on 5/6 GHz
+    // span the full operating width from the block's lowest 20 MHz channel
+    // (channels step by 4 per 20 MHz); 2.4 GHz keeps the fixed 1-11 span.
+    let triplet: [u8; 3] = if band6 || is_5ghz(channel) {
+        let n = (width / 20).max(1) as u8;
+        let first = if width > 20 {
+            center_channel(channel, width, band6) - 2 * (n - 1)
+        } else {
+            channel
+        };
+        [first, n, 23]
+    } else {
+        [1, 11, 30]
+    };
     let mut data = vec![country[0], country[1], 0x20];
     data.extend_from_slice(&triplet);
     ie(7, &data)
@@ -350,7 +364,11 @@ fn vht_operation(channel: u8, width: u16) -> Vec<u8> {
         160 => (1u8, center_channel(channel, 80, false), center_channel(channel, 160, false)),
         _ => (0u8, 0u8, 0u8),
     };
-    ie(192, &[cw, seg0, seg1, 0x00, 0x00]) // + Basic VHT-MCS and NSS Set
+    // Basic VHT-MCS and NSS Set 0xfffc: NSS1 requires MCS 0-7, NSS2-8 exempt
+    // (hostapd's default, same as the HE Operation basic set). NOT 0x0000 — in
+    // this 2-bits-per-NSS field 0 means "required" and 3 "not required", so
+    // all-zeroes would demand 8 mandatory spatial streams from every client.
+    ie(192, &[cw, seg0, seg1, 0xfc, 0xff])
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +556,7 @@ pub fn make_beacon_ies_6ghz(ssid: &[u8], channel: u8, country: &[u8; 2], width: 
     let mut v = Vec::new();
     v.extend_from_slice(&ie(0, ssid)); // SSID
     v.extend_from_slice(&ie(1, &RATES_5GHZ)); // Supported Rates (OFDM)
-    v.extend_from_slice(&country_ie(country, channel)); // Country
+    v.extend_from_slice(&country_ie(country, channel, width, true)); // Country
     v.extend_from_slice(&he_capabilities());
     v.extend_from_slice(&he_operation_6ghz(channel, width));
     v.extend_from_slice(&he_6ghz_band_capabilities());
@@ -586,11 +604,11 @@ pub fn make_beacon_ies(ssid: &[u8], channel: u8, country: &[u8; 2], width: u16, 
     v.extend_from_slice(&ie(0, ssid)); // SSID
     if is_5ghz(channel) {
         v.extend_from_slice(&ie(1, &RATES_5GHZ)); // Supported Rates (OFDM)
-        v.extend_from_slice(&country_ie(country, channel)); // Country
+        v.extend_from_slice(&country_ie(country, channel, width, false)); // Country
     } else {
         v.extend_from_slice(&ie(1, &RATES_2GHZ)); // Supported Rates
         v.extend_from_slice(&ie(3, &[channel])); // DS Parameter Set
-        v.extend_from_slice(&country_ie(country, channel)); // Country
+        v.extend_from_slice(&country_ie(country, channel, width, false)); // Country
         v.extend_from_slice(&ie(50, &EXT_RATES_2GHZ)); // Extended Supported Rates
     }
     // 802.11n HT
@@ -687,7 +705,7 @@ pub fn build_probe_resp(bssid: &[u8; 6], dst: &[u8; 6], ssid: &[u8], channel: u8
 }
 
 /// The security mode an AP advertises.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SecurityMode {
     Wpa2,
     Wpa3Sae,
@@ -921,6 +939,104 @@ pub fn build_assoc_req_sae(bssid: &[u8; 6], sta: &[u8; 6], ssid: &[u8], sc: u16)
     v
 }
 
+// --- 802.11be MLD association (replicated from a real wpa_supplicant MLD assoc) ---
+// Captured IEs from a working hostapd-MLD assoc; reused verbatim so hostapd accepts
+// the 2-link MLD station. RSN AKM is set to PSK-SHA256 (00-0F-AC:6) + BIP-GMAC-256.
+pub const AMLD_RATES: [u8; 10] = [0x01, 0x08, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24];
+pub const AMLD_EXTRATES: [u8; 6] = [0x32, 0x04, 0x30, 0x48, 0x60, 0x6c];
+/// RSN: group CCMP, pairwise CCMP, AKM PSK-SHA256 (00-0F-AC:6), MFPR|MFPC,
+/// group-mgmt BIP-GMAC-256 (00-0F-AC:12) — 32-byte IGTK for the back-index geometry.
+pub const AMLD_RSN_PSK256: [u8; 28] = [
+    0x30, 0x1a, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+    0x01, 0x00, 0x00, 0x0f, 0xac, 0x06, 0xcc, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xac, 0x0c,
+];
+/// RSN: group CCMP, pairwise CCMP, AKM SAE (00-0F-AC:8), MFPR|MFPC,
+/// group-mgmt BIP-GMAC-256 (00-0F-AC:12) — verbatim from the captured MLD assoc.
+pub const AMLD_RSN_SAE: [u8; 28] = [
+    0x30, 0x1a, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+    0x01, 0x00, 0x00, 0x0f, 0xac, 0x08, 0xcc, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xac, 0x0c,
+];
+pub const AMLD_HTCAP: [u8; 28] = [
+    0x2d, 0x1a, 0x7e, 0x10, 0x1b, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+pub const AMLD_EXTCAP: [u8; 12] = [0x7f, 0x0a, 0x04, 0x00, 0x4a, 0x02, 0x01, 0x40, 0x00, 0x40, 0x00, 0x01];
+pub const AMLD_HECAP: [u8; 24] = [
+    0xff, 0x16, 0x23, 0x01, 0x78, 0xc8, 0x1a, 0x40, 0x00, 0x02, 0xbf, 0xce, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0xff, 0xfa, 0xff,
+];
+pub const AMLD_EHTCAP: [u8; 19] = [
+    0xff, 0x11, 0x6c, 0x07, 0x00, 0x7c, 0x00, 0x00, 0xfe, 0xff, 0xff, 0x07, 0x01, 0x00,
+    0x88, 0x88, 0x88, 0x00, 0x00,
+];
+pub const AMLD_WMM: [u8; 9] = [0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00];
+/// Link-1 STA-Profile inner IEs (no RSN — inherited from link 0): RATES, EXTRATES,
+/// HT-CAP, HE-CAP, EHT-CAP.
+pub const AMLD_LINK1_PROFILE_IES: [u8; 87] = [
+    0x01, 0x08, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24, 0x32, 0x04, 0x30, 0x48,
+    0x60, 0x6c, 0x2d, 0x1a, 0x7e, 0x10, 0x1b, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xff, 0x16, 0x23, 0x01, 0x78, 0xc8, 0x1a, 0x40, 0x00, 0x02, 0xbf, 0xce,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfa, 0xff, 0xfa, 0xff, 0xff, 0x11,
+    0x6c, 0x07, 0x00, 0x7c, 0x00, 0x00, 0xfe, 0xff, 0xff, 0x07, 0x01, 0x00, 0x88, 0x88,
+    0x88, 0x00, 0x00,
+];
+
+/// Basic Multi-Link element carrying a Per-STA Profile for link 1 (STA-Control
+/// link_id=1, complete profile, MAC present) — what makes hostapd create a 2-link
+/// MLD station.
+fn multi_link_sta(mld_mac: &[u8; 6], link1_mac: &[u8; 6]) -> Vec<u8> {
+    let mut ml = Vec::new();
+    ml.extend_from_slice(&[0x00, 0x01]); // ML control: Basic, MLD-Caps present
+    ml.push(9); // Common Info Length
+    ml.extend_from_slice(mld_mac); // MLD MAC Address
+    ml.extend_from_slice(&[0x00, 0x00]); // MLD Capabilities
+    // Per-STA Profile subelement (id 0) for link 1
+    let mut prof = Vec::new();
+    prof.extend_from_slice(&[0x31, 0x00]); // STA-Control: link_id=1, complete, MAC present
+    prof.push(7); // STA-Info Length (incl. itself)
+    prof.extend_from_slice(link1_mac); // link-1 STA MAC
+    prof.extend_from_slice(&[0x30, 0x04]); // link-1 Capability Info
+    prof.extend_from_slice(&AMLD_LINK1_PROFILE_IES);
+    ml.push(0); // subelement id: Per-STA Profile
+    ml.push(prof.len() as u8);
+    ml.extend_from_slice(&prof);
+    ext_ie(107, &ml)
+}
+
+/// Basic Multi-Link element for SAE *authentication* frames: Common Info only
+/// (MLD MAC + MLD Capabilities), no per-STA profile. The AP learns the STA's MLD
+/// MAC here; without it the AP records 00:00:00:00:00:00 and the assoc mismatches.
+pub fn multi_link_auth(mld_mac: &[u8; 6]) -> Vec<u8> {
+    let mut ml = Vec::new();
+    ml.extend_from_slice(&[0x00, 0x01]); // ML control: Basic, MLD-Caps present
+    ml.push(9); // Common Info Length
+    ml.extend_from_slice(mld_mac); // MLD MAC Address
+    ml.extend_from_slice(&[0x00, 0x00]); // MLD Capabilities
+    ext_ie(107, &ml)
+}
+
+/// 2-link MLD (Re)Association Request (PSK-SHA256). Frame addressed with link-0
+/// addresses; the ML element advertises the MLD MAC + the link-1 per-STA profile.
+pub fn build_assoc_req_mld(ap_bssid: &[u8; 6], sta_link0: &[u8; 6], mld_mac: &[u8; 6],
+                           link1_mac: &[u8; 6], ssid: &[u8], sc: u16) -> Vec<u8> {
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, FC_TODS, ap_bssid, sta_link0, ap_bssid, sc);
+    v.extend_from_slice(&[0x30, 0x04]); // Capability Info (0x0430)
+    v.extend_from_slice(&[0x05, 0x00]); // Listen interval
+    v.extend_from_slice(&ie(0, ssid));
+    v.extend_from_slice(&AMLD_RATES);
+    v.extend_from_slice(&AMLD_EXTRATES);
+    v.extend_from_slice(&AMLD_RSN_SAE);
+    v.extend_from_slice(&AMLD_HTCAP);
+    v.extend_from_slice(&AMLD_EXTCAP);
+    v.extend_from_slice(&AMLD_HECAP);
+    v.extend_from_slice(&multi_link_sta(mld_mac, link1_mac));
+    v.extend_from_slice(&AMLD_EHTCAP);
+    v.extend_from_slice(&RSNXE_H2E); // SAE H2E capability (RSNXE)
+    v.extend_from_slice(&AMLD_WMM);
+    v
+}
+
 /// OWE Diffie-Hellman Parameter element (ID 255, extension 32): group + public
 /// key (RFC 8110).
 pub fn build_dh_param_element(group: u16, pubkey: &[u8]) -> Vec<u8> {
@@ -1060,16 +1176,39 @@ pub fn build_eapol_m2(bssid: &[u8; 6], sta: &[u8; 6], snonce: &[u8; 32], kck: &[
 
 /// EAPOL message 4 (STA -> AP): the handshake ack, MIC'd with the KCK.
 pub fn build_eapol_m4(bssid: &[u8; 6], sta: &[u8; 6], kck: &[u8], sc: u16, mic: KeyMic) -> Vec<u8> {
+    build_eapol_m4_mld(bssid, sta, kck, sc, mic, None)
+}
+
+/// EAPOL message 4 with an optional STA MLD MAC address (802.11be).
+///
+/// For an MLD association the AP requires m4 to carry the STA's MLD MAC in a
+/// MAC Address KDE (00-0F-AC:3) — the same KDE m2 carries — otherwise it rejects
+/// the handshake with "Mismatching or missing MLD address in EAPOL-Key msg 4/4"
+/// and never authorizes the port, so all uplink data is dropped as "not
+/// associated". `None` keeps the legacy empty-key-data m4 for non-MLD links.
+pub fn build_eapol_m4_mld(bssid: &[u8; 6], sta: &[u8; 6], kck: &[u8], sc: u16, mic: KeyMic, mld_mac: Option<&[u8; 6]>) -> Vec<u8> {
     let ki = KeyInfo {
+        // The Secure bit MUST be set in message 4 (it is clear in message 2):
+        // hostapd's MLD 4-way uses it to tell m4 from m2, and without it treats
+        // our m4 as a stray m2 ("invalid state - dropped") and never finishes.
+        secure: true,
         has_key_mic: true,
         key_type: true,
         key_descriptor_type_version: mic.version(),
         ..Default::default()
     };
     let zero_nonce = [0u8; 32];
-    let body0 = build_eapol_key_body(ki, 0, 2, &zero_nonce, &[0u8; 16], &[]);
+    let key_data: Vec<u8> = match mld_mac {
+        Some(mld) => {
+            let mut kd = vec![0xdd, 0x0a, 0x00, 0x0f, 0xac, 0x03];
+            kd.extend_from_slice(mld);
+            kd
+        }
+        None => Vec::new(),
+    };
+    let body0 = build_eapol_key_body(ki, 0, 2, &zero_nonce, &[0u8; 16], &key_data);
     let mic = mic.compute(kck, &eapol_wrap(&body0));
-    let body = build_eapol_key_body(ki, 0, 2, &zero_nonce, &mic, &[]);
+    let body = build_eapol_key_body(ki, 0, 2, &zero_nonce, &mic, &key_data);
     let mut frame = eapol_data_header_tods(bssid, sta, sc);
     frame.extend_from_slice(&eapol_wrap(&body));
     frame
@@ -1086,6 +1225,8 @@ pub enum KeyMic {
     AesCmac,
     /// OWE (AKM 00-0F-AC:18): HMAC-SHA256-128, Key Descriptor Version 0.
     HmacSha256,
+    /// PSK-SHA256 (AKM 00-0F-AC:6): AES-128-CMAC, Key Descriptor Version 3.
+    AesCmacV3,
 }
 
 impl KeyMic {
@@ -1103,6 +1244,7 @@ impl KeyMic {
     fn version(self) -> u8 {
         match self {
             KeyMic::HmacSha1 => 2,
+            KeyMic::AesCmacV3 => 3,
             _ => 0,
         }
     }
@@ -1112,7 +1254,7 @@ impl KeyMic {
         let mut mic = [0u8; 16];
         match self {
             KeyMic::HmacSha1 => mic.copy_from_slice(&crypto::hmac_sha1(kck, data)[..16]),
-            KeyMic::AesCmac => mic.copy_from_slice(&crypto::aes_cmac(kck, data)),
+            KeyMic::AesCmac | KeyMic::AesCmacV3 => mic.copy_from_slice(&crypto::aes_cmac(kck, data)),
             KeyMic::HmacSha256 => mic.copy_from_slice(&crypto::hmac_sha256(kck, data)[..16]),
         }
         mic
@@ -1177,12 +1319,40 @@ pub fn parse_oci_kde(key_data: &[u8]) -> Option<(u8, u8)> {
 
 /// The operating class for a channel (81 for 2.4 GHz, 115 for 5 GHz) — used for
 /// the OCI.
-pub fn operating_class(channel: u8) -> u8 {
-    if is_5ghz(channel) {
-        115
+pub fn operating_class(channel: u8, width: u16, band6: bool) -> u8 {
+    if band6 {
+        // 6 GHz global classes: 131=20, 132=40, 133=80, 134=160, 137=320 MHz.
+        match width { 320 => 137, 160 => 134, 80 => 133, 40 => 132, _ => 131 }
+    } else if is_5ghz(channel) {
+        // OCV validators (hostap ocv.c) check the class's bandwidth against the
+        // operating width, so 115 (20 MHz) at 80 MHz fails the 4-way.
+        match width {
+            160 => 129,
+            80 => 128,
+            40 => {
+                let lower = (channel as i32 - 36).rem_euclid(8) == 0;
+                match (channel, lower) {
+                    (36..=48, true) => 116, (36..=48, false) => 117,
+                    (52..=64, true) => 119, (52..=64, false) => 120,
+                    (100..=144, true) => 122, (100..=144, false) => 123,
+                    (_, true) => 126, (_, false) => 127,
+                }
+            }
+            _ => match channel { 36..=48 => 115, 52..=64 => 118, 100..=144 => 121, _ => 124 },
+        }
     } else {
-        81
+        match width { 40 => 83, _ => 81 } // 2.4 GHz: 81=20, 83/84=40 MHz
     }
+}
+
+/// Whether a received OCI's operating class belongs to the band we operate on —
+/// the peer's class may legitimately differ in *width* from ours (e.g. a 20 MHz
+/// STA on an 80 MHz BSS), so validation pins the primary channel + band rather
+/// than demanding an identical class.
+pub fn oci_class_matches_band(op_class: u8, channel: u8, band6: bool) -> bool {
+    if band6 { (131..=137).contains(&op_class) }
+    else if is_5ghz(channel) { (115..=130).contains(&op_class) }
+    else { matches!(op_class, 81..=84) }
 }
 
 /// The IGTK key-data encapsulation (KDE) for PMF (802.11w): delivers the
@@ -1487,6 +1657,36 @@ pub fn build_ccmp_data(
     inner_payload: &[u8],
     qos_tid: Option<u8>,
 ) -> Vec<u8> {
+    // Non-MLD: the CCMP security addresses are the MAC-header addresses.
+    build_ccmp_data_sec(a1, a2, a3, a1, a2, a3, flags, sc, pn, key_id, tk, ethertype, inner_payload, qos_tid)
+}
+
+/// Like [`build_ccmp_data`], but with the CCMP *security* addresses
+/// (`sec_a1`/`sec_a2`/`sec_a3` — used for the nonce A2 and the AAD) decoupled
+/// from the MAC-header addresses (`a1`/`a2`/`a3`).
+///
+/// This is the 802.11be (MLO) rule: a data frame on a link carries the **link
+/// addresses** in the MAC header so it can traverse that physical link, but the
+/// CCMP nonce and AAD — and hence the AP's STA lookup — hinge on the **MLD
+/// addresses**, consistent with the PTK derivation (which also uses the MLD
+/// addresses). For a non-MLD association the two sets are identical.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ccmp_data_sec(
+    a1: &[u8; 6],
+    a2: &[u8; 6],
+    a3: &[u8; 6],
+    sec_a1: &[u8; 6],
+    sec_a2: &[u8; 6],
+    sec_a3: &[u8; 6],
+    flags: u8,
+    sc: u16,
+    pn: u64,
+    key_id: u8,
+    tk: &[u8],
+    ethertype: u16,
+    inner_payload: &[u8],
+    qos_tid: Option<u8>,
+) -> Vec<u8> {
     // QoS Data (WMM) when a TID is given, else a plain Data frame.
     let subtype = if qos_tid.is_some() { SUBTYPE_QOS_DATA } else { 0 };
     let mut frame = dot11_header(TYPE_DATA, subtype, flags, a1, a2, a3, sc);
@@ -1498,8 +1698,10 @@ pub fn build_ccmp_data(
 
     let fc_bytes = (frame[0], frame[1]);
     let prio = qos_tid.unwrap_or(0);
-    let nonce = ccmp_get_nonce(prio, a2, pn);
-    let aad = ccmp_get_aad(fc_bytes.0, fc_bytes.1, a1, a2, a3, sc, qos_tid.map(|t| (t & 0x0F) as u16));
+    // CCMP nonce A2 and AAD use the *security* (MLD) addresses, not the
+    // link addresses carried in the MAC header.
+    let nonce = ccmp_get_nonce(prio, sec_a2, pn);
+    let aad = ccmp_get_aad(fc_bytes.0, fc_bytes.1, sec_a1, sec_a2, sec_a3, sc, qos_tid.map(|t| (t & 0x0F) as u16));
 
     let mut plaintext = Vec::with_capacity(8 + inner_payload.len());
     plaintext.extend_from_slice(&llc_snap(ethertype));
@@ -1627,10 +1829,27 @@ pub fn build_group_deauth_bip(bssid: &[u8; 6], igtk: &[u8; 16], key_id: u16, ipn
 /// DA=addr1/SA=addr3, uplink (to-DS) frames take DA=addr3/SA=addr2. Returns the
 /// reconstructed Ethernet bytes, or `None` if the tag does not verify.
 pub fn decrypt_ccmp(frame: &Dot11, tk: &[u8], from_ap: bool) -> Option<Vec<u8>> {
+    decrypt_ccmp_sec(frame, tk, from_ap, None)
+}
+
+/// Like [`decrypt_ccmp`], but with optional 802.11be (MLO) *security* addresses.
+///
+/// `sec_addrs = Some((sec_a1, sec_a2, sec_a3))` supplies the MLD addresses used
+/// for the CCMP nonce A2 and the AAD, while the MAC header keeps its link
+/// addresses (mirroring the AP/mac80211, which CCMP-protects MLD downlink with
+/// the MLD addresses even though the frame carries link addresses over the air).
+/// `None` falls back to the MAC-header addresses (non-MLD).
+pub fn decrypt_ccmp_sec(
+    frame: &Dot11,
+    tk: &[u8],
+    from_ap: bool,
+    sec_addrs: Option<([u8; 6], [u8; 6], [u8; 6])>,
+) -> Option<Vec<u8>> {
     let pn = frame.ccmp_pn()?;
     let qos_tid = frame.qos.map(|_| frame.priority());
-    let nonce = ccmp_get_nonce(frame.priority() as u8, &frame.addr2, pn);
-    let aad = ccmp_get_aad(frame.fc0, frame.fc1, &frame.addr1, &frame.addr2, &frame.addr3, frame.sc, qos_tid);
+    let (sa1, sa2, sa3) = sec_addrs.unwrap_or((frame.addr1, frame.addr2, frame.addr3));
+    let nonce = ccmp_get_nonce(frame.priority() as u8, &sa2, pn);
+    let aad = ccmp_get_aad(frame.fc0, frame.fc1, &sa1, &sa2, &sa3, frame.sc, qos_tid);
 
     let data = frame.ccmp_data()?;
     if data.len() < 8 {

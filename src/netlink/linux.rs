@@ -488,12 +488,14 @@ fn nl_new_key(sock: &mut NetlinkSocket, family: u16, ifindex: u32, sta: Option<&
         m = m.attr(Attr::bytes(NL80211_ATTR_MAC, s));
     } else {
         // The group key is the default TX key for group-addressed frames; the
-        // kernel needs this set for the AP data path to come up. Scope the
-        // default to multicast so it doesn't clobber the pairwise (unicast)
-        // default key.
-        m = m
-            .attr(Attr::bytes(NL80211_ATTR_KEY_DEFAULT, &[]))
-            .attr(Attr::nested(NL80211_ATTR_KEY_DEFAULT_TYPES, &[Attr::bytes(NL80211_KEY_DEFAULT_TYPE_MULTICAST, &[])]));
+        // kernel needs this set for the AP data path to come up. The kernel infers
+        // multicast scope from KEY_TYPE=GROUP, so a bare KEY_DEFAULT flag suffices
+        // (the per-station pairwise PTK still governs unicast). An explicit
+        // NL80211_ATTR_KEY_DEFAULT_TYPES nest tripped strict nested-attr policy
+        // validation on NEW_KEY ("attribute 88 has an invalid length"), so the
+        // kernel rejected the whole key and the GTK silently never installed —
+        // leaving AP-originated broadcast/multicast downlink dropped.
+        m = m.attr(Attr::bytes(NL80211_ATTR_KEY_DEFAULT, &[]));
     }
     if let Err(e) = sock.request_ack(m) {
         eprintln!("netlink AP: NEW_KEY (idx {idx}, pairwise {pairwise}) failed: {e}");
@@ -701,18 +703,24 @@ pub fn run_offload_ap(mut ap: crate::ap::Ap, iface: &str, channel: u8, ctrl_path
     );
 
     // Derive the nl80211 auth type + RSN AKM suite(s) from the AP's configured
-    // security mode, instead of hardcoding open-system + WPA2-PSK. SAE uses the
-    // SAE auth type (the kernel/driver expects it for a WPA3 BSS); OWE and PSK use
-    // open-system. Transition advertises BOTH PSK and SAE AKMs so WPA2 and WPA3
-    // clients can each pick their AKM. (6 GHz mandates WPA3/SAE, so this is also
-    // what makes a 6 GHz / 320 MHz AP possible at all.)
+    // security mode, instead of hardcoding open-system + WPA2-PSK. The AKM suite
+    // list distinguishes the modes; Transition advertises BOTH PSK and SAE AKMs so
+    // WPA2 and WPA3 clients can each pick their AKM.
+    //
+    // AUTH_TYPE for START_AP must stay OPEN_SYSTEM for every mode here: barely-ap
+    // runs the SAE/OWE exchange in *userspace* (the kernel hands auth frames up via
+    // REGISTER_FRAME), so it never offloads SAE to the driver. Passing
+    // NL80211_AUTHTYPE_SAE asserts driver SAE-offload (NL80211_EXT_FEATURE_SAE_-
+    // OFFLOAD_AP); a driver without it (e.g. mac80211_hwsim) rejects START_AP with
+    // EINVAL. This is what blocked WPA3-SAE — and therefore the PMF-protected EHT
+    // (--phy be) config that 802.11be mandates — on the netlink path.
     let (auth_type, akm_suites): (u32, Vec<u8>) = match ap.security_mode() {
         dot11::SecurityMode::Wpa2 => (NL80211_AUTHTYPE_OPEN_SYSTEM, WLAN_AKM_SUITE_PSK.to_ne_bytes().to_vec()),
-        dot11::SecurityMode::Wpa3Sae => (NL80211_AUTHTYPE_SAE, WLAN_AKM_SUITE_SAE.to_ne_bytes().to_vec()),
+        dot11::SecurityMode::Wpa3Sae => (NL80211_AUTHTYPE_OPEN_SYSTEM, WLAN_AKM_SUITE_SAE.to_ne_bytes().to_vec()),
         dot11::SecurityMode::Transition => {
             let mut a = WLAN_AKM_SUITE_PSK.to_ne_bytes().to_vec();
             a.extend_from_slice(&WLAN_AKM_SUITE_SAE.to_ne_bytes());
-            (NL80211_AUTHTYPE_SAE, a)
+            (NL80211_AUTHTYPE_OPEN_SYSTEM, a)
         }
         dot11::SecurityMode::Owe => (NL80211_AUTHTYPE_OPEN_SYSTEM, WLAN_AKM_SUITE_OWE.to_ne_bytes().to_vec()),
     };

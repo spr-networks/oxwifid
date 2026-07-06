@@ -187,6 +187,12 @@ pub struct Ap {
     /// 6 GHz is always HE+. Defaults to VHT to match prior behaviour.
     phy_mode: dot11::PhyMode,
     pub pmk: [u8; 32],
+    /// hostapd `wpa_psk_file` model: candidate PMKs, each optionally bound to a
+    /// station MAC. `None` MAC = wildcard (00:00:00:00:00:00) onboarding entry.
+    /// On the 4-way, MAC-specific entries are tried before wildcards; the one
+    /// whose PTK verifies message 2's MIC is that station's password. Empty =>
+    /// the single `pmk` above is used (classic single-passphrase AP).
+    psk_candidates: Vec<(Option<[u8; 6]>, [u8; 32])>,
     /// Passphrase, retained for WPA3-SAE PWE derivation.
     password: Vec<u8>,
     /// When true, accept WPA3-SAE (H2E) authentication.
@@ -300,6 +306,7 @@ impl Ap {
             channel_width: 20,
             phy_mode: dot11::PhyMode::Vht,
             pmk,
+            psk_candidates: Vec::new(),
             password: psk.as_bytes().to_vec(),
             sae_enabled: false,
             transition: false,
@@ -478,6 +485,17 @@ impl Ap {
     /// station cannot read broadcast/multicast addressed to another's VLAN.
     pub fn enable_per_sta_vif(&mut self) {
         self.per_sta_vif = true;
+    }
+
+    /// Install the hostapd-style `wpa_psk_file` candidates: `(mac, passphrase)`
+    /// pairs (`None` mac = wildcard onboarding entry). Each passphrase is turned
+    /// into a PMK against this AP's SSID. Tried MAC-specific-first on the 4-way.
+    pub fn set_psk_file(&mut self, entries: &[(Option<[u8; 6]>, String)]) {
+        let ssid = String::from_utf8_lossy(&self.ssid).to_string();
+        self.psk_candidates = entries
+            .iter()
+            .map(|(m, pass)| (*m, crypto::pbkdf2_pmk(pass, &ssid)))
+            .collect();
     }
 
     /// Whether per-station-VIF mode is enabled.
@@ -733,6 +751,12 @@ impl Ap {
                 entry.tk = [0; 16];
                 entry.gtk = random_bytes::<16>();
                 entry.pending_eapol = None; // no stale m1/m3 to retransmit
+                // Drop any psk_file PMK pinned by a previous 4-way so the
+                // candidate trial (per-MAC -> wildcard -> default) re-runs — a
+                // re-onboarded device may use a different password now. (SAE uses
+                // algorithm-3 auth and never reaches this open-auth reset; PMKSA
+                // fast-reconnect re-sets `pmk` from the cache at association.)
+                entry.pmk = None;
             }
         }
 
@@ -1082,48 +1106,79 @@ impl Ap {
         {
             return;
         }
-        let (pmk, sha256, owe) = self
+        let (sta_pmk, sha256, owe) = self
             .stations
             .get(&sta)
-            .map(|s| (s.pmk.unwrap_or(self.pmk), s.sha256, s.owe))
-            .unwrap_or((self.pmk, false, false));
+            .map(|s| (s.pmk, s.sha256, s.owe))
+            .unwrap_or((None, false, false));
+
+        // hostapd `wpa_psk_file` order: a PMK already fixed for this station
+        // (SAE / OWE / PMKSA) is used outright; otherwise try the PSK-file entries
+        // whose MAC matches this station, then the wildcard onboarding entries,
+        // then the single default passphrase. The candidate whose PTK verifies
+        // message 2's MIC is this station's password.
+        let candidates: Vec<[u8; 32]> = if let Some(p) = sta_pmk {
+            vec![p]
+        } else {
+            let mut v: Vec<[u8; 32]> = Vec::new();
+            v.extend(self.psk_candidates.iter().filter(|(m, _)| *m == Some(sta)).map(|(_, p)| *p));
+            v.extend(self.psk_candidates.iter().filter(|(m, _)| m.is_none()).map(|(_, p)| *p));
+            v.push(self.pmk);
+            v
+        };
+
+        let mic_off_in_eapol = 4 + ek.mic_offset; // EAPOL header (4) + body offset
         let mut kck = [0u8; 16];
         let mut kek = [0u8; 16];
         let mut tk = [0u8; 16];
-        if sha256 {
-            let ptk = crypto::derive_ptk_sha256(&pmk, &amac, &smac, &anonce, &snonce);
-            kck.copy_from_slice(&ptk[..16]);
-            kek.copy_from_slice(&ptk[16..32]);
-            tk.copy_from_slice(&ptk[32..48]);
-        } else {
-            let ptk = crypto::custom_prf512(&pmk, &amac, &smac, &anonce, &snonce);
-            kck.copy_from_slice(&ptk[..16]);
-            kek.copy_from_slice(&ptk[16..32]);
-            tk.copy_from_slice(&ptk[32..48]);
+        let mut matched_pmk: Option<[u8; 32]> = None;
+        for pmk in &candidates {
+            if sha256 {
+                let ptk = crypto::derive_ptk_sha256(pmk, &amac, &smac, &anonce, &snonce);
+                kck.copy_from_slice(&ptk[..16]);
+                kek.copy_from_slice(&ptk[16..32]);
+                tk.copy_from_slice(&ptk[32..48]);
+            } else {
+                let ptk = crypto::custom_prf512(pmk, &amac, &smac, &anonce, &snonce);
+                kck.copy_from_slice(&ptk[..16]);
+                kek.copy_from_slice(&ptk[16..32]);
+                tk.copy_from_slice(&ptk[32..48]);
+            }
+            // Recompute the MIC over the EAPOL frame with the MIC field zeroed
+            // (AES-CMAC for SAE, HMAC-SHA256 for OWE, HMAC-SHA1 for WPA2).
+            let mut to_check = eapol_frame.to_vec();
+            for b in to_check[mic_off_in_eapol..mic_off_in_eapol + 16].iter_mut() {
+                *b = 0;
+            }
+            let computed = dot11::KeyMic::select(sha256, owe).compute(&kck, &to_check);
+            if crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
+                matched_pmk = Some(*pmk);
+                break;
+            }
         }
-
-        // Verify the MIC on message 2: recompute over the EAPOL frame with the
-        // MIC field zeroed (AES-CMAC for SAE, HMAC-SHA256 for OWE, HMAC-SHA1 for WPA2).
-        let mic_off_in_eapol = 4 + ek.mic_offset; // EAPOL header (4) + body offset
-        let mut to_check = eapol_frame.to_vec();
-        for b in to_check[mic_off_in_eapol..mic_off_in_eapol + 16].iter_mut() {
-            *b = 0;
-        }
-        let computed = dot11::KeyMic::select(sha256, owe).compute(&kck, &to_check).to_vec();
-        if !crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
-            // bad MIC -> wrong PSK: log the (fingerprinted) attempt, deauth, drop.
-            self.record_failure(&sta, crate::failures::FailureKind::FourWayMic);
-            let deauth = dot11::build_deauth(&self.mac, &sta, 1);
-            out.tx(deauth);
-            self.disconnect(&sta, 1);
-            return;
+        let matched_pmk = match matched_pmk {
+            None => {
+                // no candidate verified -> wrong password: log, deauth, drop.
+                self.record_failure(&sta, crate::failures::FailureKind::FourWayMic);
+                let deauth = dot11::build_deauth(&self.mac, &sta, 1);
+                out.tx(deauth);
+                self.disconnect(&sta, 1);
+                return;
+            }
+            Some(p) => p,
+        };
+        // Pin the matched password to this station so m3 retransmits and GTK
+        // rekeys reuse the same PMK.
+        if let Some(s) = self.stations.get_mut(&sta) {
+            s.pmk = Some(matched_pmk);
         }
 
         // Operating Channel Validation: message 2's OCI must match our channel.
         if self.ocv {
-            let want = (dot11::operating_class(self.channel), self.channel);
             match dot11::parse_oci_kde(&ek.key_data) {
-                Some(oci) if oci == want => {}
+                Some((oc, ch))
+                    if ch == self.channel
+                        && dot11::oci_class_matches_band(oc, self.channel, self.band6) => {}
                 _ => return, // missing or mismatched OCI -> possible MITM, drop
             }
         }
@@ -1152,7 +1207,7 @@ impl Ap {
             None
         };
         let oci = if self.ocv {
-            Some((dot11::operating_class(self.channel), self.channel))
+            Some((dot11::operating_class(self.channel, self.channel_width, self.band6), self.channel))
         } else {
             None
         };
@@ -1445,6 +1500,17 @@ impl Ap {
     pub fn test_expire_group_rekey(&mut self) {
         let ago = Duration::from_secs(self.group_rekey_secs.saturating_add(1));
         self.last_group_rekey = Instant::now().checked_sub(ago).unwrap_or(self.last_group_rekey);
+    }
+
+    /// Test hook: clear the per-station auth/assoc backoff so an immediate
+    /// re-authentication is treated as a genuine new session (not a retransmit),
+    /// as a real reconnect seconds/minutes later would be.
+    #[doc(hidden)]
+    pub fn test_clear_auth_backoff(&mut self) {
+        for s in self.stations.values_mut() {
+            s.last_auth = None;
+            s.last_assoc = None;
+        }
     }
 
     /// Test hook: age every pending EAPOL frame past the retransmit timeout so a

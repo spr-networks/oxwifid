@@ -43,6 +43,10 @@ fn main() {
     let mut mode = "stdio".to_string();
     let mut iface = "wlan0".to_string();
     let mut channel: u8 = 1;
+    let mut mld_mac: Option<[u8; 6]> = None;
+    let mut link1_mac: Option<[u8; 6]> = None;
+    let mut ap_mld_mac: Option<[u8; 6]> = None;
+    let mut pause_m3 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -68,6 +72,10 @@ fn main() {
             "--mode" => mode = next(i),
             "--iface" => iface = next(i),
             "--channel" => channel = next(i).parse().unwrap_or(1),
+            "--mld-mac" => mld_mac = Some(mac_to_bytes(&next(i))),
+            "--link1-mac" => link1_mac = Some(mac_to_bytes(&next(i))),
+            "--ap-mld-mac" => ap_mld_mac = Some(mac_to_bytes(&next(i))),
+            "--pause-m3" => pause_m3 = true,
             _ => {}
         }
         i += 1;
@@ -94,6 +102,15 @@ fn main() {
     }
     client.set_wmm(wmm);
     client.set_wmm_tid(wmm_tid);
+    if let (Some(m), Some(l1), Some(am)) = (mld_mac, link1_mac, ap_mld_mac) {
+        client.enable_mld(m, l1, am);
+        eprintln!("MLD enabled: mld={} link1={} ap_mld={} pause_m3={pause_m3}",
+                  barely_ap::util::bytes_to_mac(&m), barely_ap::util::bytes_to_mac(&l1),
+                  barely_ap::util::bytes_to_mac(&am));
+    }
+    if pause_m3 {
+        client.set_pause_m3();
+    }
     let ping_cfg = if ping { Some((gw_mac, src_ip, gw_ip)) } else { None };
     let mut node = ClientNode::new(client, Duration::from_millis(20), ping_cfg);
     node.ping_tos = dscp;

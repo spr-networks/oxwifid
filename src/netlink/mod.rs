@@ -54,8 +54,10 @@ pub const NL80211_ATTR_KEY_CIPHER: u16 = 9;
 pub const NL80211_ATTR_KEY_SEQ: u16 = 10;
 pub const NL80211_ATTR_KEY_DEFAULT: u16 = 11;
 /// Make this key the default management key (the IGTK used to TX/validate
-/// BIP-protected robust management frames).
-pub const NL80211_ATTR_KEY_DEFAULT_MGMT: u16 = 28;
+/// BIP-protected robust management frames). Kernel value is 40 (28 is a
+/// different attribute, which the kernel rejected on policy validation, so the
+/// IGTK install silently failed and kernel-side BIP was never enforced).
+pub const NL80211_ATTR_KEY_DEFAULT_MGMT: u16 = 40;
 /// Nested attribute selecting which traffic a default key applies to
 /// (unicast/multicast), so a group key becomes the multicast default.
 pub const NL80211_ATTR_KEY_DEFAULT_TYPES: u16 = 88;

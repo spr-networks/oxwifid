@@ -415,6 +415,49 @@ fn ccmp_roundtrip_rust_only() {
     assert_eq!(&eth[14..], &inner[..]);
 }
 
+#[test]
+fn ccmp_mld_uses_mld_addresses_for_security() {
+    // 802.11be MLO: the MAC header carries the *link* addresses (so the frame
+    // traverses the link) but the CCMP nonce/AAD — and thus the AP's STA lookup
+    // — use the *MLD* addresses, consistent with the PTK derivation. This is the
+    // exact bug behind hostapd dropping uplink data as "not associated STA
+    // <link-addr>": the link-addressed CCMP context can't be mapped to the MLD STA.
+    let tk = from_hex(vectors()["crypto"]["tk"].as_str().unwrap());
+    let sta_link = mac6("02:00:00:00:04:00"); // STA link-0 address
+    let sta_mld = mac6("02:00:00:00:04:aa"); // STA MLD address
+    let ap_link = mac6("02:00:00:58:6c:d4"); // AP link-0 BSSID
+    let ap_mld = mac6("02:00:00:11:22:33"); // AP MLD address
+    let inner = b"mld-uplink-ccmp-payload";
+
+    // Uplink (to-DS) frame: header = link addresses, CCMP security = MLD addresses.
+    let frame_bytes = dot11::build_ccmp_data_sec(
+        &ap_link, &sta_link, &ap_link, // A1/A2/A3 (MAC header, link addrs)
+        &ap_mld, &sta_mld, &ap_mld,    // security A1/A2/A3 (MLD addrs)
+        dot11::FC_TODS | dot11::FC_PROTECTED,
+        0x10, 0x42, 0, &tk, 0x0800, inner, None,
+    );
+    let frame = dot11::Dot11::parse(&frame_bytes).unwrap();
+
+    // The over-the-air header keeps the link addresses.
+    assert_eq!(&frame.addr1, &ap_link, "header A1 (RA) must be the AP link BSSID");
+    assert_eq!(&frame.addr2, &sta_link, "header A2 (TA) must be the STA link address");
+
+    // Decrypting with the link addresses (the old, buggy single-link behaviour)
+    // MUST fail — this mirrors hostapd's MLD data path rejecting the frame.
+    assert!(
+        dot11::decrypt_ccmp(&frame, &tk, false).is_none(),
+        "link-addressed CCMP context must NOT verify (this was the bug)"
+    );
+
+    // Decrypting with the MLD security addresses succeeds, as the real AP does.
+    let sec = Some((ap_mld, sta_mld, ap_mld));
+    let eth = dot11::decrypt_ccmp_sec(&frame, &tk, false, sec)
+        .expect("MLD-addressed CCMP context must verify");
+    // Decapsulated Ethernet: dst=addr3, src=addr2 (to-DS), then the payload.
+    assert_eq!(&eth[12..14], &[0x08, 0x00]);
+    assert_eq!(&eth[14..], &inner[..]);
+}
+
 // ---------------------------------------------------------------------------
 // Parser checks against incoming client frames
 // ---------------------------------------------------------------------------
