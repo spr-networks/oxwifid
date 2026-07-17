@@ -49,16 +49,28 @@ fn main() {
     let mut de = NanDe::new(mac);
     if let Some(ref name) = publish {
         let id = de.publish(name, ssi.as_deref().map(|s| s.as_bytes()));
-        eprintln!("barely-nan: publish {name:?} instance={id} mac={}", bytes_to_mac(&mac));
+        eprintln!(
+            "barely-nan: publish {name:?} instance={id} mac={}",
+            bytes_to_mac(&mac)
+        );
     }
     if let Some(ref name) = subscribe {
         let id = de.subscribe(name);
-        eprintln!("barely-nan: subscribe {name:?} instance={id} mac={}", bytes_to_mac(&mac));
+        eprintln!(
+            "barely-nan: subscribe {name:?} instance={id} mac={}",
+            bytes_to_mac(&mac)
+        );
     }
 
-    let lossy = |info: &Option<Vec<u8>>| info.as_deref().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+    let lossy = |info: &Option<Vec<u8>>| {
+        info.as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default()
+    };
 
-    let mut last_tx = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
+    let mut last_tx = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
     loop {
         if last_tx.elapsed() >= Duration::from_millis(400) {
             for f in de.periodic_frames() {
@@ -70,14 +82,33 @@ fn main() {
             let (events, responses) = de.process_frame(&frame);
             for e in &events {
                 match e {
-                    NanEvent::Discovered { peer, service_id, peer_instance, service_info } => {
-                        println!("NAN_DISCOVERED peer={} sid={} inst={} ssi={}", bytes_to_mac(peer), to_hex(service_id), peer_instance, lossy(service_info));
+                    NanEvent::Discovered {
+                        peer,
+                        service_id,
+                        peer_instance,
+                        service_info,
+                    } => {
+                        println!(
+                            "NAN_DISCOVERED peer={} sid={} inst={} ssi={}",
+                            bytes_to_mac(peer),
+                            to_hex(service_id),
+                            peer_instance,
+                            lossy(service_info)
+                        );
                     }
                     NanEvent::SubscribeReceived { peer, service_id } => {
-                        println!("NAN_SUBSCRIBE_RX peer={} sid={}", bytes_to_mac(peer), to_hex(service_id));
+                        println!(
+                            "NAN_SUBSCRIBE_RX peer={} sid={}",
+                            bytes_to_mac(peer),
+                            to_hex(service_id)
+                        );
                     }
                     NanEvent::FollowupReceived { peer, service_info } => {
-                        println!("NAN_FOLLOWUP_RX peer={} ssi={}", bytes_to_mac(peer), lossy(service_info));
+                        println!(
+                            "NAN_FOLLOWUP_RX peer={} ssi={}",
+                            bytes_to_mac(peer),
+                            lossy(service_info)
+                        );
                     }
                 }
             }

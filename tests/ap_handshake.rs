@@ -12,9 +12,18 @@ fn vectors() -> Value {
 
 fn fixtured_ap() -> Ap {
     let v = vectors();
-    let mut ap = Ap::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:00:00"), 1);
-    let gtk: [u8; 16] = from_hex(v["frames"]["eapol_m3"]["gtk"].as_str().unwrap()).try_into().unwrap();
-    let anonce: [u8; 32] = from_hex(v["crypto"]["anonce"].as_str().unwrap()).try_into().unwrap();
+    let mut ap = Ap::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:00:00"),
+        1,
+    );
+    let gtk: [u8; 16] = from_hex(v["frames"]["eapol_m3"]["gtk"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    let anonce: [u8; 32] = from_hex(v["crypto"]["anonce"].as_str().unwrap())
+        .try_into()
+        .unwrap();
     ap.set_test_fixtures(gtk, anonce);
     ap
 }
@@ -24,7 +33,9 @@ fn fixtured_ap() -> Ap {
 fn send_m4(ap: &mut Ap, v: &Value) {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     let sta = mac_to_bytes("02:00:00:00:ab:cd");
-    let kck: [u8; 16] = from_hex(v["crypto"]["kck"].as_str().unwrap()).try_into().unwrap();
+    let kck: [u8; 16] = from_hex(v["crypto"]["kck"].as_str().unwrap())
+        .try_into()
+        .unwrap();
     let m4 = dot11::build_eapol_m4(&ap_mac, &sta, &kck, 0, dot11::KeyMic::select(false, false));
     let mut framed = dot11::RADIOTAP_TX.to_vec();
     framed.extend_from_slice(&m4);
@@ -47,24 +58,45 @@ fn full_handshake_matches_reference() {
         to_hex(&out.frames[0]).starts_with(v["frames"]["assoc_resp"]["bytes"].as_str().unwrap()),
         "assoc response must match the reference (plus the BSS Max Idle element)"
     );
-    assert_eq!(to_hex(&out.frames[1]), v["frames"]["eapol_m1"]["bytes"].as_str().unwrap());
+    assert_eq!(
+        to_hex(&out.frames[1]),
+        v["frames"]["eapol_m1"]["bytes"].as_str().unwrap()
+    );
 
     // 2. EAPOL message 2 (valid) -> EAPOL message 3, station associated
     let m2 = from_hex(v["frames"]["eapol_m2_incoming"]["bytes"].as_str().unwrap());
     let out = ap.handle_incoming(&m2);
     assert_eq!(out.frames.len(), 1, "valid m2 must yield exactly m3");
-    assert_eq!(to_hex(&out.frames[0]), v["frames"]["eapol_m3"]["bytes"].as_str().unwrap());
-    assert!(!ap.is_associated(&sta), "station awaits m4, not yet associated after m3");
+    assert_eq!(
+        to_hex(&out.frames[0]),
+        v["frames"]["eapol_m3"]["bytes"].as_str().unwrap()
+    );
+    assert!(
+        !ap.is_associated(&sta),
+        "station awaits m4, not yet associated after m3"
+    );
 
     // 2b. EAPOL message 4 -> station fully associated (authorized only now).
     send_m4(&mut ap, &v);
-    assert!(ap.is_associated(&sta), "station must be associated after verified m4");
+    assert!(
+        ap.is_associated(&sta),
+        "station must be associated after verified m4"
+    );
 
     // 3. Encrypted uplink data decrypts to the expected Ethernet frame
     let uplink = from_hex(v["frames"]["data_uplink"]["bytes"].as_str().unwrap());
     let out = ap.handle_incoming(&uplink);
-    assert_eq!(out.to_network.len(), 1, "uplink must decrypt to one ethernet frame");
-    assert_eq!(to_hex(&out.to_network[0]), v["frames"]["data_uplink"]["decrypted_eth"].as_str().unwrap());
+    assert_eq!(
+        out.to_network.len(),
+        1,
+        "uplink must decrypt to one ethernet frame"
+    );
+    assert_eq!(
+        to_hex(&out.to_network[0]),
+        v["frames"]["data_uplink"]["decrypted_eth"]
+            .as_str()
+            .unwrap()
+    );
     assert!(out.frames.is_empty());
 }
 
@@ -80,7 +112,10 @@ fn connect_then_disconnect_events() {
     ap.handle_incoming(&assoc_req);
     let m2 = from_hex(v["frames"]["eapol_m2_incoming"]["bytes"].as_str().unwrap());
     ap.handle_incoming(&m2);
-    assert!(ap.drain_events().is_empty(), "no connect event before m4 verifies");
+    assert!(
+        ap.drain_events().is_empty(),
+        "no connect event before m4 verifies"
+    );
 
     // m4 authorizes the station -> AP-STA-CONNECTED.
     send_m4(&mut ap, &v);
@@ -90,7 +125,13 @@ fn connect_then_disconnect_events() {
     // Reaping the now-idle station -> AP-STA-DISCONNECTED (pairs with connect).
     std::thread::sleep(std::time::Duration::from_millis(2));
     ap.prune_idle(std::time::Duration::from_millis(1));
-    assert_eq!(ap.drain_events(), vec![ApEvent::Disconnected { mac: sta, reason: 4 }]);
+    assert_eq!(
+        ap.drain_events(),
+        vec![ApEvent::Disconnected {
+            mac: sta,
+            reason: 4
+        }]
+    );
 }
 
 #[test]
@@ -110,7 +151,15 @@ fn wrong_psk_emits_authfail_event() {
     assert_eq!(ev.len(), 1, "exactly one AuthFailed event");
     assert!(
         matches!(&ev[0], ApEvent::AuthFailed { mac, kind: FailureKind::FourWayMic, count } if *mac == sta && *count >= 1),
-        "got {:?}", ev[0]
+        "got {:?}",
+        ev[0]
+    );
+    assert!(
+        ev[0]
+            .to_line()
+            .starts_with("AP-STA-POSSIBLE-PSK-MISMATCH 02:00:00:00:ab:cd wpa mismatch"),
+        "SPR action event was {}",
+        ev[0].to_line()
     );
 }
 
@@ -162,7 +211,10 @@ fn bad_mic_in_message_2_triggers_deauth() {
     assert_eq!(out.frames.len(), 1, "bad MIC must produce a deauth");
     let frame = dot11::Dot11::parse(dot11::strip_radiotap(&out.frames[0]).unwrap()).unwrap();
     assert_eq!(frame.frame_type(), dot11::TYPE_MGMT);
-    assert!(!ap.is_associated(&sta), "station must be dropped after bad MIC");
+    assert!(
+        !ap.is_associated(&sta),
+        "station must be dropped after bad MIC"
+    );
     // the wrong-PSK attempt is recorded in the fingerprinted failure log
     let recs = ap.failures().records();
     assert_eq!(recs.len(), 1);
@@ -178,13 +230,19 @@ fn downlink_roundtrips_through_a_station() {
     let mut ap = fixtured_ap();
 
     // complete the handshake (m2 then m4)
-    ap.handle_incoming(&from_hex(v["incoming"]["assoc_req"]["bytes"].as_str().unwrap()));
-    ap.handle_incoming(&from_hex(v["frames"]["eapol_m2_incoming"]["bytes"].as_str().unwrap()));
+    ap.handle_incoming(&from_hex(
+        v["incoming"]["assoc_req"]["bytes"].as_str().unwrap(),
+    ));
+    ap.handle_incoming(&from_hex(
+        v["frames"]["eapol_m2_incoming"]["bytes"].as_str().unwrap(),
+    ));
     send_m4(&mut ap, &v);
     assert!(ap.is_associated(&sta));
 
     // an Ethernet frame from the AP's stack toward the station
-    let tk: [u8; 16] = from_hex(v["crypto"]["tk"].as_str().unwrap()).try_into().unwrap();
+    let tk: [u8; 16] = from_hex(v["crypto"]["tk"].as_str().unwrap())
+        .try_into()
+        .unwrap();
     let mut eth = Vec::new();
     eth.extend_from_slice(&sta); // dst
     eth.extend_from_slice(&ap_mac); // src
@@ -207,26 +265,56 @@ fn eapol_m1_retransmits_then_times_out() {
     let sta = mac_to_bytes("02:00:00:00:ab:cd");
     let mut ap = fixtured_ap();
     // association -> assoc-resp + m1 (cached for retransmit)
-    ap.handle_incoming(&from_hex(v["incoming"]["assoc_req"]["bytes"].as_str().unwrap()));
+    ap.handle_incoming(&from_hex(
+        v["incoming"]["assoc_req"]["bytes"].as_str().unwrap(),
+    ));
     // a tick before the timeout does nothing
     assert!(ap.tick().frames.is_empty(), "no retransmit before timeout");
-    // after the timeout, m1 is retransmitted up to MAX_EAPOL_RETRIES (4) times...
+    // hostapd's default update count is four total sends: initial + 3 retries.
     let mut retransmits = 0;
-    for _ in 0..4 {
+    for _ in 0..3 {
         ap.test_expire_eapol();
         if !ap.tick().frames.is_empty() {
             retransmits += 1;
         }
     }
-    assert_eq!(retransmits, 4, "m1 retransmitted 4 times");
+    assert_eq!(retransmits, 3, "m1 retransmitted 3 times");
     assert!(!ap.is_associated(&sta), "still not associated (no m2)");
     // ...then the 4-way times out: the station is deauthed and dropped.
     ap.test_expire_eapol();
     let out = ap.tick();
-    assert_eq!(out.frames.len(), 1, "final tick deauths the stalled station");
+    assert_eq!(
+        out.frames.len(),
+        1,
+        "final tick deauths the stalled station"
+    );
     let f = dot11::Dot11::parse(dot11::strip_radiotap(&out.frames[0]).unwrap()).unwrap();
     assert_eq!(f.subtype(), dot11::SUBTYPE_DEAUTH);
     // and a subsequent tick is quiet (station gone)
     ap.test_expire_eapol();
     assert!(ap.tick().frames.is_empty(), "nothing left to retransmit");
+}
+
+#[test]
+fn unacked_assoc_response_cancels_speculative_eapol() {
+    let v = vectors();
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = fixtured_ap();
+    let assoc_req = from_hex(v["incoming"]["assoc_req"]["bytes"].as_str().unwrap());
+    let parsed = dot11::Dot11::parse(dot11::strip_radiotap(&assoc_req).unwrap()).unwrap();
+    let listen_interval = u16::from_le_bytes([parsed.body[2], parsed.body[3]]);
+
+    let out = ap.handle_incoming(&assoc_req);
+    assert_eq!(
+        out.frames.len(),
+        2,
+        "m1 is prepared with the assoc response"
+    );
+    assert_eq!(ap.station_listen_interval(&sta), Some(listen_interval));
+
+    // Netlink removes the station when the successful response is not MAC-ACKed.
+    // The AP core must not then leak its speculatively prepared m1 on a timer.
+    ap.note_assoc_response_not_acked(&sta);
+    ap.test_expire_eapol();
+    assert!(ap.tick().frames.is_empty());
 }

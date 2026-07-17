@@ -71,22 +71,32 @@ fn client_ignores_unprotected_deauth_but_honors_protected_group() {
     // 1. Spoofed UNPROTECTED broadcast deauth -> ignored (still connected).
     let bcast = [0xffu8; 6];
     sta.handle_incoming(&with_radiotap(dot11::build_deauth(&bssid, &bcast, 7)));
-    assert_eq!(sta.connected, 4, "unprotected broadcast deauth must be ignored under PMF");
+    assert_eq!(
+        sta.connected, 4,
+        "unprotected broadcast deauth must be ignored under PMF"
+    );
 
     // 2. Spoofed UNPROTECTED unicast deauth -> ignored.
     sta.handle_incoming(&with_radiotap(dot11::build_deauth(&bssid, &sta_mac, 7)));
-    assert_eq!(sta.connected, 4, "unprotected unicast deauth must be ignored under PMF");
+    assert_eq!(
+        sta.connected, 4,
+        "unprotected unicast deauth must be ignored under PMF"
+    );
 
     // 3. A FORGED BIP frame (wrong IGTK) -> ignored.
     let forged_igtk = [0x55u8; 16];
-    let forged = dot11::build_group_deauth_bip(&bssid, &forged_igtk, 4, &[0, 0, 0, 0, 0, 9], 7, 0x10);
+    let forged =
+        dot11::build_group_deauth_bip(&bssid, &forged_igtk, 4, &[0, 0, 0, 0, 0, 9], 7, 0x10);
     sta.handle_incoming(&with_radiotap(forged));
     assert_eq!(sta.connected, 4, "BIP frame with wrong key must be ignored");
 
     // 4. A VALID BIP-protected group deauth (AP's real IGTK) -> disconnect.
     let real = ap.group_deauth(7);
     sta.handle_incoming(&real);
-    assert_eq!(sta.connected, 0, "valid BIP group deauth must disconnect the STA");
+    assert_eq!(
+        sta.connected, 0,
+        "valid BIP group deauth must disconnect the STA"
+    );
 }
 
 #[test]
@@ -104,7 +114,10 @@ fn ccmp_replay_is_rejected() {
 
     // replaying the *exact same* frame (same PN) must be dropped
     let out2 = ap.handle_incoming(&f1);
-    assert!(out2.to_network.is_empty(), "replayed CCMP frame must be dropped");
+    assert!(
+        out2.to_network.is_empty(),
+        "replayed CCMP frame must be dropped"
+    );
 
     // a fresh frame with a higher PN is accepted again
     let ping2 = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1], 0);
@@ -121,7 +134,10 @@ fn client_honors_protected_unicast_deauth() {
     // valid CCMP-protected unicast deauth from the AP -> disconnect
     let deauth = ap.protected_deauth(&sta_mac, 7).expect("protected deauth");
     sta.handle_incoming(&deauth);
-    assert_eq!(sta.connected, 0, "valid CCMP-protected unicast deauth must disconnect");
+    assert_eq!(
+        sta.connected, 0,
+        "valid CCMP-protected unicast deauth must disconnect"
+    );
 }
 
 #[test]
@@ -145,24 +161,41 @@ fn ap_sa_query_preserves_session_on_spoofed_assoc() {
         if parsed.is_eapol() {
             saw_eapol = true;
         }
-        if parsed.frame_type() == dot11::TYPE_MGMT && parsed.subtype() == dot11::SUBTYPE_ASSOC_RESP {
+        if parsed.frame_type() == dot11::TYPE_MGMT && parsed.subtype() == dot11::SUBTYPE_ASSOC_RESP
+        {
             // status code is at body offset 2..4 (after capability)
             let status = u16::from_le_bytes([parsed.body[2], parsed.body[3]]);
             if status == dot11::STATUS_ASSOC_REJECTED_TEMP {
                 saw_status30 = true;
             }
         }
-        if parsed.frame_type() == dot11::TYPE_MGMT && parsed.subtype() == dot11::SUBTYPE_ACTION && parsed.protected() {
+        if parsed.frame_type() == dot11::TYPE_MGMT
+            && parsed.subtype() == dot11::SUBTYPE_ACTION
+            && parsed.protected()
+        {
             saw_sa_query = true;
         }
     }
-    assert!(!saw_eapol, "AP must NOT restart the 4-way handshake on a spoofed assoc-req");
-    assert!(saw_status30, "AP must reject with status 30 (association comeback)");
+    assert!(
+        !saw_eapol,
+        "AP must NOT restart the 4-way handshake on a spoofed assoc-req"
+    );
+    assert!(
+        saw_status30,
+        "AP must reject with status 30 (association comeback)"
+    );
     assert!(saw_sa_query, "AP must emit a protected SA Query request");
 
     // ... and the existing session (keys + association) must be intact.
-    assert!(ap.is_associated(&sta_mac), "PMF session must survive a spoofed assoc-req");
-    assert_eq!(ap.station_tk(&sta_mac), Some(tk_before), "TK must be unchanged");
+    assert!(
+        ap.is_associated(&sta_mac),
+        "PMF session must survive a spoofed assoc-req"
+    );
+    assert_eq!(
+        ap.station_tk(&sta_mac),
+        Some(tk_before),
+        "TK must be unchanged"
+    );
 }
 
 #[test]
@@ -186,13 +219,29 @@ fn ap_drops_unprotected_deauth_but_honors_protected() {
         v
     });
     ap_step(&mut ap, &mut net, &spoof_sta);
-    assert!(ap.is_associated(&sta_mac), "AP must ignore unprotected deauth from a PMF STA");
+    assert!(
+        ap.is_associated(&sta_mac),
+        "AP must ignore unprotected deauth from a PMF STA"
+    );
 
     // A VALID CCMP-protected deauth from the STA (shared TK) -> tear down.
     let pn = 0x1234;
-    let protected = with_radiotap(dot11::build_ccmp_mgmt(dot11::SUBTYPE_DEAUTH, &bssid, &sta_mac, &bssid, 0x20, pn, 0, &tk, &3u16.to_le_bytes()));
+    let protected = with_radiotap(dot11::build_ccmp_mgmt(
+        dot11::SUBTYPE_DEAUTH,
+        &bssid,
+        &sta_mac,
+        &bssid,
+        0x20,
+        pn,
+        0,
+        &tk,
+        &3u16.to_le_bytes(),
+    ));
     ap_step(&mut ap, &mut net, &protected);
-    assert!(!ap.is_associated(&sta_mac), "valid CCMP-protected deauth must tear the station down");
+    assert!(
+        !ap.is_associated(&sta_mac),
+        "valid CCMP-protected deauth must tear the station down"
+    );
 }
 
 #[test]
@@ -206,10 +255,20 @@ fn wpa2_assoc_restarts_handshake_no_sa_query() {
 
     let auth = with_radiotap(dot11::build_auth_req(&ap_mac, &sta_mac, 0x10));
     ap_step(&mut ap, &mut net, &auth);
-    let assoc = with_radiotap(dot11::build_assoc_req(&ap_mac, &sta_mac, b"turtlenet", 0x20));
+    let assoc = with_radiotap(dot11::build_assoc_req(
+        &ap_mac,
+        &sta_mac,
+        b"turtlenet",
+        0x20,
+    ));
     let frames = ap_step(&mut ap, &mut net, &assoc);
     let saw_eapol = frames.iter().any(|f| {
-        dot11::Dot11::parse(dot11::strip_radiotap(f).unwrap()).map(|p| p.is_eapol()).unwrap_or(false)
+        dot11::Dot11::parse(dot11::strip_radiotap(f).unwrap())
+            .map(|p| p.is_eapol())
+            .unwrap_or(false)
     });
-    assert!(saw_eapol, "WPA2 assoc must produce EAPOL m1 (open handshake, no SA Query)");
+    assert!(
+        saw_eapol,
+        "WPA2 assoc must produce EAPOL m1 (open handshake, no SA Query)"
+    );
 }

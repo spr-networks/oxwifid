@@ -54,14 +54,19 @@ fn hunting_and_pecking_matches_ieee_j10() {
     // Deriving it independently and running the protocol must reproduce the
     // standard's local commit, KCK, PMK, and PMKID.
     let c = Curve::p256();
-    let pwe = sae::derive_pwe_hunting_pecking(&c, b"mekmitasdigoat", &ADDR1, &ADDR2).expect("H&P PWE");
+    let pwe =
+        sae::derive_pwe_hunting_pecking(&c, b"mekmitasdigoat", &ADDR1, &ADDR2).expect("H&P PWE");
     assert!(c.on_curve(&pwe));
 
     let rand = BigUint::from_bytes_be(&from_hex(LOCAL_RAND));
     let mask = BigUint::from_bytes_be(&from_hex(LOCAL_MASK));
     let mut sae = Sae::with_pwe(pwe);
     sae.prepare_commit(Some((rand, mask)));
-    assert_eq!(to_hex(&sae.write_commit()), LOCAL_COMMIT_FULL, "commit (H&P PWE)");
+    assert_eq!(
+        to_hex(&sae.write_commit()),
+        LOCAL_COMMIT_FULL,
+        "commit (H&P PWE)"
+    );
 
     sae.parse_peer_commit(&from_hex(PEER_COMMIT)).unwrap();
     sae.process_commit().unwrap();
@@ -87,7 +92,8 @@ fn sae_protocol_matches_ieee_j10() {
     // The reconstructed commit must equal the J.10 local commit byte-for-byte.
     assert_eq!(to_hex(&sae.write_commit()), to_hex(&local_commit), "commit");
 
-    sae.parse_peer_commit(&peer_commit).expect("peer commit parses");
+    sae.parse_peer_commit(&peer_commit)
+        .expect("peer commit parses");
     sae.process_commit().expect("process commit");
 
     assert_eq!(to_hex(&sae.kck), KCK, "KCK");
@@ -128,8 +134,10 @@ fn full_h2e_exchange_between_two_peers_agrees() {
 
     let ap_confirm = ap.write_confirm();
     let sta_confirm = sta.write_confirm();
-    ap.check_confirm(&sta_confirm).expect("AP verifies STA confirm");
-    sta.check_confirm(&ap_confirm).expect("STA verifies AP confirm");
+    ap.check_confirm(&sta_confirm)
+        .expect("AP verifies STA confirm");
+    sta.check_confirm(&ap_confirm)
+        .expect("STA verifies AP confirm");
 }
 
 #[test]
@@ -139,7 +147,8 @@ fn owe_two_parties_derive_the_same_pmk() {
     let (sta_priv, sta_pub) = sae::owe_keypair();
     let (ap_priv, ap_pub) = sae::owe_keypair();
     let group = 19;
-    let (sta_pmk, sta_pmkid) = sae::owe_derive(&sta_priv, &ap_pub, &sta_pub, &ap_pub, group).unwrap();
+    let (sta_pmk, sta_pmkid) =
+        sae::owe_derive(&sta_priv, &ap_pub, &sta_pub, &ap_pub, group).unwrap();
     let (ap_pmk, ap_pmkid) = sae::owe_derive(&ap_priv, &sta_pub, &sta_pub, &ap_pub, group).unwrap();
     assert_eq!(to_hex(&sta_pmk), to_hex(&ap_pmk), "OWE PMK agreement");
     assert_eq!(to_hex(&sta_pmkid), to_hex(&ap_pmkid), "OWE PMKID agreement");

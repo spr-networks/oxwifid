@@ -40,7 +40,8 @@ impl IfaceLink {
                 return Err(io::Error::last_os_error());
             }
 
-            let ifindex = libc::if_nametoindex(format!("{iface}\0").as_ptr() as *const libc::c_char);
+            let ifindex =
+                libc::if_nametoindex(format!("{iface}\0").as_ptr() as *const libc::c_char);
             if ifindex == 0 {
                 libc::close(fd);
                 return Err(io::Error::last_os_error());

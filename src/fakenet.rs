@@ -142,7 +142,13 @@ impl FakeNet {
         }
     }
 
-    fn handle_udp(&mut self, src_mac: &[u8; 6], src_ip: &[u8; 4], dst_ip: &[u8; 4], udp: &[u8]) -> Vec<Vec<u8>> {
+    fn handle_udp(
+        &mut self,
+        src_mac: &[u8; 6],
+        src_ip: &[u8; 4],
+        dst_ip: &[u8; 4],
+        udp: &[u8],
+    ) -> Vec<Vec<u8>> {
         if udp.len() < 8 {
             return vec![];
         }
@@ -153,7 +159,11 @@ impl FakeNet {
             return self.handle_dhcp(src_mac, body);
         }
         // otherwise reject
-        self.icmp_unreachable(src_mac, src_ip, &self.rebuild_ip(src_ip, dst_ip, IP_PROTO_UDP, udp))
+        self.icmp_unreachable(
+            src_mac,
+            src_ip,
+            &self.rebuild_ip(src_ip, dst_ip, IP_PROTO_UDP, udp),
+        )
     }
 
     fn handle_dhcp(&mut self, src_mac: &[u8; 6], bootp: &[u8]) -> Vec<Vec<u8>> {
@@ -190,7 +200,7 @@ impl FakeNet {
         b[16..20].copy_from_slice(&yiaddr);
         b[20..24].copy_from_slice(&server);
         b[28..34].copy_from_slice(src_mac); // chaddr
-        // magic cookie
+                                            // magic cookie
         b[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
 
         // options
@@ -214,7 +224,13 @@ impl FakeNet {
         vec![self.ethernet(src_mac, &self.mac.clone(), ETHERTYPE_IPV4, &ip)]
     }
 
-    fn handle_icmp(&mut self, src_mac: &[u8; 6], src_ip: &[u8; 4], dst_ip: &[u8; 4], icmp: &[u8]) -> Vec<Vec<u8>> {
+    fn handle_icmp(
+        &mut self,
+        src_mac: &[u8; 6],
+        src_ip: &[u8; 4],
+        dst_ip: &[u8; 4],
+        icmp: &[u8],
+    ) -> Vec<Vec<u8>> {
         if icmp.len() < 8 {
             return vec![];
         }
@@ -224,7 +240,11 @@ impl FakeNet {
         }
         // Only answer for IPs we own / have leased.
         let Some(reply_src_mac) = self.mac_for_ip(dst_ip) else {
-            return self.icmp_unreachable(src_mac, src_ip, &self.rebuild_ip(src_ip, dst_ip, IP_PROTO_ICMP, icmp));
+            return self.icmp_unreachable(
+                src_mac,
+                src_ip,
+                &self.rebuild_ip(src_ip, dst_ip, IP_PROTO_ICMP, icmp),
+            );
         };
         let reply_src_ip = *dst_ip;
 
@@ -241,7 +261,12 @@ impl FakeNet {
         vec![self.ethernet(src_mac, &reply_src_mac, ETHERTYPE_IPV4, &ip)]
     }
 
-    fn icmp_unreachable(&self, src_mac: &[u8; 6], src_ip: &[u8; 4], orig_ip_packet: &[u8]) -> Vec<Vec<u8>> {
+    fn icmp_unreachable(
+        &self,
+        src_mac: &[u8; 6],
+        src_ip: &[u8; 4],
+        orig_ip_packet: &[u8],
+    ) -> Vec<Vec<u8>> {
         // ICMP type 3 code 1 (host unreachable), echoing up to 28 bytes of the
         // offending IP header+payload.
         let mut reply = Vec::new();

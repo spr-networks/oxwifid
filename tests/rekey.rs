@@ -63,19 +63,31 @@ fn gtk_rekey_installs_new_key_on_station() {
     let (mut ap, _net, mut sta) = wpa3_up();
 
     let old_gtk = ap.gtk();
-    assert_eq!(sta.gtk(), old_gtk, "STA has the original GTK after the handshake");
+    assert_eq!(
+        sta.gtk(),
+        old_gtk,
+        "STA has the original GTK after the handshake"
+    );
     let old_igtk = sta.igtk().unwrap();
 
     // AP rotates the GTK and runs the Group Key Handshake.
     let msgs = ap.rekey_gtk();
-    assert_eq!(msgs.len(), 1, "one Group Key message 1 per associated station");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "one Group Key message 1 per associated station"
+    );
     let new_gtk = ap.gtk();
     assert_ne!(new_gtk, old_gtk, "AP rotated the GTK");
 
     // The STA processes message 1, installs the new GTK/IGTK, and replies.
     let out = sta.handle_incoming(&msgs[0]);
     assert_eq!(sta.gtk(), new_gtk, "STA installed the rotated GTK");
-    assert_ne!(sta.igtk().unwrap(), old_igtk, "STA installed the rotated IGTK");
+    assert_ne!(
+        sta.igtk().unwrap(),
+        old_igtk,
+        "STA installed the rotated IGTK"
+    );
     assert_eq!(out.frames.len(), 1, "STA sends Group Key message 2");
     assert_eq!(sta.connected, 4, "STA stays associated across a rekey");
 }
@@ -90,7 +102,11 @@ fn group_rekey_msg1_with_bad_mic_is_ignored() {
     let n = m.len();
     m[n - 40] ^= 0xff;
     sta.handle_incoming(m);
-    assert_eq!(sta.gtk(), old_gtk, "a tampered Group Key message must not install a GTK");
+    assert_eq!(
+        sta.gtk(),
+        old_gtk,
+        "a tampered Group Key message must not install a GTK"
+    );
 }
 
 #[test]
@@ -101,13 +117,20 @@ fn ap_processes_group_msg2_and_coalesces_rekeys() {
     assert_eq!(msgs.len(), 1);
     // A second rekey while the first is still in flight is coalesced to nothing
     // (hostapd waits for GKeyDoneStations to reach 0 before starting another).
-    assert!(ap.rekey_gtk().is_empty(), "rekey coalesces while one is in flight");
+    assert!(
+        ap.rekey_gtk().is_empty(),
+        "rekey coalesces while one is in flight"
+    );
     // The station ACKs (msg 2); feed it back to the AP, which clears its state.
     let reply = sta.handle_incoming(&msgs[0]);
     assert_eq!(reply.frames.len(), 1, "station emits Group Key msg 2");
     ap.handle_incoming(&reply.frames[0]);
     // With every station's msg 2 in, a fresh rekey is permitted again.
-    assert_eq!(ap.rekey_gtk().len(), 1, "rekey allowed again once all msg 2s are in");
+    assert_eq!(
+        ap.rekey_gtk().len(),
+        1,
+        "rekey allowed again once all msg 2s are in"
+    );
 }
 
 #[test]
@@ -115,17 +138,28 @@ fn periodic_group_rekey_fires_on_tick() {
     let (mut ap, _net, mut sta) = wpa3_up();
     // Well inside a long interval, tick must not rekey.
     ap.set_group_rekey(3600);
-    assert!(ap.tick().frames.is_empty(), "no rekey well before the interval");
+    assert!(
+        ap.tick().frames.is_empty(),
+        "no rekey well before the interval"
+    );
     // Age the clock past a short interval and the next tick performs the rekey.
     ap.set_group_rekey(1);
     let old = ap.gtk();
     ap.test_expire_group_rekey();
     let out = ap.tick();
-    assert_ne!(ap.gtk(), old, "periodic wpa_group_rekey rotated the GTK on tick");
+    assert_ne!(
+        ap.gtk(),
+        old,
+        "periodic wpa_group_rekey rotated the GTK on tick"
+    );
     for f in &out.frames {
         sta.handle_incoming(f);
     }
-    assert_eq!(sta.gtk(), ap.gtk(), "station installed the periodically-rotated GTK");
+    assert_eq!(
+        sta.gtk(),
+        ap.gtk(),
+        "station installed the periodically-rotated GTK"
+    );
 }
 
 #[test]
@@ -135,7 +169,11 @@ fn disabling_periodic_rekey_stops_it() {
     let old = ap.gtk();
     ap.test_expire_group_rekey();
     ap.tick();
-    assert_eq!(ap.gtk(), old, "wpa_group_rekey=0 disables periodic group rekeying");
+    assert_eq!(
+        ap.gtk(),
+        old,
+        "wpa_group_rekey=0 disables periodic group rekeying"
+    );
 }
 
 #[test]
@@ -151,11 +189,19 @@ fn strict_rekey_on_authorized_leave() {
     // departed A can no longer read group traffic.
     ap.kick(&mac_to_bytes("02:00:00:00:00:01"));
     let out = ap.tick();
-    assert_ne!(ap.gtk(), old, "strict rekey rotated the GTK after an authorized STA left");
+    assert_ne!(
+        ap.gtk(),
+        old,
+        "strict rekey rotated the GTK after an authorized STA left"
+    );
     for f in &out.frames {
         b.handle_incoming(f);
     }
-    assert_eq!(b.gtk(), ap.gtk(), "the remaining station installed the rotated GTK");
+    assert_eq!(
+        b.gtk(),
+        ap.gtk(),
+        "the remaining station installed the rotated GTK"
+    );
 }
 
 #[test]
@@ -165,7 +211,11 @@ fn no_strict_rekey_when_last_station_leaves() {
     // The only station leaves — no one remains to protect, so no rekey.
     ap.kick(&mac_to_bytes("02:00:00:00:ab:cd"));
     ap.tick();
-    assert_eq!(ap.gtk(), old, "no strict rekey when the last station leaves");
+    assert_eq!(
+        ap.gtk(),
+        old,
+        "no strict rekey when the last station leaves"
+    );
 }
 
 /// Per-STA-VIF: a group rekey must rotate EACH station's OWN per-station GTK
@@ -189,7 +239,10 @@ fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
     // index (the advertised key id, 1 initially).
     let a_gtk0 = ap.station_gtk(&a_mac);
     let b_gtk0 = ap.station_gtk(&b_mac);
-    assert_ne!(a_gtk0, b_gtk0, "per-STA-VIF: stations have distinct GTK values");
+    assert_ne!(
+        a_gtk0, b_gtk0,
+        "per-STA-VIF: stations have distinct GTK values"
+    );
     assert_eq!(a.gtk(), a_gtk0, "station A installed its own GTK");
     assert_eq!(b.gtk(), b_gtk0, "station B installed its own GTK");
     assert_eq!(ap.station_gtk_key_id(&a_mac), 1);
@@ -208,12 +261,23 @@ fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
     let b_gtk1 = ap.station_gtk(&b_mac);
     assert_ne!(a_gtk1, a_gtk0, "A's per-station GTK value rotated");
     assert_ne!(b_gtk1, b_gtk0, "B's per-station GTK value rotated");
-    assert_ne!(a_gtk1, b_gtk1, "isolation preserved: rotated values still differ");
+    assert_ne!(
+        a_gtk1, b_gtk1,
+        "isolation preserved: rotated values still differ"
+    );
     // The per-station GTK index is a fixed constant (1): it does NOT toggle on
     // rekey — only each station's own value rotates (above). The isolation is the
     // distinct values, never a per-station or a moving index.
-    assert_eq!(ap.station_gtk_key_id(&a_mac), 1, "index stays at constant 1 after rekey");
-    assert_eq!(ap.station_gtk_key_id(&b_mac), 1, "index stays at constant 1 after rekey");
+    assert_eq!(
+        ap.station_gtk_key_id(&a_mac),
+        1,
+        "index stays at constant 1 after rekey"
+    );
+    assert_eq!(
+        ap.station_gtk_key_id(&b_mac),
+        1,
+        "index stays at constant 1 after rekey"
+    );
     assert_eq!(
         ap.station_gtk_key_id(&a_mac),
         ap.station_gtk_key_id(&b_mac),
@@ -227,5 +291,9 @@ fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
     }
     assert_eq!(a.gtk(), a_gtk1, "A installed its own rotated GTK");
     assert_eq!(b.gtk(), b_gtk1, "B installed its own rotated GTK");
-    assert_ne!(a.gtk(), b.gtk(), "post-rekey, the two stations still hold different GTKs");
+    assert_ne!(
+        a.gtk(),
+        b.gtk(),
+        "post-rekey, the two stations still hold different GTKs"
+    );
 }

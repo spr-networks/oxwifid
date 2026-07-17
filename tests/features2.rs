@@ -80,7 +80,10 @@ fn owe_handshake_and_ping() {
     sta.enable_owe();
 
     drive(&mut ap, &mut net, &mut sta, 50);
-    assert_eq!(sta.connected, 4, "OWE handshake (open + DH + 4-way) must complete");
+    assert_eq!(
+        sta.connected, 4,
+        "OWE handshake (open + DH + 4-way) must complete"
+    );
     assert!(ap.is_associated(&sta_mac));
 
     // Data round-trips over the OWE-keyed CCMP link.
@@ -107,11 +110,18 @@ fn ocv_handshake_completes_when_both_enabled() {
     let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
     ap.enable_ocv();
     let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
-    let mut sta = Client::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:ab:cd"));
+    let mut sta = Client::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:ab:cd"),
+    );
     sta.enable_sae();
     sta.enable_ocv();
     drive(&mut ap, &mut net, &mut sta, 50);
-    assert_eq!(sta.connected, 4, "OCV handshake (matching channel) must complete");
+    assert_eq!(
+        sta.connected, 4,
+        "OCV handshake (matching channel) must complete"
+    );
 }
 
 #[test]
@@ -120,10 +130,17 @@ fn ocv_ap_rejects_client_without_oci() {
     let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
     ap.enable_ocv();
     let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
-    let mut sta = Client::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:ab:cd"));
+    let mut sta = Client::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:ab:cd"),
+    );
     sta.enable_sae(); // OCV NOT enabled -> message 2 omits the OCI
     drive(&mut ap, &mut net, &mut sta, 30);
-    assert!(sta.connected < 4, "OCV-required AP must reject a client that omits the OCI");
+    assert!(
+        sta.connected < 4,
+        "OCV-required AP must reject a client that omits the OCI"
+    );
     assert!(!ap.is_associated(&mac_to_bytes("02:00:00:00:ab:cd")));
 }
 
@@ -142,7 +159,10 @@ fn btm_disassoc_imminent_disconnects_station() {
     assert_eq!(body[1], dot11::WNM_BTM_REQUEST);
 
     sta.handle_incoming(&btm);
-    assert_eq!(sta.connected, 0, "disassoc-imminent BTM must disconnect the STA");
+    assert_eq!(
+        sta.connected, 0,
+        "disassoc-imminent BTM must disconnect the STA"
+    );
 }
 
 #[test]
@@ -157,13 +177,24 @@ fn neighbor_report_is_protected_and_lists_the_ap() {
     assert_eq!(body[0], dot11::ACTION_CATEGORY_RADIO_MEAS);
     assert_eq!(body[1], dot11::RADIO_MEAS_NEIGHBOR_REPORT_RESP);
     // a Neighbor Report element (id 52) carrying the AP's BSSID
-    assert!(dot11::find_ie(&body[3..], 52).is_some(), "must contain a Neighbor Report element");
-    assert_eq!(&dot11::find_ie(&body[3..], 52).unwrap()[..6], &mac_to_bytes("02:00:00:00:00:00"));
+    assert!(
+        dot11::find_ie(&body[3..], 52).is_some(),
+        "must contain a Neighbor Report element"
+    );
+    assert_eq!(
+        &dot11::find_ie(&body[3..], 52).unwrap()[..6],
+        &mac_to_bytes("02:00:00:00:00:00")
+    );
 }
 
 #[test]
 fn channel_switch_announcement_and_apply() {
-    let mut ap = Ap::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:00:00"), 1);
+    let mut ap = Ap::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:00:00"),
+        1,
+    );
     assert_eq!(ap.channel, 1);
     ap.announce_channel_switch(6, 2);
 
@@ -184,17 +215,30 @@ fn channel_switch_announcement_and_apply() {
 
 #[test]
 fn multiple_bssid_element_advertised() {
-    let mut ap = Ap::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:00:00"), 1);
+    let mut ap = Ap::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:00:00"),
+        1,
+    );
     let b0 = parse(&ap.beacon_frame());
     assert!(dot11::find_ie(&b0.body[12..], 71).is_none());
     ap.enable_multi_bssid();
     let b1 = parse(&ap.beacon_frame());
-    assert!(dot11::find_ie(&b1.body[12..], 71).is_some(), "Multiple BSSID element must be advertised when enabled");
+    assert!(
+        dot11::find_ie(&b1.body[12..], 71).is_some(),
+        "Multiple BSSID element must be advertised when enabled"
+    );
 }
 
 #[test]
 fn pmksa_cache_is_bounded() {
-    let mut ap = Ap::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:00:00"), 1);
+    let mut ap = Ap::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:00:00"),
+        1,
+    );
     // Insert far more distinct PMKSA entries than the cap. The cache must stay
     // bounded (evicting to within PMKSA_CACHE_MAX = 256) rather than growing
     // without bound over a long uptime with many distinct clients.
@@ -203,5 +247,9 @@ fn pmksa_cache_is_bounded() {
         id[..4].copy_from_slice(&i.to_be_bytes());
         ap.test_cache_pmksa(id);
     }
-    assert!(ap.pmksa_len() <= 256, "PMKSA cache must stay bounded, got {}", ap.pmksa_len());
+    assert!(
+        ap.pmksa_len() <= 256,
+        "PMKSA cache must stay bounded, got {}",
+        ap.pmksa_len()
+    );
 }

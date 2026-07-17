@@ -2,9 +2,11 @@
 //! state machines against each other through the full SAE exchange, the 4-way
 //! handshake (using the SAE PMK), and a CCMP ping.
 
-use barely_ap::ap::Ap;
+use barely_ap::ap::{Ap, MldLink};
 use barely_ap::client::Client;
+use barely_ap::dot11;
 use barely_ap::fakenet::FakeNet;
+use barely_ap::sae::Sae;
 use barely_ap::util::mac_to_bytes;
 
 /// Run the AP side for one inbound frame, including the fake-network round-trip.
@@ -55,8 +57,14 @@ fn wpa3_sae_h2e_full_handshake_and_ping() {
         to_client.extend(next_to_client);
     }
 
-    assert!(sta.connected >= 4, "STA must reach full authentication via SAE (rounds={rounds})");
-    assert!(ap.is_associated(&sta_mac), "AP must consider the SAE station associated");
+    assert!(
+        sta.connected >= 4,
+        "STA must reach full authentication via SAE (rounds={rounds})"
+    );
+    assert!(
+        ap.is_associated(&sta_mac),
+        "AP must consider the SAE station associated"
+    );
 
     // Now exchange a ping over the SAE-keyed CCMP link.
     let ping = sta.build_ping(&ap_mac, [10, 10, 10, 2], [10, 10, 10, 1], 0);
@@ -77,7 +85,10 @@ fn wpa3_sae_h2e_full_handshake_and_ping() {
             }
         }
     }
-    assert!(got_reply, "STA should decrypt the ICMP echo reply over the SAE-keyed link");
+    assert!(
+        got_reply,
+        "STA should decrypt the ICMP echo reply over the SAE-keyed link"
+    );
 }
 
 fn run_sae(mut sta: Client) -> (Ap, FakeNet, Client) {
@@ -105,37 +116,342 @@ fn run_sae(mut sta: Client) -> (Ap, FakeNet, Client) {
     (ap, net, sta)
 }
 
+fn mld_ap_for_tests() -> Ap {
+    let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
+    let ap_link1 = mac_to_bytes("02:00:00:00:10:02");
+    let ap_mld = mac_to_bytes("02:00:00:00:10:00");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_link0, 1);
+    ap.mld = true;
+    ap.mld_mac = ap_mld;
+    ap.link_id = 0;
+    ap.set_mld_links(vec![
+        MldLink {
+            link_id: 0,
+            mac: ap_link0,
+            channel: 1,
+            width: 20,
+        },
+        MldLink {
+            link_id: 1,
+            mac: ap_link1,
+            channel: 36,
+            width: 20,
+        },
+    ]);
+    ap
+}
+
+fn open_auth(ap: &mut Ap, sta: [u8; 6]) {
+    let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
+    let mut auth = dot11::RADIOTAP_TX.to_vec();
+    auth.extend_from_slice(&dot11::build_auth_req(&ap_link0, &sta, 0x10));
+    ap.handle_incoming(&auth);
+}
+
+fn mld_assoc_req(sta: [u8; 6], sta_mld: [u8; 6], profiles: &[(u8, [u8; 6])]) -> Vec<u8> {
+    let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
+    let mut link_info = Vec::new();
+    for (link_id, link_mac) in profiles {
+        link_info.extend_from_slice(&dot11::per_sta_profile(*link_id, link_mac, &[]));
+    }
+    let mut frame = dot11::build_assoc_req(&ap_link0, &sta, b"turtlenet", 0x20);
+    frame.extend_from_slice(&dot11::multi_link_ap_basic(&sta_mld, 0, 0, &link_info));
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.extend_from_slice(&frame);
+    framed
+}
+
+fn assoc_status(frame: &[u8]) -> u16 {
+    let parsed = dot11::strip_radiotap(frame)
+        .and_then(dot11::Dot11::parse)
+        .expect("assoc response parses");
+    assert_eq!(parsed.subtype(), dot11::SUBTYPE_ASSOC_RESP);
+    u16::from_le_bytes([parsed.body[2], parsed.body[3]])
+}
+
 #[test]
 fn wpa3_pmf_igtk_and_bip_protection() {
     // After a WPA3-SAE handshake the STA must have installed the IGTK delivered
     // in message 3, and must accept a BIP-protected group deauth from the AP
     // (and reject a tampered one).
-    let mut sta = Client::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:ab:cd"));
+    let mut sta = Client::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:ab:cd"),
+    );
     sta.enable_sae();
     let (mut ap, _net, sta) = run_sae(sta);
     assert!(sta.connected >= 4, "SAE must complete");
 
-    assert_eq!(sta.igtk(), Some(ap.igtk()), "STA must install the AP's IGTK via PMF");
+    assert_eq!(
+        sta.igtk(),
+        Some(ap.igtk()),
+        "STA must install the AP's IGTK via PMF"
+    );
 
     let deauth = ap.group_deauth(3);
-    assert!(sta.verify_group_mgmt(&deauth), "STA must validate the BIP-protected deauth");
+    assert!(
+        sta.verify_group_mgmt(&deauth),
+        "STA must validate the BIP-protected deauth"
+    );
 
     // tamper with the frame body -> verification must fail
     let mut tampered = deauth.clone();
     let n = tampered.len();
     tampered[n - 20] ^= 0xff;
-    assert!(!sta.verify_group_mgmt(&tampered), "tampered group mgmt must fail BIP");
+    assert!(
+        !sta.verify_group_mgmt(&tampered),
+        "tampered group mgmt must fail BIP"
+    );
 }
 
 #[test]
 fn wpa3_sae_hunting_and_pecking_handshake() {
     // Same flow but with the legacy hunting-and-pecking PWE (commit status 0).
-    let mut sta = Client::new("turtlenet", "password1234", mac_to_bytes("02:00:00:00:ab:cd"));
+    let mut sta = Client::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:ab:cd"),
+    );
     sta.enable_sae();
     sta.use_hunting_pecking();
     let (ap, _net, sta) = run_sae(sta);
     assert!(sta.connected >= 4, "hunting-and-pecking SAE must complete");
     assert!(ap.is_associated(&mac_to_bytes("02:00:00:00:ab:cd")));
+}
+
+#[test]
+fn mld_ap_sae_uses_ap_mld_address() {
+    let ap_link = mac_to_bytes("02:00:00:00:00:00");
+    let ap_mld = mac_to_bytes("02:00:00:11:22:33");
+    let sta_link = mac_to_bytes("02:00:00:00:01:00");
+
+    let mut ap = Ap::new("turtlenet", "password1234", ap_link, 1);
+    ap.enable_sae();
+    ap.mld = true;
+    ap.mld_mac = ap_mld;
+
+    let mut sta_sae = Sae::new_h2e(b"turtlenet", b"password1234", None, &sta_link, &ap_mld);
+    sta_sae.prepare_commit(None);
+    let auth = dot11::build_sae_auth(
+        &ap_link,
+        &sta_link,
+        &ap_link,
+        0,
+        0,
+        1,
+        dot11::STATUS_SAE_H2E,
+        &sta_sae.write_commit(),
+    );
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.extend_from_slice(&auth);
+
+    let out = ap.handle_incoming(&framed);
+    assert_eq!(
+        out.frames.len(),
+        2,
+        "SAE commit must yield AP commit + confirm"
+    );
+
+    let ap_commit_frame = dot11::strip_radiotap(&out.frames[0])
+        .and_then(dot11::Dot11::parse)
+        .expect("AP commit frame parses");
+    assert_eq!(
+        ap_commit_frame.addr2, ap_link,
+        "SAE auth frame remains link-addressed"
+    );
+    let ap_commit = dot11::parse_auth(&ap_commit_frame.body).expect("AP commit auth body");
+    assert_eq!(ap_commit.seq, 1);
+    sta_sae
+        .parse_peer_commit(ap_commit.payload)
+        .expect("AP commit parses");
+    sta_sae
+        .process_commit()
+        .expect("MLD SAE shared secret derives");
+
+    let ap_confirm_frame = dot11::strip_radiotap(&out.frames[1])
+        .and_then(dot11::Dot11::parse)
+        .expect("AP confirm frame parses");
+    let ap_confirm = dot11::parse_auth(&ap_confirm_frame.body).expect("AP confirm auth body");
+    assert_eq!(ap_confirm.seq, 2);
+    sta_sae
+        .check_confirm(ap_confirm.payload)
+        .expect("AP confirm verifies with AP-MLD SAE identity");
+}
+
+#[test]
+fn mld_ap_sae_uses_sta_mld_from_auth_element() {
+    let ap_link = mac_to_bytes("02:00:00:00:00:00");
+    let ap_mld = mac_to_bytes("02:00:00:11:22:33");
+    let sta_mld = mac_to_bytes("02:00:00:00:01:00");
+    let sta_air = mac_to_bytes("32:4f:53:27:65:f3");
+
+    let mut ap = Ap::new("turtlenet", "password1234", ap_link, 1);
+    ap.enable_sae();
+    ap.mld = true;
+    ap.mld_mac = ap_mld;
+
+    let mut sta_sae = Sae::new_h2e(b"turtlenet", b"password1234", None, &sta_mld, &ap_mld);
+    sta_sae.prepare_commit(None);
+    let mut payload = sta_sae.write_commit();
+    payload.extend_from_slice(&dot11::multi_link_auth(&sta_mld));
+    let auth = dot11::build_sae_auth(
+        &ap_link,
+        &sta_air,
+        &ap_link,
+        0,
+        0,
+        1,
+        dot11::STATUS_SAE_H2E,
+        &payload,
+    );
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.extend_from_slice(&auth);
+
+    let out = ap.handle_incoming(&framed);
+    assert_eq!(
+        out.frames.len(),
+        2,
+        "SAE commit must yield AP commit + confirm"
+    );
+
+    let ap_commit_frame = dot11::strip_radiotap(&out.frames[0])
+        .and_then(dot11::Dot11::parse)
+        .expect("AP commit frame parses");
+    assert_eq!(ap_commit_frame.addr1, sta_air);
+    assert_eq!(ap_commit_frame.addr2, ap_link);
+    let ap_commit = dot11::parse_auth(&ap_commit_frame.body).expect("AP commit auth body");
+    assert_eq!(ap_commit.seq, 1);
+    sta_sae
+        .parse_peer_commit(ap_commit.payload)
+        .expect("AP commit parses");
+    sta_sae
+        .process_commit()
+        .expect("MLD SAE shared secret derives from STA MLD");
+
+    let ap_confirm_frame = dot11::strip_radiotap(&out.frames[1])
+        .and_then(dot11::Dot11::parse)
+        .expect("AP confirm frame parses");
+    let ap_confirm = dot11::parse_auth(&ap_confirm_frame.body).expect("AP confirm auth body");
+    assert_eq!(ap_confirm.seq, 2);
+    sta_sae
+        .check_confirm(ap_confirm.payload)
+        .expect("AP confirm verifies with STA-MLD SAE identity");
+}
+
+#[test]
+fn mld_assoc_rejects_duplicate_and_reused_link_macs() {
+    let mut ap = mld_ap_for_tests();
+    let sta1 = mac_to_bytes("02:00:00:00:20:01");
+    let mld1 = mac_to_bytes("02:00:00:00:20:00");
+    let link1 = mac_to_bytes("02:00:00:00:20:11");
+    open_auth(&mut ap, sta1);
+
+    let ok = ap.handle_incoming(&mld_assoc_req(sta1, mld1, &[(1, link1)]));
+    assert_eq!(assoc_status(&ok.frames[0]), dot11::STATUS_SUCCESS);
+    assert_eq!(ap.station_mld_mac(&sta1), Some(mld1));
+    assert_eq!(ap.station_mld_link_macs(&sta1), vec![(1, link1)]);
+
+    let sta2 = mac_to_bytes("02:00:00:00:30:01");
+    let mld2 = mac_to_bytes("02:00:00:00:30:00");
+    open_auth(&mut ap, sta2);
+    let reused = ap.handle_incoming(&mld_assoc_req(sta2, mld2, &[(1, link1)]));
+    assert_eq!(
+        reused.frames.len(),
+        1,
+        "reused link MAC must fail before 4-way starts"
+    );
+    assert_ne!(assoc_status(&reused.frames[0]), dot11::STATUS_SUCCESS);
+    assert_eq!(ap.station_mld_mac(&sta2), None);
+
+    let mut ap = mld_ap_for_tests();
+    let sta3 = mac_to_bytes("02:00:00:00:40:01");
+    let mld3 = mac_to_bytes("02:00:00:00:40:00");
+    let link_a = mac_to_bytes("02:00:00:00:40:11");
+    let link_b = mac_to_bytes("02:00:00:00:40:12");
+    open_auth(&mut ap, sta3);
+    let duplicate = ap.handle_incoming(&mld_assoc_req(sta3, mld3, &[(1, link_a), (1, link_b)]));
+    assert_eq!(
+        duplicate.frames.len(),
+        1,
+        "duplicate link IDs must be rejected"
+    );
+    assert_ne!(assoc_status(&duplicate.frames[0]), dot11::STATUS_SUCCESS);
+    assert_eq!(ap.station_mld_mac(&sta3), None);
+}
+
+#[test]
+fn mld_sae_userspace_data_uses_mld_ccmp_addresses() {
+    let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
+    let ap_mld = mac_to_bytes("02:00:00:00:10:00");
+    let sta_link0 = mac_to_bytes("02:00:00:00:50:01");
+    let sta_mld = mac_to_bytes("02:00:00:00:50:00");
+    let sta_link1 = mac_to_bytes("02:00:00:00:50:11");
+
+    let mut ap = mld_ap_for_tests();
+    ap.enable_sae();
+    let mut net = FakeNet::new(ap_link0, [10, 10, 10, 1]);
+
+    let mut sta = Client::new("turtlenet", "password1234", sta_link0);
+    sta.enable_sae();
+    sta.enable_mld(sta_mld, sta_link1, ap_mld);
+    drive(&mut ap, &mut net, &mut sta);
+
+    assert_eq!(sta.connected, 4, "MLD SAE station must complete the 4-way");
+    assert!(ap.is_associated(&sta_link0));
+
+    let ping = sta.build_ping(&ap_link0, [10, 10, 10, 2], [10, 10, 10, 1], 0);
+    let ping_frame = sta.encrypt_uplink(&ping).expect("MLD uplink encrypts");
+    let replies = ap_step(&mut ap, &mut net, &ping_frame);
+    assert!(
+        !replies.is_empty(),
+        "AP must decrypt the MLD-secured uplink and answer"
+    );
+
+    let mut got_reply = false;
+    for f in replies {
+        let out = sta.handle_incoming(&f);
+        got_reply |= out.to_network.iter().any(|eth| {
+            eth.len() >= 14 + 20 + 8
+                && eth[12] == 0x08
+                && eth[13] == 0x00
+                && eth[14 + 9] == 1
+                && eth[14 + ((eth[14] & 0x0f) as usize * 4)] == 0
+        });
+    }
+    assert!(got_reply, "STA must decrypt the MLD-secured downlink reply");
+
+    let tk = ap
+        .station_tk(&sta_link0)
+        .expect("AP has the MLD station TK");
+    let deauth_to_sta = ap
+        .protected_deauth(&sta_link0, 7)
+        .expect("protected MLD deauth");
+    sta.handle_incoming(&deauth_to_sta);
+    assert_eq!(
+        sta.connected, 0,
+        "STA must accept AP->STA MLD-protected deauth"
+    );
+
+    let mut deauth_to_ap = dot11::RADIOTAP_TX.to_vec();
+    deauth_to_ap.extend_from_slice(&dot11::build_ccmp_mgmt_sec(
+        dot11::SUBTYPE_DEAUTH,
+        &ap_link0,
+        &sta_link0,
+        &ap_link0,
+        Some((ap_mld, sta_mld, ap_mld)),
+        0,
+        0x40,
+        77,
+        0,
+        &tk,
+        &3u16.to_le_bytes(),
+    ));
+    ap.handle_incoming(&deauth_to_ap);
+    assert!(
+        !ap.is_associated(&sta_link0),
+        "AP must accept STA->AP MLD-protected deauth"
+    );
 }
 
 /// Drive a client (WPA2 or WPA3) against a given AP to full association.
@@ -174,7 +490,10 @@ fn idle_station_is_pruned_with_protected_deauth() {
 
     // The deauth is CCMP-protected (PMF), so the STA accepts it and disconnects.
     sta.handle_incoming(&frames[0]);
-    assert_eq!(sta.connected, 0, "STA honours the protected inactivity deauth");
+    assert_eq!(
+        sta.connected, 0,
+        "STA honours the protected inactivity deauth"
+    );
 }
 
 #[test]
@@ -193,7 +512,15 @@ fn pmksa_caching_fast_reconnect_skips_sae() {
     assert_eq!(sta.connected, 0);
     let mut d2ap = barely_ap::dot11::RADIOTAP_TX.to_vec();
     d2ap.extend_from_slice(&barely_ap::dot11::build_ccmp_mgmt(
-        barely_ap::dot11::SUBTYPE_DEAUTH, &ap_mac, &sta_mac, &ap_mac, 0x30, 5, 0, &tk, &3u16.to_le_bytes(),
+        barely_ap::dot11::SUBTYPE_DEAUTH,
+        &ap_mac,
+        &sta_mac,
+        &ap_mac,
+        0x30,
+        5,
+        0,
+        &tk,
+        &3u16.to_le_bytes(),
     ));
     ap.handle_incoming(&d2ap);
     assert!(!ap.is_associated(&sta_mac));
@@ -220,17 +547,60 @@ fn pmksa_caching_fast_reconnect_skips_sae() {
         }
         to_client.extend(nxt2);
     }
-    assert_eq!(sta.connected, 4, "PMKSA fast reconnect must complete the 4-way");
+    assert_eq!(
+        sta.connected, 4,
+        "PMKSA fast reconnect must complete the 4-way"
+    );
     assert!(ap.is_associated(&sta_mac));
 
     for f in &all {
-        let p = barely_ap::dot11::Dot11::parse(barely_ap::dot11::strip_radiotap(f).unwrap()).unwrap();
-        if p.frame_type() == barely_ap::dot11::TYPE_MGMT && p.subtype() == barely_ap::dot11::SUBTYPE_AUTH {
+        let p =
+            barely_ap::dot11::Dot11::parse(barely_ap::dot11::strip_radiotap(f).unwrap()).unwrap();
+        if p.frame_type() == barely_ap::dot11::TYPE_MGMT
+            && p.subtype() == barely_ap::dot11::SUBTYPE_AUTH
+        {
             if let Some(a) = barely_ap::dot11::parse_auth(&p.body) {
-                assert_ne!(a.algo, barely_ap::dot11::AUTH_ALG_SAE, "PMKSA reconnect must not re-run SAE");
+                assert_ne!(
+                    a.algo,
+                    barely_ap::dot11::AUTH_ALG_SAE,
+                    "PMKSA reconnect must not re-run SAE"
+                );
             }
         }
     }
+}
+
+#[test]
+fn unknown_sae_pmkid_is_rejected_with_status_53() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    ap.enable_sae();
+
+    // PMKSA reconnect begins with Open-System auth. The station then presents
+    // a PMKID from an earlier AP lifetime that this fresh AP does not have.
+    let mut auth = dot11::RADIOTAP_TX.to_vec();
+    auth.extend_from_slice(&dot11::build_auth_req(&ap_mac, &sta_mac, 0));
+    let auth_out = ap.handle_incoming(&auth);
+    assert_eq!(auth_out.frames.len(), 1, "open auth is accepted for PMKSA");
+
+    let stale_pmkid = [0x5a; 16];
+    let mut assoc = dot11::RADIOTAP_TX.to_vec();
+    assoc.extend_from_slice(&dot11::build_assoc_req_pmkid(
+        &ap_mac,
+        &sta_mac,
+        b"turtlenet",
+        &stale_pmkid,
+        16,
+    ));
+    let out = ap.handle_incoming(&assoc);
+    assert_eq!(out.frames.len(), 1, "AP must explicitly reject stale PMKID");
+    assert_eq!(
+        assoc_status(&out.frames[0]),
+        dot11::STATUS_INVALID_PMKID,
+        "status 53 makes the station discard PMKSA and retry full SAE"
+    );
+    assert!(!ap.is_associated(&sta_mac));
 }
 
 #[test]
@@ -244,18 +614,33 @@ fn beacon_protection_bigtk() {
     sta.enable_sae();
 
     drive(&mut ap, &mut net, &mut sta);
-    assert_eq!(sta.connected, 4, "handshake completes with beacon protection on");
+    assert_eq!(
+        sta.connected, 4,
+        "handshake completes with beacon protection on"
+    );
 
     // The STA installed the BIGTK delivered in message 3.
     assert_eq!(sta.bigtk(), Some(ap.bigtk()), "STA installs the BIGTK");
 
     // A protected beacon from the AP verifies; a tampered one does not.
     let beacon = ap.beacon_frame();
-    assert!(sta.verify_beacon(&beacon), "valid BIP-protected beacon must verify");
+    let extcap = dot11::find_ie(&beacon[36..], 127).expect("Extended Capabilities");
+    assert_ne!(
+        extcap[10] & 0x10,
+        0,
+        "Beacon Protection mode advertises Extended Capability bit 84"
+    );
+    assert!(
+        sta.verify_beacon(&beacon),
+        "valid BIP-protected beacon must verify"
+    );
     let mut bad = beacon.clone();
     let n = bad.len();
     bad[n - 30] ^= 0xff;
-    assert!(!sta.verify_beacon(&bad), "tampered beacon must fail BIP verification");
+    assert!(
+        !sta.verify_beacon(&bad),
+        "tampered beacon must fail BIP verification"
+    );
 }
 
 /// Netlink kernel-beacon path: the static beacon handed to START_AP must NOT
@@ -278,7 +663,11 @@ fn netlink_static_beacon_has_no_mme() {
         unprotected.len() + 18,
         "protected beacon carries an 18-octet MME the unprotected one does not"
     );
-    assert_eq!(protected[protected.len() - 18], EID_MME, "protected beacon ends with the MME");
+    assert_eq!(
+        protected[protected.len() - 18],
+        EID_MME,
+        "protected beacon ends with the MME"
+    );
     // The unprotected beacon must not end with an MME element header.
     let u = &unprotected;
     assert!(
@@ -300,7 +689,10 @@ fn transition_mode_accepts_both_wpa2_and_wpa3_clients() {
             sta.enable_sae();
         }
         drive(&mut ap, &mut net, &mut sta);
-        assert_eq!(sta.connected, 4, "transition AP must accept use_sae={use_sae} client");
+        assert_eq!(
+            sta.connected, 4,
+            "transition AP must accept use_sae={use_sae} client"
+        );
         assert!(ap.is_associated(&sta_mac));
     }
 }
@@ -336,7 +728,10 @@ fn wrong_password_sae_fails_to_associate() {
 
     // Different PMKs -> the SAE confirm exchange fails, so the STA never reaches
     // full authentication.
-    assert!(sta.connected < 4, "mismatched password must not authenticate");
+    assert!(
+        sta.connected < 4,
+        "mismatched password must not authenticate"
+    );
     assert!(!ap.is_associated(&sta_mac));
 }
 
@@ -352,27 +747,37 @@ fn sae_only_ap_rejects_open_system_auth() {
     let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
     ap.enable_sae();
 
-    // Open-system Authentication request (algo 0) from a downgrade attacker.
+    // Open-system Authentication request (algo 0). A SAE AP now *accepts* open
+    // auth, because WPA3-SAE PMKSA fast-reconnect uses open-auth + a cached
+    // PMKID (rejecting it here with status 13 breaks reconnect and loops the STA
+    // in AUTHENTICATING). The anti-downgrade guarantee moves to association.
     let sc = 0u16;
     let req = dot11::build_auth_req(&ap_mac, &sta_mac, sc);
     let mut framed = dot11::RADIOTAP_TX.to_vec();
     framed.extend_from_slice(&req);
     let out = ap.handle_incoming(&framed);
+    if let Some(f) = out.frames.first() {
+        let body = dot11::strip_radiotap(f).expect("radiotap");
+        let frame = dot11::Dot11::parse(body).expect("parse");
+        if let Some(auth) = dot11::parse_auth(&frame.body) {
+            assert_ne!(
+                auth.status,
+                dot11::STATUS_UNSUPPORTED_AUTH_ALG,
+                "SAE AP must not reject open auth with status 13 (would break PMKSA reconnect)"
+            );
+        }
+    }
 
-    // The AP must answer with an Authentication reject (status != success), not
-    // a success that would let the station proceed to associate + 4-way.
-    assert_eq!(out.frames.len(), 1, "SAE-only AP must answer open auth with one reject frame");
-    let body = dot11::strip_radiotap(&out.frames[0]).expect("radiotap");
-    let frame = dot11::Dot11::parse(body).expect("parse");
-    let auth = dot11::parse_auth(&frame.body).expect("auth body");
-    assert_eq!(auth.algo, dot11::AUTH_ALG_OPEN, "reject echoes the open-system algorithm");
-    assert_eq!(auth.status, dot11::STATUS_UNSUPPORTED_AUTH_ALG, "status 13 (unsupported auth algorithm)");
-
-    // A subsequent association attempt must not associate (no PMK was derived).
+    // The anti-downgrade guarantee: a station that open-authed but has NO
+    // SAE/OWE/cached PMK must never associate on a SAE-only AP (so it can never
+    // reach a 4-way and fall back to the bare PSK path).
     let ssid = b"turtlenet";
     let assoc = dot11::build_assoc_req(&ap_mac, &sta_mac, ssid, 16);
     let mut framed = dot11::RADIOTAP_TX.to_vec();
     framed.extend_from_slice(&assoc);
     ap.handle_incoming(&framed);
-    assert!(!ap.is_associated(&sta_mac), "downgrade station must never associate on a SAE-only AP");
+    assert!(
+        !ap.is_associated(&sta_mac),
+        "downgrade station (no PMK) must never associate on a SAE-only AP"
+    );
 }

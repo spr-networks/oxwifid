@@ -69,10 +69,22 @@ fn python_client_to_rust_ap() {
         eprintln!("SKIP: python3 + scapy unavailable");
         return;
     };
-    let ap = format!("{AP_BIN} --mode stdio --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
+    let ap = format!(
+        "{AP_BIN} --mode stdio --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234"
+    );
     let cli = format!("{py} tools/run_client.py");
     assert!(
-        run_bridge(&py, &ap, &cli, &["Fully Authenticated", "PING_REPLY_OK"], &[("BARELY_PING", "1"), ("AP_MAC", "02:00:00:00:00:00"), ("STA_MAC", "02:00:00:00:ab:cd")]),
+        run_bridge(
+            &py,
+            &ap,
+            &cli,
+            &["Fully Authenticated", "PING_REPLY_OK"],
+            &[
+                ("BARELY_PING", "1"),
+                ("AP_MAC", "02:00:00:00:00:00"),
+                ("STA_MAC", "02:00:00:00:ab:cd")
+            ]
+        ),
         "python client should authenticate + ping through the Rust AP"
     );
 }
@@ -83,7 +95,9 @@ fn rust_client_to_rust_ap() {
         eprintln!("SKIP: python3 + scapy unavailable");
         return;
     };
-    let ap = format!("{AP_BIN} --mode stdio --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
+    let ap = format!(
+        "{AP_BIN} --mode stdio --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234"
+    );
     let cli = format!("{CLI_BIN} --ping --mac 02:00:00:00:ab:cd --gw-mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
     assert!(
         run_bridge(&py, &ap, &cli, &["AUTHENTICATED", "PING_REPLY_OK"], &[]),
@@ -97,7 +111,9 @@ fn wpa3_sae_rust_client_to_rust_ap() {
         eprintln!("SKIP: python3 + scapy unavailable");
         return;
     };
-    let ap = format!("{AP_BIN} --mode stdio --sae --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
+    let ap = format!(
+        "{AP_BIN} --mode stdio --sae --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234"
+    );
     let cli = format!("{CLI_BIN} --ping --sae --mac 02:00:00:00:ab:cd --gw-mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
     assert!(
         run_bridge(&py, &ap, &cli, &["AUTHENTICATED", "PING_REPLY_OK"], &[]),
@@ -111,7 +127,9 @@ fn wpa3_sae_hunting_and_pecking_rust_client_to_rust_ap() {
         eprintln!("SKIP: python3 + scapy unavailable");
         return;
     };
-    let ap = format!("{AP_BIN} --mode stdio --sae --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
+    let ap = format!(
+        "{AP_BIN} --mode stdio --sae --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234"
+    );
     let cli = format!("{CLI_BIN} --ping --sae-hnp --mac 02:00:00:00:ab:cd --gw-mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
     assert!(
         run_bridge(&py, &ap, &cli, &["AUTHENTICATED", "PING_REPLY_OK"], &[]),
@@ -133,7 +151,10 @@ fn python_sae_matches_ieee_j10() {
         .output()
         .expect("run python sae self-test");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && stdout.contains("True"), "python SAE J.10 self-test failed: {stdout}");
+    assert!(
+        out.status.success() && stdout.contains("True"),
+        "python SAE J.10 self-test failed: {stdout}"
+    );
 }
 
 /// WPA3 cross-validation: the independent Python SAE must interoperate with the
@@ -144,13 +165,30 @@ fn wpa3_python_client_to_rust_ap() {
         eprintln!("SKIP: python3 + scapy unavailable");
         return;
     };
-    let ap = format!("{AP_BIN} --mode stdio --sae --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
+    let ap = format!(
+        "{AP_BIN} --mode stdio --sae --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234"
+    );
     let cli = format!("{py} tools/wpa3_client.py");
-    let env = [("AP_MAC", "02:00:00:00:00:00"), ("STA_MAC", "02:00:00:00:ab:cd")];
-    assert!(run_bridge(&py, &ap, &cli, &["AUTHENTICATED", "PING_REPLY_OK"], &env), "python H2E client -> rust AP");
+    let env = [
+        ("AP_MAC", "02:00:00:00:00:00"),
+        ("STA_MAC", "02:00:00:00:ab:cd"),
+    ];
+    assert!(
+        run_bridge(&py, &ap, &cli, &["AUTHENTICATED", "PING_REPLY_OK"], &env),
+        "python H2E client -> rust AP"
+    );
     let mut env_hnp = env.to_vec();
     env_hnp.push(("SAE_HNP", "1"));
-    assert!(run_bridge(&py, &ap, &cli, &["AUTHENTICATED", "PING_REPLY_OK"], &env_hnp), "python H&P client -> rust AP");
+    assert!(
+        run_bridge(
+            &py,
+            &ap,
+            &cli,
+            &["AUTHENTICATED", "PING_REPLY_OK"],
+            &env_hnp
+        ),
+        "python H&P client -> rust AP"
+    );
 }
 
 #[test]
@@ -161,10 +199,30 @@ fn wpa3_rust_client_to_python_ap() {
     };
     let ap = format!("{py} tools/wpa3_ap.py");
     let env = [("AP_MAC", "02:00:00:00:00:00")];
-    let cli_h2e = format!("{CLI_BIN} --ping --sae --mac 02:00:00:00:ab:cd --gw-mac 02:00:00:00:00:00");
-    assert!(run_bridge(&py, &ap, &cli_h2e, &["AUTHENTICATED", "PING_REPLY_OK"], &env), "rust H2E client -> python AP");
-    let cli_hnp = format!("{CLI_BIN} --ping --sae-hnp --mac 02:00:00:00:ab:cd --gw-mac 02:00:00:00:00:00");
-    assert!(run_bridge(&py, &ap, &cli_hnp, &["AUTHENTICATED", "PING_REPLY_OK"], &env), "rust H&P client -> python AP");
+    let cli_h2e =
+        format!("{CLI_BIN} --ping --sae --mac 02:00:00:00:ab:cd --gw-mac 02:00:00:00:00:00");
+    assert!(
+        run_bridge(
+            &py,
+            &ap,
+            &cli_h2e,
+            &["AUTHENTICATED", "PING_REPLY_OK"],
+            &env
+        ),
+        "rust H2E client -> python AP"
+    );
+    let cli_hnp =
+        format!("{CLI_BIN} --ping --sae-hnp --mac 02:00:00:00:ab:cd --gw-mac 02:00:00:00:00:00");
+    assert!(
+        run_bridge(
+            &py,
+            &ap,
+            &cli_hnp,
+            &["AUTHENTICATED", "PING_REPLY_OK"],
+            &env
+        ),
+        "rust H&P client -> python AP"
+    );
 }
 
 #[test]
@@ -176,7 +234,13 @@ fn rust_client_to_python_ap() {
     let ap = format!("{py} tools/run_ap.py");
     let cli = format!("{CLI_BIN} --ping --mac 02:00:00:00:ab:cd --gw-mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234");
     assert!(
-        run_bridge(&py, &ap, &cli, &["AUTHENTICATED", "PING_REPLY_OK"], &[("AP_MAC", "02:00:00:00:00:00")]),
+        run_bridge(
+            &py,
+            &ap,
+            &cli,
+            &["AUTHENTICATED", "PING_REPLY_OK"],
+            &[("AP_MAC", "02:00:00:00:00:00")]
+        ),
         "rust client should authenticate + ping through the reference Python AP"
     );
 }

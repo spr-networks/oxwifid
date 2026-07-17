@@ -18,7 +18,7 @@
 //! }
 //! ```
 
-use crate::ap::Ap;
+use crate::ap::{Ap, MldLink};
 use crate::util::mac_to_bytes;
 use serde_json::Value;
 
@@ -65,6 +65,17 @@ pub struct Config {
     pub band6: bool,
     /// Per-station VIF: each station gets its own AP_VLAN + GTK (netlink mode).
     pub per_sta_vif: bool,
+    /// 802.11be preamble-puncturing bitmap (EHT Operation Disabled Subchannel
+    /// Bitmap): one bit per 20 MHz subchannel, 1 = punctured. 0 = none.
+    pub punct_bitmap: u16,
+    /// 802.11be AP MLD: advertise a Basic Multi-Link element and run association
+    /// + 4-way at the MLD level. Off by default.
+    pub mld: bool,
+    /// This affiliated link's Link ID (0-15).
+    pub link_id: u8,
+    /// Affiliated AP links for an MLD AP. Empty means the top-level
+    /// mac/channel/link_id describes the only link.
+    pub mld_links: Vec<MldLinkConfig>,
     /// One credential file of `MAC passphrase` lines (`00:00:00:00:00:00` =
     /// wildcard onboarding). Unlike hostapd's split `wpa_psk_file`/`sae_psk_file`,
     /// this single file serves all key-mgmt.
@@ -75,6 +86,13 @@ pub struct Config {
     /// Path for the runtime control socket (hostapd-style `ctrl_interface`).
     /// `None` disables it. netlink mode only.
     pub ctrl_path: Option<String>,
+    /// SPR API Unix socket. When set, station events are delivered directly as
+    /// HTTP PUT requests without spawning hostapd_cli, an action script, or curl.
+    pub spr_api_socket: Option<String>,
+    /// SPR's hostap DHCP/XDP helper. When set alongside `spr_api_socket`, the
+    /// event worker invokes `add|remove <AP_VLAN iface> <station MAC>` before
+    /// reporting the corresponding event to the SPR API.
+    pub spr_dhcp_helper: Option<String>,
     /// Additional co-hosted BSSes (extra SSIDs) on the same radio. Each gets its
     /// own netdev/BSSID and 4-way. netlink mode only.
     pub bss: Vec<BssConfig>,
@@ -96,6 +114,14 @@ pub struct BssConfig {
     pub mac: [u8; 6],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MldLinkConfig {
+    pub link_id: u8,
+    pub mac: [u8; 6],
+    pub channel: u8,
+    pub width: Option<u16>,
+}
+
 impl Default for Config {
     fn default() -> Config {
         Config {
@@ -115,9 +141,17 @@ impl Default for Config {
             rnr: false,
             band6: false,
             per_sta_vif: false,
+            punct_bitmap: 0,
+            mld: false,
+            link_id: 0,
+            mld_links: Vec::new(),
             psk_file: None,
             wmm: true,
             ctrl_path: None,
+            spr_api_socket: None,
+            // wifid installs this helper at the container root. It is only used
+            // when `spr_api_socket` enables the SPR event worker.
+            spr_dhcp_helper: Some("/hostap_dhcp_helper".to_string()),
             bss: Vec::new(),
             group_rekey: 600,
             strict_rekey: true,
@@ -151,7 +185,9 @@ impl Config {
             "country" | "country_code" => self.country = parse_country(as_str(key, val)?)?,
             "channel" => self.channel = as_u8(key, val)?,
             "width" | "channel_width" => {
-                let n = val.as_u64().ok_or_else(|| format!("{key} must be an integer"))?;
+                let n = val
+                    .as_u64()
+                    .ok_or_else(|| format!("{key} must be an integer"))?;
                 self.width = u16::try_from(n).map_err(|_| format!("{key} out of range"))?;
             }
             "phy" | "phy_mode" | "ieee80211_mode" => self.phy = parse_phy(as_str(key, val)?)?,
@@ -164,15 +200,53 @@ impl Config {
             "rnr" => self.rnr = as_bool(key, val)?,
             "band6" => self.band6 = as_bool(key, val)?,
             "per_sta_vif" => self.per_sta_vif = as_bool(key, val)?,
+            "punct_bitmap" | "ru_puncturing_bitmap" => {
+                let n = val
+                    .as_u64()
+                    .ok_or_else(|| format!("{key} must be an integer"))?;
+                self.punct_bitmap = u16::try_from(n).map_err(|_| format!("{key} out of range"))?;
+            }
+            "mld" | "mld_ap" => self.mld = as_bool(key, val)?,
+            "mld_mac" | "mld_addr" => {
+                // The AP MLD address must equal the interface's own MAC (the
+                // kernel keys MLO on it); it is not independently configurable, so
+                // reject it rather than silently ignoring the admin's value. Set
+                // the interface address via `mac` instead.
+                return Err("mld_mac is not separately configurable; the AP MLD address is the interface's own MAC (set it via `mac`)".to_string());
+            }
+            "link_id" | "mld_link_id" => self.link_id = as_u8(key, val)?,
+            "mld_links" | "links" => {
+                let arr = val
+                    .as_array()
+                    .ok_or_else(|| format!("{key} must be an array"))?;
+                self.mld_links.clear();
+                for item in arr {
+                    self.mld_links.push(parse_mld_link(item, self.width)?);
+                }
+            }
             "psk_file" => self.psk_file = Some(as_str(key, val)?.to_string()),
             "wmm" | "wme" => self.wmm = as_bool(key, val)?,
             "ctrl_path" | "ctrl_interface" => self.ctrl_path = Some(as_str(key, val)?.to_string()),
+            "spr_api_socket" | "spr_socket" => {
+                self.spr_api_socket = Some(as_str(key, val)?.to_string())
+            }
+            "spr_dhcp_helper" | "spr_helper" => {
+                self.spr_dhcp_helper = if val.is_null() {
+                    None
+                } else {
+                    Some(as_str(key, val)?.to_string())
+                }
+            }
             "wpa_group_rekey" | "group_rekey" => {
-                self.group_rekey = val.as_u64().ok_or_else(|| format!("{key} must be an integer"))?;
+                self.group_rekey = val
+                    .as_u64()
+                    .ok_or_else(|| format!("{key} must be an integer"))?;
             }
             "wpa_strict_rekey" | "strict_rekey" => self.strict_rekey = as_bool(key, val)?,
             "bss" => {
-                let arr = val.as_array().ok_or_else(|| format!("{key} must be an array"))?;
+                let arr = val
+                    .as_array()
+                    .ok_or_else(|| format!("{key} must be an array"))?;
                 let (default_pass, default_km) = (self.passphrase.clone(), self.key_mgmt);
                 for item in arr {
                     self.bss.push(parse_bss(item, &default_pass, default_km)?);
@@ -202,13 +276,55 @@ impl Config {
         }
         // Channel width.
         if !matches!(self.width, 20 | 40 | 80 | 160 | 320) {
-            return Err(format!("width must be one of 20/40/80/160/320 MHz (got {})", self.width));
+            return Err(format!(
+                "width must be one of 20/40/80/160/320 MHz (got {})",
+                self.width
+            ));
         }
         if self.width == 320 && !self.band6 {
             return Err("320 MHz is 6 GHz / 802.11be only (set band6)".to_string());
         }
         if self.width >= 80 && !self.band6 && !crate::dot11::is_5ghz(self.channel) {
             return Err("80/160 MHz require a 5 or 6 GHz channel".to_string());
+        }
+        if !self.mld_links.is_empty() {
+            if !self.mld {
+                return Err("mld_links requires mld=true".to_string());
+            }
+            if self.mode != "netlink" {
+                return Err("multi-link MLD AP requires netlink mode".to_string());
+            }
+            let mut ids = Vec::new();
+            let mut macs = Vec::new();
+            for link in &self.mld_links {
+                if link.link_id > 15 {
+                    return Err(format!("mld link_id {} out of range", link.link_id));
+                }
+                if ids.contains(&link.link_id) {
+                    return Err(format!("duplicate mld link_id {}", link.link_id));
+                }
+                if macs.contains(&link.mac) {
+                    return Err(format!(
+                        "duplicate mld link MAC {}",
+                        crate::util::bytes_to_mac(&link.mac)
+                    ));
+                }
+                let width = link.width.unwrap_or(self.width);
+                if !matches!(width, 20 | 40 | 80 | 160 | 320) {
+                    return Err(format!(
+                        "mld link {} width must be one of 20/40/80/160/320 MHz",
+                        link.link_id
+                    ));
+                }
+                ids.push(link.link_id);
+                macs.push(link.mac);
+            }
+            if !ids.contains(&self.link_id) {
+                return Err(format!(
+                    "mld_links must include the association link_id {}",
+                    self.link_id
+                ));
+            }
         }
         // Additional BSSes need per-BSS netdevs, which only the netlink transport
         // creates.
@@ -220,10 +336,16 @@ impl Config {
         let mut macs = vec![self.mac];
         for b in &self.bss {
             if b.key_mgmt != KeyMgmt::Owe && !(8..=63).contains(&b.passphrase.len()) {
-                return Err(format!("bss {:?} passphrase must be 8..=63 characters", b.ssid));
+                return Err(format!(
+                    "bss {:?} passphrase must be 8..=63 characters",
+                    b.ssid
+                ));
             }
             if self.band6 && b.key_mgmt == KeyMgmt::Psk {
-                return Err(format!("bss {:?}: 6 GHz mandates WPA3/SAE or OWE, not WPA2-PSK", b.ssid));
+                return Err(format!(
+                    "bss {:?}: 6 GHz mandates WPA3/SAE or OWE, not WPA2-PSK",
+                    b.ssid
+                ));
             }
             if macs.contains(&b.mac) {
                 return Err(format!(
@@ -249,7 +371,9 @@ impl Config {
     /// `band6` likewise forces SAE because 6 GHz mandates WPA3. OWE is already
     /// PMF-protected and is left as-is.
     pub fn effective_key_mgmt(&self) -> KeyMgmt {
-        if self.phy == crate::dot11::PhyMode::Eht && matches!(self.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition) {
+        if self.phy == crate::dot11::PhyMode::Eht
+            && matches!(self.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition)
+        {
             KeyMgmt::Sae
         } else {
             self.key_mgmt
@@ -261,6 +385,27 @@ impl Config {
         let mut ap = Ap::new(&self.ssid, &self.passphrase, self.mac, self.channel);
         ap.set_country(self.country);
         ap.set_width(self.width);
+        ap.punct = self.punct_bitmap;
+        if self.mld {
+            ap.mld = true;
+            // The kernel's AP-MLD address is the interface's own address (the
+            // links get their own addresses via ADD_LINK). It must equal the MLD
+            // MAC barely-ap advertises + uses for SAE/4-way crypto, otherwise the
+            // kernel does not recognize (and silently drops) EAPOL the client
+            // sends to the advertised MLD address. So the MLD MAC IS the primary
+            // interface `mac`; the affiliated links use the `mld_links` BSSIDs.
+            ap.mld_mac = self.mac;
+            ap.link_id = self.link_id;
+            let links = self.resolved_mld_links();
+            // Anchor the management plane (auth/assoc/EAPOL) on the association
+            // link's BSSID: the client authenticates to that link address, so the
+            // AP's responses must originate from it (not the default `mac`). The
+            // per-link beacons already use their own `link.mac`.
+            if let Some(assoc) = links.iter().find(|l| l.link_id == self.link_id) {
+                ap.mac = assoc.mac;
+            }
+            ap.set_mld_links(links);
+        }
         ap.set_phy(self.phy);
         ap.set_wmm(self.wmm);
         ap.set_group_rekey(self.group_rekey);
@@ -291,6 +436,27 @@ impl Config {
         ap
     }
 
+    pub fn resolved_mld_links(&self) -> Vec<MldLink> {
+        if self.mld_links.is_empty() {
+            vec![MldLink {
+                link_id: self.link_id,
+                mac: self.mac,
+                channel: self.channel,
+                width: self.width,
+            }]
+        } else {
+            self.mld_links
+                .iter()
+                .map(|l| MldLink {
+                    link_id: l.link_id,
+                    mac: l.mac,
+                    channel: l.channel,
+                    width: l.width.unwrap_or(self.width),
+                })
+                .collect()
+        }
+    }
+
     /// Build an [`Ap`] for an additional BSS: the primary's radio parameters
     /// (channel, width, country, band) with the BSS's own SSID/BSSID/security.
     pub fn build_bss_ap(&self, bss: &BssConfig) -> Ap {
@@ -303,7 +469,9 @@ impl Config {
         ap.set_strict_rekey(self.strict_rekey);
         // EHT mandates PMF for every BSS on the radio, the same way `band6` does
         // below — upgrade a non-MFPR mode to SAE (see `effective_key_mgmt`).
-        let km = if self.phy == crate::dot11::PhyMode::Eht && matches!(bss.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition) {
+        let km = if self.phy == crate::dot11::PhyMode::Eht
+            && matches!(bss.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition)
+        {
             KeyMgmt::Sae
         } else {
             bss.key_mgmt
@@ -364,6 +532,36 @@ fn parse_bss(item: &Value, default_pass: &str, default_km: KeyMgmt) -> Result<Bs
     Ok(b)
 }
 
+fn parse_mld_link(item: &Value, _default_width: u16) -> Result<MldLinkConfig, String> {
+    let o = item
+        .as_object()
+        .ok_or("each mld link must be a JSON object")?;
+    let mut link_id: Option<u8> = None;
+    let mut mac: Option<[u8; 6]> = None;
+    let mut channel: Option<u8> = None;
+    let mut width: Option<u16> = None;
+    for (k, v) in o {
+        match k.as_str() {
+            "link_id" | "mld_link_id" => link_id = Some(as_u8(k, v)?),
+            "mac" | "bssid" | "link_mac" => mac = Some(mac_to_bytes(as_str(k, v)?)),
+            "channel" => channel = Some(as_u8(k, v)?),
+            "width" | "channel_width" => {
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| format!("{k} must be an integer"))?;
+                width = Some(u16::try_from(n).map_err(|_| format!("{k} out of range"))?);
+            }
+            _ => return Err(format!("unknown mld link key {k:?}")),
+        }
+    }
+    Ok(MldLinkConfig {
+        link_id: link_id.ok_or("mld link missing link_id")?,
+        mac: mac.ok_or("mld link missing mac")?,
+        channel: channel.ok_or("mld link missing channel")?,
+        width,
+    })
+}
+
 /// One credential-file entry: `(MAC filter, passphrase)`, `None` MAC = wildcard.
 pub type PskEntry = (Option<[u8; 6]>, String);
 
@@ -421,7 +619,9 @@ fn parse_key_mgmt(s: &str) -> Result<KeyMgmt, String> {
         "sae" | "wpa3" | "wpa3-sae" => Ok(KeyMgmt::Sae),
         "sae-transition" | "transition" | "wpa2-wpa3" | "wpa2+wpa3" => Ok(KeyMgmt::SaeTransition),
         "owe" => Ok(KeyMgmt::Owe),
-        _ => Err(format!("unknown key_mgmt {s:?} (psk|sae|sae-transition|owe)")),
+        _ => Err(format!(
+            "unknown key_mgmt {s:?} (psk|sae|sae-transition|owe)"
+        )),
     }
 }
 
@@ -433,7 +633,9 @@ pub fn parse_ip(s: &str) -> Result<[u8; 4], String> {
         if n >= 4 {
             return Err(format!("invalid IPv4 address {s:?}"));
         }
-        out[n] = part.parse().map_err(|_| format!("invalid IPv4 octet {part:?} in {s:?}"))?;
+        out[n] = part
+            .parse()
+            .map_err(|_| format!("invalid IPv4 octet {part:?} in {s:?}"))?;
         n += 1;
     }
     if n != 4 {
@@ -443,15 +645,19 @@ pub fn parse_ip(s: &str) -> Result<[u8; 4], String> {
 }
 
 fn as_str<'a>(key: &str, val: &'a Value) -> Result<&'a str, String> {
-    val.as_str().ok_or_else(|| format!("{key} must be a string"))
+    val.as_str()
+        .ok_or_else(|| format!("{key} must be a string"))
 }
 
 fn as_bool(key: &str, val: &Value) -> Result<bool, String> {
-    val.as_bool().ok_or_else(|| format!("{key} must be a boolean"))
+    val.as_bool()
+        .ok_or_else(|| format!("{key} must be a boolean"))
 }
 
 fn as_u8(key: &str, val: &Value) -> Result<u8, String> {
-    let n = val.as_u64().ok_or_else(|| format!("{key} must be a non-negative integer"))?;
+    let n = val
+        .as_u64()
+        .ok_or_else(|| format!("{key} must be a non-negative integer"))?;
     u8::try_from(n).map_err(|_| format!("{key} must be 0..=255"))
 }
 
@@ -469,18 +675,63 @@ mod tests {
     }
 
     #[test]
+    fn cross_band_mld_config_produces_band_correct_per_link_beacons() {
+        // MLD across 2.4 GHz (ch 1) + 5 GHz (ch 36) — the realistic deployment,
+        // not two 2.4 GHz channels. Each link's beacon must carry band-correct
+        // IEs: the 5 GHz link advertises VHT (id 191); the 2.4 GHz link does not.
+        let cfg = Config::from_json(include_str!("../configs/mld.json")).expect("mld.json parses");
+        let links = cfg.resolved_mld_links();
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].channel, 1, "link 0 on 2.4 GHz ch 1");
+        assert_eq!(links[1].channel, 36, "link 1 on 5 GHz ch 36");
+        let ap = cfg.build_ap();
+        let b0 = ap.beacon_frame_unprotected_for_link(&links[0]);
+        let b1 = ap.beacon_frame_unprotected_for_link(&links[1]);
+        // Walk the beacon IEs (after the 24-byte header + 12-byte fixed fields).
+        let has_ie = |f: &[u8], id: u8| {
+            let mut i = 36usize;
+            while i + 2 <= f.len() {
+                if f[i] == id {
+                    return true;
+                }
+                i += 2 + f[i + 1] as usize;
+            }
+            false
+        };
+        assert!(
+            has_ie(&b1, 191),
+            "5 GHz (ch 36) link beacon carries VHT Capabilities"
+        );
+        assert!(
+            !has_ie(&b0, 191),
+            "2.4 GHz (ch 1) link beacon omits VHT Capabilities"
+        );
+    }
+
+    #[test]
     fn eht_mandates_pmf_upgrading_non_mfpr_modes_to_sae() {
         use crate::dot11::{PhyMode, SecurityMode};
         // 802.11be (EHT) requires PMF: a non-MFPR mode (WPA2-PSK / SAE-transition)
         // is upgraded to WPA3-SAE, so the AP advertises an MFPR|MFPC RSN that a
         // spec-compliant Wi-Fi 7 client will accept.
-        let mut c = Config { phy: PhyMode::Eht, ..Config::default() };
+        let mut c = Config {
+            phy: PhyMode::Eht,
+            ..Config::default()
+        };
         assert_eq!(c.key_mgmt, KeyMgmt::Psk);
-        assert_eq!(c.effective_key_mgmt(), KeyMgmt::Sae, "EHT + PSK must advertise SAE/PMF");
+        assert_eq!(
+            c.effective_key_mgmt(),
+            KeyMgmt::Sae,
+            "EHT + PSK must advertise SAE/PMF"
+        );
         assert_eq!(c.build_ap().security_mode(), SecurityMode::Wpa3Sae);
 
         c.key_mgmt = KeyMgmt::SaeTransition; // transition is only MFPC, not MFPR
-        assert_eq!(c.effective_key_mgmt(), KeyMgmt::Sae, "EHT + transition must advertise SAE/PMF");
+        assert_eq!(
+            c.effective_key_mgmt(),
+            KeyMgmt::Sae,
+            "EHT + transition must advertise SAE/PMF"
+        );
 
         // OWE is already PMF-protected; SAE is already correct — both unchanged.
         c.key_mgmt = KeyMgmt::Owe;
@@ -490,8 +741,16 @@ mod tests {
 
         // Non-EHT PHYs keep WPA2-PSK (PMF is not mandated below 11be).
         for phy in [PhyMode::Ht, PhyMode::Vht, PhyMode::He] {
-            let c = Config { phy, key_mgmt: KeyMgmt::Psk, ..Config::default() };
-            assert_eq!(c.effective_key_mgmt(), KeyMgmt::Psk, "{phy:?} must stay WPA2-PSK");
+            let c = Config {
+                phy,
+                key_mgmt: KeyMgmt::Psk,
+                ..Config::default()
+            };
+            assert_eq!(
+                c.effective_key_mgmt(),
+                KeyMgmt::Psk,
+                "{phy:?} must stay WPA2-PSK"
+            );
             assert_eq!(c.build_ap().security_mode(), SecurityMode::Wpa2);
         }
     }
@@ -509,7 +768,11 @@ mod tests {
         cfg.validate().expect("valid");
         assert_eq!(cfg.bss.len(), 2);
         assert_eq!(cfg.bss[0].ssid, "guest");
-        assert_eq!(cfg.bss[0].key_mgmt, KeyMgmt::Psk, "inherits primary default");
+        assert_eq!(
+            cfg.bss[0].key_mgmt,
+            KeyMgmt::Psk,
+            "inherits primary default"
+        );
         assert_eq!(cfg.bss[1].key_mgmt, KeyMgmt::Sae);
         assert_eq!(cfg.bss[1].mac, mac_to_bytes("02:00:00:00:00:20"));
         // build_bss_ap inherits the primary radio params, keeps the BSS identity.
@@ -524,17 +787,26 @@ mod tests {
         let json = r#"{ "ssid": "main", "passphrase": "password1234", "mac": "02:00:00:00:00:10", "mode": "netlink",
             "bss": [ { "ssid": "guest", "psk": "guestpass123", "mac": "02:00:00:00:00:10" } ] }"#;
         let cfg = Config::from_json(json).expect("parses");
-        assert!(cfg.validate().is_err(), "BSSID duplicating the primary must be rejected");
+        assert!(
+            cfg.validate().is_err(),
+            "BSSID duplicating the primary must be rejected"
+        );
     }
 
     #[test]
     fn bss_requires_ssid_and_mac() {
         let no_mac = r#"{ "ssid": "main", "passphrase": "password1234",
             "bss": [ { "ssid": "guest", "psk": "guestpass123" } ] }"#;
-        assert!(Config::from_json(no_mac).is_err(), "a BSS without a BSSID must be rejected");
+        assert!(
+            Config::from_json(no_mac).is_err(),
+            "a BSS without a BSSID must be rejected"
+        );
         let no_ssid = r#"{ "ssid": "main", "passphrase": "password1234",
             "bss": [ { "mac": "02:00:00:00:00:10", "psk": "guestpass123" } ] }"#;
-        assert!(Config::from_json(no_ssid).is_err(), "a BSS without an SSID must be rejected");
+        assert!(
+            Config::from_json(no_ssid).is_err(),
+            "a BSS without an SSID must be rejected"
+        );
     }
 
     #[test]
@@ -549,7 +821,9 @@ mod tests {
             "mac": "02:aa:bb:cc:dd:ee",
             "ip": "192.168.5.1",
             "ocv": true,
-            "per_sta_vif": true
+            "per_sta_vif": true,
+            "spr_api_socket": "/state/wifi/apisock",
+            "spr_dhcp_helper": "/hostap_dhcp_helper"
         }"#;
         let c = Config::from_json(json).unwrap();
         assert_eq!(c.ssid, "lab");
@@ -562,6 +836,8 @@ mod tests {
         assert_eq!(c.ip, [192, 168, 5, 1]);
         assert!(c.ocv);
         assert!(c.per_sta_vif);
+        assert_eq!(c.spr_api_socket.as_deref(), Some("/state/wifi/apisock"));
+        assert_eq!(c.spr_dhcp_helper.as_deref(), Some("/hostap_dhcp_helper"));
     }
 
     #[test]
@@ -622,7 +898,7 @@ mod tests {
         assert!(c.validate().is_err());
         c.key_mgmt = KeyMgmt::Sae;
         assert!(c.validate().is_ok()); // 6 GHz + SAE is fine
-        // OWE needs no passphrase
+                                       // OWE needs no passphrase
         let o = Config {
             key_mgmt: KeyMgmt::Owe,
             passphrase: String::new(),
@@ -635,8 +911,16 @@ mod tests {
     #[test]
     fn country_defaults_and_parses() {
         assert_eq!(Config::default().country, *b"US");
-        assert_eq!(Config::from_json(r#"{"country": "de"}"#).unwrap().country, *b"DE");
-        assert_eq!(Config::from_json(r#"{"country_code": "JP"}"#).unwrap().country, *b"JP");
+        assert_eq!(
+            Config::from_json(r#"{"country": "de"}"#).unwrap().country,
+            *b"DE"
+        );
+        assert_eq!(
+            Config::from_json(r#"{"country_code": "JP"}"#)
+                .unwrap()
+                .country,
+            *b"JP"
+        );
         assert!(Config::from_json(r#"{"country": "USA"}"#).is_err()); // not 2 letters
         assert!(Config::from_json(r#"{"country": "U1"}"#).is_err()); // not alphabetic
     }
@@ -657,7 +941,13 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(e.len(), 2);
         assert_eq!(e[0], (None, "onboardpass".to_string())); // wildcard
-        assert_eq!(e[1], (Some(mac_to_bytes("aa:bb:cc:dd:ee:ff")), "devicepass".to_string()));
+        assert_eq!(
+            e[1],
+            (
+                Some(mac_to_bytes("aa:bb:cc:dd:ee:ff")),
+                "devicepass".to_string()
+            )
+        );
         let c = Config::from_json(r#"{"psk_file": "/x"}"#).unwrap();
         assert_eq!(c.psk_file.as_deref(), Some("/x"));
     }

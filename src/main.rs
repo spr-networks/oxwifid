@@ -66,6 +66,9 @@ fn parse_args() -> Config {
             "--mode" => cfg.mode = next(i),
             "--iface" => cfg.iface = next(i),
             "--ctrl" => cfg.ctrl_path = Some(next(i)),
+            "--spr-api-socket" => cfg.spr_api_socket = Some(next(i)),
+            "--spr-dhcp-helper" => cfg.spr_dhcp_helper = Some(next(i)),
+            "--no-spr-dhcp-helper" => cfg.spr_dhcp_helper = None,
             "--sae" => cfg.key_mgmt = KeyMgmt::Sae,
             "--owe" => cfg.key_mgmt = KeyMgmt::Owe,
             "--transition" => cfg.key_mgmt = KeyMgmt::SaeTransition,
@@ -76,9 +79,13 @@ fn parse_args() -> Config {
             "--per-sta-vif" => cfg.per_sta_vif = true,
             "-h" | "--help" => {
                 eprintln!("barely-ap [--config FILE.json] [--ssid NAME] [--psk PASS] [--mac MAC]");
-                eprintln!("          [--channel N] [--ip IP] [--mode stdio|iface|netlink] [--iface NAME]");
+                eprintln!(
+                    "          [--channel N] [--ip IP] [--mode stdio|iface|netlink] [--iface NAME]"
+                );
                 eprintln!("          [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--band6] [--per-sta-vif]");
                 eprintln!("          [--ctrl PATH]   (netlink: hostapd-style control socket; multi-BSS via config `bss`)");
+                eprintln!("          [--spr-api-socket PATH] (direct SPR HTTP over a Unix socket; no action-script exec)");
+                eprintln!("          [--spr-dhcp-helper PATH] (invoke SPR DHCP/XDP helper for AP_VLAN clients)");
                 eprintln!("          [--country CC]  (2-letter regulatory code for the Country IE; default US)");
                 std::process::exit(0);
             }
@@ -130,9 +137,21 @@ fn main() {
     if cfg.mode == "netlink" {
         let extra: Vec<Ap> = cfg.bss.iter().map(|b| cfg.build_bss_ap(b)).collect();
         if !extra.is_empty() {
-            eprintln!("barely-ap: + {} additional BSS(es) on this radio", extra.len());
+            eprintln!(
+                "barely-ap: + {} additional BSS(es) on this radio",
+                extra.len()
+            );
         }
-        run_netlink(ap, extra, &cfg.iface, channel, cfg.ctrl_path.as_deref());
+        run_netlink(
+            ap,
+            extra,
+            &cfg.iface,
+            channel,
+            cfg.ctrl_path.as_deref(),
+            cfg.psk_file.as_deref(),
+            cfg.spr_api_socket.as_deref(),
+            cfg.spr_dhcp_helper.as_deref(),
+        );
         return;
     }
 
@@ -171,15 +190,42 @@ fn run_iface(_node: ApNode, _iface: &str, _channel: u8, _band6: bool) {
 }
 
 #[cfg(target_os = "linux")]
-fn run_netlink(ap: Ap, extra: Vec<Ap>, iface: &str, channel: u8, ctrl_path: Option<&str>) {
-    if let Err(e) = barely_ap::netlink::run_offload_aps(ap, extra, iface, channel, ctrl_path) {
+fn run_netlink(
+    ap: Ap,
+    extra: Vec<Ap>,
+    iface: &str,
+    channel: u8,
+    ctrl_path: Option<&str>,
+    psk_file: Option<&str>,
+    spr_api_socket: Option<&str>,
+    spr_dhcp_helper: Option<&str>,
+) {
+    if let Err(e) = barely_ap::netlink::run_offload_aps(
+        ap,
+        extra,
+        iface,
+        channel,
+        ctrl_path,
+        psk_file,
+        spr_api_socket,
+        spr_dhcp_helper,
+    ) {
         eprintln!("netlink AP failed on {iface}: {e}");
         std::process::exit(1);
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_netlink(_ap: Ap, _extra: Vec<Ap>, _iface: &str, _channel: u8, _ctrl_path: Option<&str>) {
+fn run_netlink(
+    _ap: Ap,
+    _extra: Vec<Ap>,
+    _iface: &str,
+    _channel: u8,
+    _ctrl_path: Option<&str>,
+    _psk_file: Option<&str>,
+    _spr_api_socket: Option<&str>,
+    _spr_dhcp_helper: Option<&str>,
+) {
     eprintln!("netlink mode is only supported on Linux; use --mode stdio");
     std::process::exit(1);
 }

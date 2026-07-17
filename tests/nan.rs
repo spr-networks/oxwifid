@@ -8,7 +8,10 @@ fn service_id_is_sha256_of_lowercased_name() {
     // SHA-256("foo") = 2c26b46b68ff... -> first 6 bytes is the service id.
     assert_eq!(to_hex(&nan::service_id("foo")), "2c26b46b68ff");
     // case-insensitive
-    assert_eq!(nan::service_id("Wi-Fi_Aware"), nan::service_id("wi-fi_aware"));
+    assert_eq!(
+        nan::service_id("Wi-Fi_Aware"),
+        nan::service_id("wi-fi_aware")
+    );
     // distinct names differ
     assert_ne!(nan::service_id("serviceA"), nan::service_id("serviceB"));
 }
@@ -28,7 +31,10 @@ fn sdf_build_parse_roundtrip() {
     // Public Action + NAN vendor type header
     assert_eq!(body[0], nan::WLAN_ACTION_PUBLIC);
     assert_eq!(body[1], nan::WLAN_PA_VENDOR_SPECIFIC);
-    assert_eq!(u32::from_be_bytes([body[2], body[3], body[4], body[5]]), nan::NAN_SDF_VENDOR_TYPE);
+    assert_eq!(
+        u32::from_be_bytes([body[2], body[3], body[4], body[5]]),
+        nan::NAN_SDF_VENDOR_TYPE
+    );
 
     let descriptors = nan::parse_sdf(&body).expect("parse");
     assert_eq!(descriptors.len(), 1);
@@ -42,7 +48,14 @@ fn sdf_build_parse_roundtrip() {
 #[test]
 fn parse_rejects_non_nan_action() {
     // wrong vendor type
-    let mut body = nan::build_sdf(nan::NAN_SRV_CTRL_SUBSCRIBE, &nan::service_id("x"), 1, 0, None, 2);
+    let mut body = nan::build_sdf(
+        nan::NAN_SRV_CTRL_SUBSCRIBE,
+        &nan::service_id("x"),
+        1,
+        0,
+        None,
+        2,
+    );
     body[2] ^= 0xff;
     assert!(nan::parse_sdf(&body).is_none());
 }
@@ -62,12 +75,19 @@ fn passive_subscriber_discovers_publisher() {
     for f in publisher.periodic_frames() {
         let (events, _) = subscriber.process_frame(&f);
         for e in events {
-            if let NanEvent::Discovered { peer, peer_instance, service_info, .. } = e {
+            if let NanEvent::Discovered {
+                peer,
+                peer_instance,
+                service_info,
+                ..
+            } = e
+            {
                 discovered = Some((peer, peer_instance, service_info));
             }
         }
     }
-    let (peer, peer_instance, info) = discovered.expect("subscriber must discover the published service");
+    let (peer, peer_instance, info) =
+        discovered.expect("subscriber must discover the published service");
     assert_eq!(peer, pub_mac);
     assert_eq!(peer_instance, pub_inst);
     assert_eq!(info.as_deref(), Some(&b"model=X100"[..]));
@@ -87,10 +107,18 @@ fn active_subscribe_triggers_solicited_publish_and_followup() {
     let mut solicited = Vec::new();
     for f in subscriber.periodic_frames() {
         let (events, responses) = publisher.process_frame(&f);
-        assert!(events.iter().any(|e| matches!(e, NanEvent::SubscribeReceived { .. })), "publisher must see the subscribe");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, NanEvent::SubscribeReceived { .. })),
+            "publisher must see the subscribe"
+        );
         solicited.extend(responses);
     }
-    assert!(!solicited.is_empty(), "publisher must answer with a solicited publish");
+    assert!(
+        !solicited.is_empty(),
+        "publisher must answer with a solicited publish"
+    );
 
     // subscriber processes the solicited publish -> discovery
     let mut peer_inst = None;

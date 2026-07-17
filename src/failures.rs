@@ -105,7 +105,12 @@ impl FailureLog {
         for r in self.records() {
             out.push_str(&format!(
                 "  {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  {:<24}  x{}  (traits {:#018x})\n",
-                r.mac[0], r.mac[1], r.mac[2], r.mac[3], r.mac[4], r.mac[5],
+                r.mac[0],
+                r.mac[1],
+                r.mac[2],
+                r.mac[3],
+                r.mac[4],
+                r.mac[5],
                 r.kind.label(),
                 r.count,
                 r.traits,

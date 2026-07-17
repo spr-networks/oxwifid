@@ -55,7 +55,14 @@ impl ServiceDescriptor {
 }
 
 /// Build a NAN Service Discovery Frame body (Public Action + NAN attributes).
-pub fn build_sdf(ctrl_type: u8, service_id: &[u8; 6], instance_id: u8, req_instance_id: u8, ssi: Option<&[u8]>, srv_proto_type: u8) -> Vec<u8> {
+pub fn build_sdf(
+    ctrl_type: u8,
+    service_id: &[u8; 6],
+    instance_id: u8,
+    req_instance_id: u8,
+    ssi: Option<&[u8]>,
+    srv_proto_type: u8,
+) -> Vec<u8> {
     let mut v = Vec::new();
     v.push(WLAN_ACTION_PUBLIC);
     v.push(WLAN_PA_VENDOR_SPECIFIC);
@@ -179,7 +186,10 @@ pub enum NanEvent {
     /// A publisher saw a peer subscribe to one of its services.
     SubscribeReceived { peer: [u8; 6], service_id: [u8; 6] },
     /// A Follow-up message arrived from a peer.
-    FollowupReceived { peer: [u8; 6], service_info: Option<Vec<u8>> },
+    FollowupReceived {
+        peer: [u8; 6],
+        service_info: Option<Vec<u8>>,
+    },
 }
 
 /// A NAN USD discovery engine for one device.
@@ -250,9 +260,23 @@ impl NanDe {
         let mut frames = Vec::new();
         for s in &services {
             let body = if s.is_publish {
-                build_sdf(NAN_SRV_CTRL_PUBLISH, &s.service_id, s.instance_id, 0, s.ssi.as_deref(), 2)
+                build_sdf(
+                    NAN_SRV_CTRL_PUBLISH,
+                    &s.service_id,
+                    s.instance_id,
+                    0,
+                    s.ssi.as_deref(),
+                    2,
+                )
             } else {
-                build_sdf(NAN_SRV_CTRL_SUBSCRIBE, &s.service_id, s.instance_id, 0, None, 2)
+                build_sdf(
+                    NAN_SRV_CTRL_SUBSCRIBE,
+                    &s.service_id,
+                    s.instance_id,
+                    0,
+                    None,
+                    2,
+                )
             };
             frames.push(self.wrap(NAN_NETWORK_ID, &body));
         }
@@ -260,8 +284,22 @@ impl NanDe {
     }
 
     /// Build a unicast Follow-up SDF to a discovered peer.
-    pub fn followup(&mut self, peer: [u8; 6], peer_instance: u8, my_instance: u8, sid: &[u8; 6], ssi: &[u8]) -> Vec<u8> {
-        let body = build_sdf(NAN_SRV_CTRL_FOLLOW_UP, sid, my_instance, peer_instance, Some(ssi), 2);
+    pub fn followup(
+        &mut self,
+        peer: [u8; 6],
+        peer_instance: u8,
+        my_instance: u8,
+        sid: &[u8; 6],
+        ssi: &[u8],
+    ) -> Vec<u8> {
+        let body = build_sdf(
+            NAN_SRV_CTRL_FOLLOW_UP,
+            sid,
+            my_instance,
+            peer_instance,
+            Some(ssi),
+            2,
+        );
         self.wrap(peer, &body)
     }
 
@@ -289,7 +327,12 @@ impl NanDe {
 
         for d in descriptors {
             let t = d.ctrl_type();
-            if t == NAN_SRV_CTRL_PUBLISH && self.services.iter().any(|s| !s.is_publish && s.service_id == d.service_id) {
+            if t == NAN_SRV_CTRL_PUBLISH
+                && self
+                    .services
+                    .iter()
+                    .any(|s| !s.is_publish && s.service_id == d.service_id)
+            {
                 // A subscriber matches a peer's publish.
                 events.push(NanEvent::Discovered {
                     peer,
@@ -300,13 +343,33 @@ impl NanDe {
             } else if t == NAN_SRV_CTRL_SUBSCRIBE {
                 // A publisher answers a matching subscribe with a solicited
                 // (unicast) Publish SDF.
-                let matching: Vec<Service> = self.services.iter().filter(|s| s.is_publish && s.service_id == d.service_id).cloned().collect();
+                let matching: Vec<Service> = self
+                    .services
+                    .iter()
+                    .filter(|s| s.is_publish && s.service_id == d.service_id)
+                    .cloned()
+                    .collect();
                 for s in matching {
-                    events.push(NanEvent::SubscribeReceived { peer, service_id: d.service_id });
-                    let resp = build_sdf(NAN_SRV_CTRL_PUBLISH, &s.service_id, s.instance_id, d.instance_id, s.ssi.as_deref(), 2);
+                    events.push(NanEvent::SubscribeReceived {
+                        peer,
+                        service_id: d.service_id,
+                    });
+                    let resp = build_sdf(
+                        NAN_SRV_CTRL_PUBLISH,
+                        &s.service_id,
+                        s.instance_id,
+                        d.instance_id,
+                        s.ssi.as_deref(),
+                        2,
+                    );
                     responses.push(self.wrap(peer, &resp));
                 }
-            } else if t == NAN_SRV_CTRL_FOLLOW_UP && self.services.iter().any(|s| s.instance_id == d.requestor_instance_id) {
+            } else if t == NAN_SRV_CTRL_FOLLOW_UP
+                && self
+                    .services
+                    .iter()
+                    .any(|s| s.instance_id == d.requestor_instance_id)
+            {
                 // Follow-up addressed to one of our service instances.
                 events.push(NanEvent::FollowupReceived {
                     peer,

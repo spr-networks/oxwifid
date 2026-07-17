@@ -312,11 +312,17 @@ fn sswu(c: &Curve, u: &BigUint) -> Point {
     let x1 = if m_is_zero { x1a } else { x1b };
 
     // gx1 = x1^3 + a*x1 + b
-    let gx1 = c.fadd(&c.fadd(&c.fmul(&c.fmul(&x1, &x1), &x1), &c.fmul(&c.a, &x1)), &c.b);
+    let gx1 = c.fadd(
+        &c.fadd(&c.fmul(&c.fmul(&x1, &x1), &x1), &c.fmul(&c.a, &x1)),
+        &c.b,
+    );
     // x2 = z*u^2*x1
     let x2 = c.fmul(&c.fmul(&z, &u2), &x1);
     // gx2 = x2^3 + a*x2 + b
-    let gx2 = c.fadd(&c.fadd(&c.fmul(&c.fmul(&x2, &x2), &x2), &c.fmul(&c.a, &x2)), &c.b);
+    let gx2 = c.fadd(
+        &c.fadd(&c.fmul(&c.fmul(&x2, &x2), &x2), &c.fmul(&c.a, &x2)),
+        &c.b,
+    );
 
     let gx1_is_qr = c.is_qr(&gx1);
     let v = if gx1_is_qr { gx1.clone() } else { gx2.clone() };
@@ -370,7 +376,12 @@ pub fn derive_pt(c: &Curve, ssid: &[u8], password: &[u8], identifier: Option<&[u
 
 /// Legacy hunting-and-pecking PWE derivation (IEEE 802.11 12.4.4.3.2), the
 /// non-H2E method. Iterates a counter until a valid x with a QR y^2 is found.
-pub fn derive_pwe_hunting_pecking(c: &Curve, password: &[u8], addr1: &[u8; 6], addr2: &[u8; 6]) -> Option<Point> {
+pub fn derive_pwe_hunting_pecking(
+    c: &Curve,
+    password: &[u8],
+    addr1: &[u8; 6],
+    addr2: &[u8; 6],
+) -> Option<Point> {
     let (max, min) = max_min_addr(addr1, addr2);
     let mut salt = [0u8; 12];
     salt[..6].copy_from_slice(&max);
@@ -390,7 +401,12 @@ pub fn derive_pwe_hunting_pecking(c: &Curve, password: &[u8], addr1: &[u8; 6], a
         // pwd-seed = HMAC-SHA256(MAX||MIN, password || counter)
         let pwd_seed = hmac_sha256(&salt, &[password, &[counter]]);
         // pwd-value = KDF-256(pwd-seed, "SAE Hunting and Pecking", p)
-        let pwd_value = sha256_prf(&pwd_seed, b"SAE Hunting and Pecking", &prime_bytes, PRIME_LEN);
+        let pwd_value = sha256_prf(
+            &pwd_seed,
+            b"SAE Hunting and Pecking",
+            &prime_bytes,
+            PRIME_LEN,
+        );
         let x = BigUint::from_bytes_be(&pwd_value);
         // Always run the QR test (on a fixed in-range dummy when x >= p) so the
         // expensive modular exponentiation happens every iteration.
@@ -463,7 +479,13 @@ fn rand_scalar(n: &BigUint) -> BigUint {
 
 impl Sae {
     /// Create an SAE instance for H2E group 19 with the PWE for this addr pair.
-    pub fn new_h2e(ssid: &[u8], password: &[u8], identifier: Option<&[u8]>, addr1: &[u8; 6], addr2: &[u8; 6]) -> Sae {
+    pub fn new_h2e(
+        ssid: &[u8],
+        password: &[u8],
+        identifier: Option<&[u8]>,
+        addr1: &[u8; 6],
+        addr2: &[u8; 6],
+    ) -> Sae {
         let curve = Curve::p256();
         let pt = derive_pt(&curve, ssid, password, identifier);
         let pwe = derive_pwe_from_pt(&curve, &pt, addr1, addr2);
@@ -485,7 +507,8 @@ impl Sae {
     /// Generate the commit scalar and element. With `fixed` set (tests), use the
     /// given rand/mask instead of fresh randomness.
     pub fn prepare_commit(&mut self, fixed: Option<(BigUint, BigUint)>) {
-        let (rand, mask) = fixed.unwrap_or_else(|| (rand_scalar(&self.curve.n), rand_scalar(&self.curve.n)));
+        let (rand, mask) =
+            fixed.unwrap_or_else(|| (rand_scalar(&self.curve.n), rand_scalar(&self.curve.n)));
         self.rand = rand.clone();
         self.commit_scalar = (&rand + &mask) % &self.curve.n;
         // COMMIT-ELEMENT = inverse(mask * PWE) == -(mask * PWE)
@@ -498,7 +521,12 @@ impl Sae {
         let mut v = Vec::with_capacity(2 + 3 * PRIME_LEN);
         v.extend_from_slice(&SAE_GROUP_19.to_le_bytes());
         v.extend_from_slice(&scalar_to_bin(&self.commit_scalar));
-        v.extend_from_slice(&self.curve.point_to_bin(&self.commit_element).expect("finite element"));
+        v.extend_from_slice(
+            &self
+                .curve
+                .point_to_bin(&self.commit_element)
+                .expect("finite element"),
+        );
         v
     }
 
@@ -565,7 +593,14 @@ impl Sae {
         self.pmkid = context[..16].to_vec();
     }
 
-    fn cn_confirm(&self, sc: u16, scalar1: &BigUint, elem1: &Point, scalar2: &BigUint, elem2: &Point) -> [u8; 32] {
+    fn cn_confirm(
+        &self,
+        sc: u16,
+        scalar1: &BigUint,
+        elem1: &Point,
+        scalar2: &BigUint,
+        elem2: &Point,
+    ) -> [u8; 32] {
         let s1 = scalar_to_bin(scalar1);
         let e1 = self.curve.point_to_bin(elem1).expect("finite");
         let s2 = scalar_to_bin(scalar2);
@@ -579,7 +614,13 @@ impl Sae {
         let sc = self.send_confirm;
         let peer_scalar = self.peer_scalar.clone().expect("peer scalar");
         let peer_element = self.peer_element.clone().expect("peer element");
-        let confirm = self.cn_confirm(sc, &self.commit_scalar, &self.commit_element, &peer_scalar, &peer_element);
+        let confirm = self.cn_confirm(
+            sc,
+            &self.commit_scalar,
+            &self.commit_element,
+            &peer_scalar,
+            &peer_element,
+        );
         let mut v = Vec::with_capacity(2 + 32);
         v.extend_from_slice(&sc.to_le_bytes());
         v.extend_from_slice(&confirm);
@@ -595,7 +636,13 @@ impl Sae {
         let peer_scalar = self.peer_scalar.clone().ok_or(SaeError::NotReady)?;
         let peer_element = self.peer_element.clone().ok_or(SaeError::NotReady)?;
         // verifier = CN(KCK, peer-sc, peer-scalar, peer-element, own-scalar, own-element)
-        let verifier = self.cn_confirm(sc, &peer_scalar, &peer_element, &self.commit_scalar, &self.commit_element);
+        let verifier = self.cn_confirm(
+            sc,
+            &peer_scalar,
+            &peer_element,
+            &self.commit_scalar,
+            &self.commit_element,
+        );
         if crate::crypto::constant_time_eq(&verifier, &data[2..2 + 32]) {
             Ok(())
         } else {
@@ -689,7 +736,13 @@ fn point_from_x(curve: &Curve, x_bytes: &[u8]) -> Option<Point> {
 /// Derive the OWE PMK and PMKID (RFC 8110 §4.4). `sta_pub`/`ap_pub` are the
 /// public keys as exchanged (bare X-coordinates); `peer_pub_bytes` is the
 /// *other* party's X. Both sides compute the same result.
-pub fn owe_derive(priv_k: &BigUint, peer_pub_bytes: &[u8], sta_pub: &[u8], ap_pub: &[u8], group: u16) -> Option<([u8; 32], [u8; 16])> {
+pub fn owe_derive(
+    priv_k: &BigUint,
+    peer_pub_bytes: &[u8],
+    sta_pub: &[u8],
+    ap_pub: &[u8],
+    group: u16,
+) -> Option<([u8; 32], [u8; 16])> {
     let curve = Curve::p256();
     let peer_pub = point_from_x(&curve, peer_pub_bytes)?;
     let shared = curve.scalar_mul(priv_k, &peer_pub);

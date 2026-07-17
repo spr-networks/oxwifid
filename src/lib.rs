@@ -1,18 +1,20 @@
 //! barely-ap: a minimal WPA2/CCMP 802.11 access point, ported from the
 //! Python/Scapy reference implementation.
 
+pub mod ap;
+pub mod client;
 pub mod config;
 pub mod control;
 pub mod crypto;
 pub mod dot11;
 pub mod failures;
 pub mod fakenet;
-pub mod ap;
-pub mod client;
 pub mod nan;
 pub mod netlink;
 pub mod raw_frames;
 pub mod sae;
+#[cfg(unix)]
+pub mod spr;
 pub mod util;
 
 /// Backwards-compatible alias for the transport/event-loop layer, which moved

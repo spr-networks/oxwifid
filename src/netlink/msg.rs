@@ -40,11 +40,20 @@ pub struct Attr {
 }
 
 impl Attr {
+    pub fn u8(typ: u16, v: u8) -> Attr {
+        Attr { typ, data: vec![v] }
+    }
     pub fn u32(typ: u16, v: u32) -> Attr {
-        Attr { typ, data: v.to_ne_bytes().to_vec() }
+        Attr {
+            typ,
+            data: v.to_ne_bytes().to_vec(),
+        }
     }
     pub fn u16v(typ: u16, v: u16) -> Attr {
-        Attr { typ, data: v.to_ne_bytes().to_vec() }
+        Attr {
+            typ,
+            data: v.to_ne_bytes().to_vec(),
+        }
     }
     /// A null-terminated string attribute (generic-netlink convention).
     pub fn string(typ: u16, s: &str) -> Attr {
@@ -53,14 +62,20 @@ impl Attr {
         Attr { typ, data }
     }
     pub fn bytes(typ: u16, b: &[u8]) -> Attr {
-        Attr { typ, data: b.to_vec() }
+        Attr {
+            typ,
+            data: b.to_vec(),
+        }
     }
     pub fn nested(typ: u16, attrs: &[Attr]) -> Attr {
         let mut data = Vec::new();
         for a in attrs {
             a.encode(&mut data);
         }
-        Attr { typ: typ | NLA_F_NESTED, data }
+        Attr {
+            typ: typ | NLA_F_NESTED,
+            data,
+        }
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
@@ -149,7 +164,12 @@ impl ParsedNlmsg<'_> {
     /// For NLMSG_ERROR: the (negated) errno in the first 4 bytes.
     pub fn error_code(&self) -> Option<i32> {
         if self.typ == NLMSG_ERROR && self.payload.len() >= 4 {
-            Some(i32::from_ne_bytes([self.payload[0], self.payload[1], self.payload[2], self.payload[3]]))
+            Some(i32::from_ne_bytes([
+                self.payload[0],
+                self.payload[1],
+                self.payload[2],
+                self.payload[3],
+            ]))
         } else {
             None
         }
@@ -238,7 +258,10 @@ mod tests {
         // MCAST_GROUPS containing one group {NAME="mlme", ID=7}.
         let group = Attr::nested(
             1, // index within MCAST_GROUPS
-            &[Attr::u32(CTRL_ATTR_MCAST_GRP_ID, 7), Attr::string(CTRL_ATTR_MCAST_GRP_NAME, "mlme")],
+            &[
+                Attr::u32(CTRL_ATTR_MCAST_GRP_ID, 7),
+                Attr::string(CTRL_ATTR_MCAST_GRP_NAME, "mlme"),
+            ],
         );
         let msg = GenlMessage::new(GENL_ID_CTRL, 1, 0, 1)
             .attr(Attr::u16v(CTRL_ATTR_FAMILY_ID, 0x1c))

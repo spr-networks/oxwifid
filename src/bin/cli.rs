@@ -104,14 +104,21 @@ fn main() {
     client.set_wmm_tid(wmm_tid);
     if let (Some(m), Some(l1), Some(am)) = (mld_mac, link1_mac, ap_mld_mac) {
         client.enable_mld(m, l1, am);
-        eprintln!("MLD enabled: mld={} link1={} ap_mld={} pause_m3={pause_m3}",
-                  barely_ap::util::bytes_to_mac(&m), barely_ap::util::bytes_to_mac(&l1),
-                  barely_ap::util::bytes_to_mac(&am));
+        eprintln!(
+            "MLD enabled: mld={} link1={} ap_mld={} pause_m3={pause_m3}",
+            barely_ap::util::bytes_to_mac(&m),
+            barely_ap::util::bytes_to_mac(&l1),
+            barely_ap::util::bytes_to_mac(&am)
+        );
     }
     if pause_m3 {
         client.set_pause_m3();
     }
-    let ping_cfg = if ping { Some((gw_mac, src_ip, gw_ip)) } else { None };
+    let ping_cfg = if ping {
+        Some((gw_mac, src_ip, gw_ip))
+    } else {
+        None
+    };
     let mut node = ClientNode::new(client, Duration::from_millis(20), ping_cfg);
     node.ping_tos = dscp;
     match mode.as_str() {

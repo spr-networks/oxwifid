@@ -84,7 +84,9 @@ fn dhcp_request_yields_ack_same_ip() {
     let v = vectors();
     let mut net = new_net();
     // discover first so the lease is the same, then request
-    net.input(&from_hex(v["net"]["dhcp_discover"]["eth"].as_str().unwrap()));
+    net.input(&from_hex(
+        v["net"]["dhcp_discover"]["eth"].as_str().unwrap(),
+    ));
     let replies = net.input(&from_hex(v["net"]["dhcp_request"]["eth"].as_str().unwrap()));
     assert_eq!(replies.len(), 1);
     let e = parse_eth(&replies[0]);
@@ -100,15 +102,25 @@ fn dhcp_request_yields_ack_same_ip() {
 fn arp_who_has_gateway_is_answered() {
     let v = vectors();
     let mut net = new_net();
-    let replies = net.input(&from_hex(v["net"]["arp_who_has_gw"]["eth"].as_str().unwrap()));
+    let replies = net.input(&from_hex(
+        v["net"]["arp_who_has_gw"]["eth"].as_str().unwrap(),
+    ));
     assert_eq!(replies.len(), 1);
     let e = parse_eth(&replies[0]);
     assert_eq!(e.ethertype, 0x0806);
     let arp = e.payload;
     assert_eq!(u16::from_be_bytes([arp[6], arp[7]]), 2, "ARP reply");
-    assert_eq!(&arp[8..14], &mac_to_bytes("02:00:00:00:00:00"), "gateway MAC");
+    assert_eq!(
+        &arp[8..14],
+        &mac_to_bytes("02:00:00:00:00:00"),
+        "gateway MAC"
+    );
     assert_eq!(&arp[14..18], &[10, 10, 10, 1], "gateway IP");
-    assert_eq!(&arp[18..24], &mac_to_bytes("02:00:00:00:ab:cd"), "target = requester");
+    assert_eq!(
+        &arp[18..24],
+        &mac_to_bytes("02:00:00:00:ab:cd"),
+        "target = requester"
+    );
 }
 
 #[test]
@@ -131,7 +143,10 @@ fn icmp_echo_to_gateway_is_answered() {
     let id = u16::from_be_bytes([icmp[4], icmp[5]]);
     let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
     assert_eq!(id as u64, v["net"]["icmp_echo_gw"]["id"].as_u64().unwrap());
-    assert_eq!(seq as u64, v["net"]["icmp_echo_gw"]["seq"].as_u64().unwrap());
+    assert_eq!(
+        seq as u64,
+        v["net"]["icmp_echo_gw"]["seq"].as_u64().unwrap()
+    );
     assert_eq!(&icmp[8..18], b"abcdefghij", "payload echoed");
 }
 

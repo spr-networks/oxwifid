@@ -52,21 +52,34 @@ fn ap_with_file(entries: &[(Option<[u8; 6]>, &str)]) -> (Ap, FakeNet) {
     (ap, FakeNet::new(ap_mac, [10, 10, 10, 1]))
 }
 
+fn sae_ap_with_file(entries: &[(Option<[u8; 6]>, &str)]) -> (Ap, FakeNet) {
+    let (mut ap, net) = ap_with_file(entries);
+    ap.enable_sae();
+    (ap, net)
+}
+
 #[test]
 fn wildcard_onboarding_authenticates() {
     // Only a wildcard entry: any MAC using that password gets on.
     let (mut ap, mut net) = ap_with_file(&[(None, "onboardpass")]);
     let mut sta = Client::new("pnet", "onboardpass", mac_to_bytes("02:00:00:00:00:aa"));
-    assert_eq!(try_connect(&mut ap, &mut net, &mut sta), 4, "wildcard onboarding failed");
+    assert_eq!(
+        try_connect(&mut ap, &mut net, &mut sta),
+        4,
+        "wildcard onboarding failed"
+    );
 }
 
 #[test]
 fn mac_specific_password_authenticates() {
     let sta_mac = mac_to_bytes("02:00:00:00:00:bb");
-    let (mut ap, mut net) =
-        ap_with_file(&[(None, "onboardpass"), (Some(sta_mac), "devicepass")]);
+    let (mut ap, mut net) = ap_with_file(&[(None, "onboardpass"), (Some(sta_mac), "devicepass")]);
     let mut sta = Client::new("pnet", "devicepass", sta_mac);
-    assert_eq!(try_connect(&mut ap, &mut net, &mut sta), 4, "mac-specific password failed");
+    assert_eq!(
+        try_connect(&mut ap, &mut net, &mut sta),
+        4,
+        "mac-specific password failed"
+    );
 }
 
 #[test]
@@ -74,19 +87,25 @@ fn wildcard_fallback_when_mac_entry_exists() {
     // The station HAS a MAC-specific entry but connects with the wildcard
     // password: the candidate loop must fall past the MAC entry to the wildcard.
     let sta_mac = mac_to_bytes("02:00:00:00:00:cc");
-    let (mut ap, mut net) =
-        ap_with_file(&[(None, "onboardpass"), (Some(sta_mac), "devicepass")]);
+    let (mut ap, mut net) = ap_with_file(&[(None, "onboardpass"), (Some(sta_mac), "devicepass")]);
     let mut sta = Client::new("pnet", "onboardpass", sta_mac);
-    assert_eq!(try_connect(&mut ap, &mut net, &mut sta), 4, "wildcard fallback failed");
+    assert_eq!(
+        try_connect(&mut ap, &mut net, &mut sta),
+        4,
+        "wildcard fallback failed"
+    );
 }
 
 #[test]
 fn wrong_password_is_rejected() {
     let sta_mac = mac_to_bytes("02:00:00:00:00:dd");
-    let (mut ap, mut net) =
-        ap_with_file(&[(None, "onboardpass"), (Some(sta_mac), "devicepass")]);
+    let (mut ap, mut net) = ap_with_file(&[(None, "onboardpass"), (Some(sta_mac), "devicepass")]);
     let mut sta = Client::new("pnet", "totally-wrong", sta_mac);
-    assert_ne!(try_connect(&mut ap, &mut net, &mut sta), 4, "wrong password wrongly accepted");
+    assert_ne!(
+        try_connect(&mut ap, &mut net, &mut sta),
+        4,
+        "wrong password wrongly accepted"
+    );
 }
 
 #[test]
@@ -95,14 +114,39 @@ fn re_auth_with_different_password_after_pin() {
     // with its now-assigned device password — the stale wildcard pin must be
     // cleared so the MAC-specific candidate matches.
     let sta_mac = mac_to_bytes("02:00:00:00:00:ee");
-    let (mut ap, mut net) =
-        ap_with_file(&[(None, "onboardpass"), (Some(sta_mac), "devicepass")]);
+    let (mut ap, mut net) = ap_with_file(&[(None, "onboardpass"), (Some(sta_mac), "devicepass")]);
     let mut sta1 = Client::new("pnet", "onboardpass", sta_mac);
-    assert_eq!(try_connect(&mut ap, &mut net, &mut sta1), 4, "onboarding failed");
+    assert_eq!(
+        try_connect(&mut ap, &mut net, &mut sta1),
+        4,
+        "onboarding failed"
+    );
     // A real reconnect is seconds/minutes later; clear the 250ms retransmit
     // backoff so this instant same-MAC re-auth is treated as a genuine session.
     ap.test_clear_auth_backoff();
     // Same MAC comes back with the device password.
     let mut sta2 = Client::new("pnet", "devicepass", sta_mac);
-    assert_eq!(try_connect(&mut ap, &mut net, &mut sta2), 4, "re-auth with device pw failed");
+    assert_eq!(
+        try_connect(&mut ap, &mut net, &mut sta2),
+        4,
+        "re-auth with device pw failed"
+    );
+}
+
+#[test]
+fn sae_uses_mac_specific_credential() {
+    let sta_mac = mac_to_bytes("02:00:00:00:00:f1");
+    let (mut ap, mut net) = sae_ap_with_file(&[(Some(sta_mac), "devicepass")]);
+    let mut sta = Client::new("pnet", "devicepass", sta_mac);
+    sta.enable_sae();
+    assert_eq!(try_connect(&mut ap, &mut net, &mut sta), 4);
+}
+
+#[test]
+fn sae_uses_configured_fallback_for_unlisted_station() {
+    let allowed = mac_to_bytes("02:00:00:00:00:f1");
+    let (mut ap, mut net) = sae_ap_with_file(&[(Some(allowed), "devicepass")]);
+    let mut sta = Client::new("pnet", "the-default-psk", mac_to_bytes("02:00:00:00:00:f2"));
+    sta.enable_sae();
+    assert_eq!(try_connect(&mut ap, &mut net, &mut sta), 4);
 }

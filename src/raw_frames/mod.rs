@@ -52,7 +52,9 @@ pub trait Node {
 /// The event loop: tick on a timer, and dispatch every inbound frame to `node`.
 pub fn run<L: Link, N: Node>(mut node: N, mut link: L) {
     let interval = node.tick_interval();
-    let mut last_tick = Instant::now().checked_sub(interval).unwrap_or_else(Instant::now);
+    let mut last_tick = Instant::now()
+        .checked_sub(interval)
+        .unwrap_or_else(Instant::now);
     loop {
         let now = Instant::now();
         if now.duration_since(last_tick) >= interval {
@@ -134,7 +136,11 @@ pub struct ClientNode {
 }
 
 impl ClientNode {
-    pub fn new(client: Client, tick: Duration, ping_gateway: Option<([u8; 6], [u8; 4], [u8; 4])>) -> ClientNode {
+    pub fn new(
+        client: Client,
+        tick: Duration,
+        ping_gateway: Option<([u8; 6], [u8; 4], [u8; 4])>,
+    ) -> ClientNode {
         ClientNode {
             client,
             tick,
@@ -159,7 +165,9 @@ impl Node for ClientNode {
         }
         if self.client.connected == 4 && !self.pinged {
             if let Some((gw_mac, src_ip, gw_ip)) = self.ping_gateway {
-                let eth = self.client.build_ping(&gw_mac, src_ip, gw_ip, self.ping_tos);
+                let eth = self
+                    .client
+                    .build_ping(&gw_mac, src_ip, gw_ip, self.ping_tos);
                 if let Some(f) = self.client.encrypt_uplink(&eth) {
                     frames.push(f);
                     self.pinged = true;
@@ -212,7 +220,8 @@ pub(crate) fn extract_frames(buf: &[u8]) -> (Vec<Vec<u8>>, usize) {
     let mut frames = Vec::new();
     let mut off = 0;
     while buf.len() - off >= 4 {
-        let wanted = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+        let wanted =
+            u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
         if buf.len() - off < 4 + wanted {
             break;
         }

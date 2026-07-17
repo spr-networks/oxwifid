@@ -59,7 +59,8 @@ pub fn sha256_prf(key: &[u8], label: &[u8], context: &[u8], out_len: usize) -> V
     let bits_le = ((out_len * 8) as u16).to_le_bytes();
     let mut counter: u16 = 1;
     while out.len() < out_len {
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts any key length");
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts any key length");
         mac.update(&counter.to_le_bytes());
         mac.update(label);
         mac.update(context);
@@ -74,7 +75,13 @@ pub fn sha256_prf(key: &[u8], label: &[u8], context: &[u8], out_len: usize) -> V
 
 /// Derive the PTK for SHA-256 AKMs (e.g. SAE): 48 bytes = KCK(16)||KEK(16)||TK(16).
 /// Context is `Min(aa,spa) || Max(aa,spa) || Min(anonce,snonce) || Max(anonce,snonce)`.
-pub fn derive_ptk_sha256(pmk: &[u8], aa: &[u8; 6], spa: &[u8; 6], anonce: &[u8; 32], snonce: &[u8; 32]) -> [u8; 48] {
+pub fn derive_ptk_sha256(
+    pmk: &[u8],
+    aa: &[u8; 6],
+    spa: &[u8; 6],
+    anonce: &[u8; 32],
+    snonce: &[u8; 32],
+) -> [u8; 48] {
     let (mac_lo, mac_hi) = if aa <= spa { (aa, spa) } else { (spa, aa) };
     let (n_lo, n_hi): (&[u8], &[u8]) = if anonce <= snonce {
         (anonce, snonce)
@@ -201,7 +208,13 @@ pub fn ctr_encrypt(key: &[u8], nonce: &[u8; 13], data: &[u8]) -> Vec<u8> {
 
 /// CBC-MAC over the CCM* formatted blocks, finalised against S_0. Mirrors
 /// `CCMPCrypto.cbc_mac` with the default `mac_len = 8`.
-pub fn cbc_mac(key: &[u8], plaintext: &[u8], aad: &[u8], nonce: &[u8; 13], mac_len: usize) -> Vec<u8> {
+pub fn cbc_mac(
+    key: &[u8],
+    plaintext: &[u8],
+    aad: &[u8],
+    nonce: &[u8; 13],
+    mac_len: usize,
+) -> Vec<u8> {
     let has_aad = !aad.is_empty();
     let mp = (mac_len - 2) / 2;
     let flags = 64 * (has_aad as usize) + 8 * mp + 1; // q - 1 == 1
@@ -242,7 +255,12 @@ pub fn cbc_mac(key: &[u8], plaintext: &[u8], aad: &[u8], nonce: &[u8; 13], mac_l
 }
 
 /// Encrypt `plaintext`, returning `(ciphertext, tag)`.
-pub fn run_ccmp_encrypt(key: &[u8], nonce: &[u8; 13], aad: &[u8], plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
+pub fn run_ccmp_encrypt(
+    key: &[u8],
+    nonce: &[u8; 13],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
     let tag = cbc_mac(key, plaintext, aad, nonce, 8);
     let encrypted = ctr_encrypt(key, nonce, plaintext);
     (encrypted, tag)
@@ -361,10 +379,20 @@ pub fn pad_key_data(mut plain: Vec<u8>) -> Vec<u8> {
 ///
 /// `B = sorted(amac, smac) || sorted(anonce, snonce)` (lexicographic), exactly
 /// like `customPRF512`.
-pub fn custom_prf512(key: &[u8], amac: &[u8], smac: &[u8], anonce: &[u8], snonce: &[u8]) -> [u8; 64] {
+pub fn custom_prf512(
+    key: &[u8],
+    amac: &[u8],
+    smac: &[u8],
+    anonce: &[u8],
+    snonce: &[u8],
+) -> [u8; 64] {
     let a = b"Pairwise key expansion";
 
-    let (mac_lo, mac_hi) = if amac <= smac { (amac, smac) } else { (smac, amac) };
+    let (mac_lo, mac_hi) = if amac <= smac {
+        (amac, smac)
+    } else {
+        (smac, amac)
+    };
     let (nonce_lo, nonce_hi) = if anonce <= snonce {
         (anonce, snonce)
     } else {
