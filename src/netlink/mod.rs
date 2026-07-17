@@ -22,6 +22,7 @@ pub const NL80211_CMD_GET_WIPHY: u8 = 1;
 pub const NL80211_CMD_SET_KEY: u8 = 10;
 pub const NL80211_CMD_NEW_KEY: u8 = 11;
 pub const NL80211_CMD_DEL_KEY: u8 = 12;
+pub const NL80211_CMD_SET_BEACON: u8 = 14;
 pub const NL80211_CMD_START_AP: u8 = 15;
 pub const NL80211_CMD_STOP_AP: u8 = 16;
 pub const NL80211_CMD_GET_STATION: u8 = 17;
@@ -44,6 +45,7 @@ pub const NL80211_CMD_SET_INTERFACE: u8 = 6;
 pub const NL80211_CMD_SET_STATION: u8 = 18;
 pub const NL80211_CMD_NEW_STATION: u8 = 19;
 pub const NL80211_CMD_DEL_STATION: u8 = 20;
+pub const NL80211_CMD_SET_BSS: u8 = 25;
 pub const NL80211_CMD_REGISTER_FRAME: u8 = 58;
 pub const NL80211_CMD_FRAME: u8 = 59;
 pub const NL80211_CMD_FRAME_TX_STATUS: u8 = 60;
@@ -99,6 +101,17 @@ pub const NL80211_ATTR_STA_SUPPORTED_RATES: u16 = 19;
 pub const NL80211_ATTR_HT_CAPABILITY: u16 = 31;
 pub const NL80211_ATTR_VHT_CAPABILITY: u16 = 157;
 pub const NL80211_ATTR_HE_CAPABILITY: u16 = 269;
+pub const NL80211_ATTR_HE_6GHZ_CAPABILITY: u16 = 293;
+pub const NL80211_ATTR_EHT_CAPABILITY: u16 = 310;
+pub const NL80211_ATTR_EML_CAPABILITY: u16 = 317;
+pub const NL80211_ATTR_MLD_CAPA_AND_OPS: u16 = 318;
+pub const NL80211_ATTR_IFTYPE_EXT_CAPA: u16 = 230;
+// BSS parameters hostapd submits immediately after every START_AP/SET_BEACON.
+pub const NL80211_ATTR_BSS_CTS_PROT: u16 = 28;
+pub const NL80211_ATTR_BSS_SHORT_PREAMBLE: u16 = 29;
+pub const NL80211_ATTR_BSS_BASIC_RATES: u16 = 36;
+pub const NL80211_ATTR_AP_ISOLATE: u16 = 96;
+pub const NL80211_ATTR_BSS_HT_OPMODE: u16 = 109;
 
 // NL80211_ATTR_STA_INFO nested attributes used by hostapd's STA control reply.
 pub const NL80211_STA_INFO_SIGNAL: u16 = 7;
@@ -199,13 +212,16 @@ pub const NL80211_STA_FLAG_MFP: u32 = 4;
 pub const NL80211_STA_FLAG_AUTHENTICATED: u32 = 5;
 pub const NL80211_STA_FLAG_ASSOCIATED: u32 = 7;
 
-/// Management frame-control type+subtype values to register for, matching the
-/// frames the AP handles (probe req, auth, (re)assoc req).
-pub const REGISTER_SUBTYPES: [u16; 4] = [
+/// Management frame-control type+subtype values to register for, matching
+/// hostapd's AP MLME subscription. Deauth and disassoc are essential both for
+/// PMF validation and for promptly removing a station that leaves.
+pub const REGISTER_SUBTYPES: [u16; 6] = [
     0x0040, // probe request  (subtype 4)
     0x00b0, // authentication (subtype 11)
     0x0000, // association request
     0x0020, // reassociation request
+    0x00a0, // disassociation (subtype 10)
+    0x00c0, // deauthentication (subtype 12)
 ];
 
 /// Whether a 5 GHz chandef (center channel + width in MHz) overlaps a DFS radar

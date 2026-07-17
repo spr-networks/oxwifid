@@ -34,13 +34,20 @@ overrides:
 barely-ap --config barely-ap.json
 barely-ap [--config FILE.json] [--ssid NAME] [--psk PASS] [--mac AA:BB:CC:DD:EE:FF]
           [--channel N] [--ip 10.10.10.1] [--mode stdio|iface|netlink] [--iface wlanN]
-          [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--band6] [--per-sta-vif]
+          [--band 2.4|5|6] [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--per-sta-vif]
 ```
 
 The config file (see `barely-ap.example.json`) sets `ssid`, `passphrase`,
 `key_mgmt` (`psk`/`sae`/`sae-transition`/`owe`), `channel`, `interface`, `mode`,
-`mac`, `ip`, and the feature toggles `ocv`, `btm`, `rnr`, `band6`, `per_sta_vif`.
+`mac`, `ip`, explicit `band` (`2.4`, `5`, or `6`), and the feature toggles
+`ocv`, `btm`, `rnr`, `per_sta_vif`.
 Unknown keys and type mismatches are hard errors. See [`src/config.rs`](src/config.rs).
+
+For an 802.11be MLD, `mld_default_links: [1]` advertises that every QoS TID
+uses Link ID 1 in both directions. The array may contain multiple configured
+Link IDs (for example `[0, 1]`); omitting it leaves link selection to the client
+and driver. This is the all-TIDs/same-link-set advertised-TTLM form supported by
+current mac80211 and hostapd.
 
 ### stdio mode (default, all platforms)
 
@@ -392,8 +399,8 @@ the CAC itself is confirmed on hardware.
 
 6 GHz is fully implemented and **runs on air on 6 GHz**: HE Capabilities, HE
 Operation (with 6 GHz Operation Information), HE 6 GHz Band Capabilities, 6 GHz
-frequency encoding and a 6 GHz (HE-only) beacon builder, driven by `--band6`.
-With the `--band6` flag the AP beacons on 6 GHz (e.g. channel 37 / 6135 MHz) and
+frequency encoding and a 6 GHz (HE-only) beacon builder, driven by `--band 6`.
+With `--band 6` the AP beacons on 6 GHz (e.g. channel 37 / 6135 MHz) and
 **Wireshark/`tshark` decodes the beacon** — frequency 6135 MHz, HE Capabilities
 and HE Operation elements — confirming spec-compliant 6 GHz frames.
 

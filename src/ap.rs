@@ -98,6 +98,8 @@ pub struct Station {
     /// Beacon periods the station may sleep between wakeups, copied from the
     /// fixed fields of its latest (Re)Association Request.
     pub listen_interval: u16,
+    /// Capability Information from the station's (Re)Association Request.
+    pub capability: u16,
     /// The last EAPOL m1/m3 (radiotap-prefixed) sent to this station that is
     /// still awaiting its m2/m4. Retransmitted on a timer if no reply arrives,
     /// so a single dropped handshake frame doesn't stall the 4-way forever.
@@ -170,6 +172,7 @@ impl Station {
             wmm: false,
             assoc_ies: Vec::new(),
             listen_interval: 0,
+            capability: 0,
             pending_eapol: None,
             eapol_tx: Instant::now(),
             eapol_retries: 0,
@@ -264,6 +267,7 @@ pub struct MldLink {
     pub mac: [u8; 6],
     pub channel: u8,
     pub width: u16,
+    pub band6: bool,
 }
 
 pub struct Ap {
@@ -294,15 +298,25 @@ pub struct Ap {
     /// Affiliated links for a netlink AP MLD. Empty means "single configured
     /// link" and is resolved from `mac`/`channel`/`link_id`.
     pub mld_links: Vec<MldLink>,
+    /// Advertised TID-to-link mapping shared by all eight TIDs. Each set bit is
+    /// an MLD Link ID allowed for both uplink and downlink; `None` leaves link
+    /// selection to the peer and driver.
+    mld_default_link_mask: Option<u16>,
+    /// AP-mode EML and MLD capabilities exposed by nl80211 for this driver.
+    /// Netlink mode fills these before constructing beacon/response MLEs.
+    mld_eml_capability: u16,
+    mld_driver_capability: Option<u16>,
+    /// Real, band-specific radio capabilities for each affiliated link.
+    /// Partner-link profiles must use these just like the outer response does.
+    mld_link_phy_capabilities: HashMap<u8, dot11::PhyCapabilities>,
     /// PHY generation advertised on 2.4/5 GHz: ac (VHT), ax (HE), or be (EHT).
     /// 6 GHz is always HE+. Defaults to VHT to match prior behaviour.
     phy_mode: dot11::PhyMode,
     pub pmk: [u8; 32],
-    /// hostapd `wpa_psk_file` model: candidate PMKs, each optionally bound to a
-    /// station MAC. `None` MAC = wildcard (00:00:00:00:00:00) onboarding entry.
+    /// hostapd credential-file model: candidate PMKs, each optionally bound to a
+    /// station MAC. `None` MAC = wildcard onboarding entry.
     /// On the 4-way, MAC-specific entries are tried before wildcards; the one
-    /// whose PTK verifies message 2's MIC is that station's password. Empty =>
-    /// the single `pmk` above is used (classic single-passphrase AP).
+    /// whose PTK verifies message 2's MIC is that station's password.
     psk_candidates: Vec<(Option<[u8; 6]>, [u8; 32])>,
     /// The passphrases behind `psk_candidates`, retained so the same SPR
     /// per-device credential file can select an SAE password by station MAC.
@@ -310,6 +324,10 @@ pub struct Ap {
     /// unlike WPA2 it cannot discover the matching credential from message 2's
     /// MIC later in the exchange.
     credential_passwords: Vec<(Option<[u8; 6]>, Vec<u8>)>,
+    /// A configured credential file is the complete access-control database.
+    /// Never fall back to the JSON/CLI passphrase when it is true, including
+    /// when the file is empty or unreadable (fail closed).
+    credential_file_authoritative: bool,
     /// Passphrase, retained for WPA3-SAE PWE derivation.
     password: Vec<u8>,
     /// When true, accept WPA3-SAE (H2E) authentication.
@@ -439,10 +457,15 @@ impl Ap {
             link_id: 0,
             bss_change_count: 0,
             mld_links: Vec::new(),
+            mld_default_link_mask: None,
+            mld_eml_capability: 0,
+            mld_driver_capability: None,
+            mld_link_phy_capabilities: HashMap::new(),
             phy_mode: dot11::PhyMode::Vht,
             pmk,
             psk_candidates: Vec::new(),
             credential_passwords: Vec::new(),
+            credential_file_authoritative: false,
             password: psk.as_bytes().to_vec(),
             sae_enabled: false,
             transition: false,
@@ -582,6 +605,11 @@ impl Ap {
         self.mld_links = links;
     }
 
+    /// Advertise one active-link set for every QoS TID in both directions.
+    pub fn set_mld_default_link_mask(&mut self, link_mask: u16) {
+        self.mld_default_link_mask = Some(link_mask);
+    }
+
     pub fn active_mld_links(&self) -> Vec<MldLink> {
         if self.mld && !self.mld_links.is_empty() {
             self.mld_links.clone()
@@ -591,6 +619,7 @@ impl Ap {
                 mac: self.mac,
                 channel: self.channel,
                 width: self.channel_width,
+                band6: self.band6,
             }]
         }
     }
@@ -604,20 +633,149 @@ impl Ap {
             if link.link_id == link_id {
                 continue;
             }
-            let inner = dot11::ap_mld_profile_inner(
+            let mut inner = dot11::ap_mld_profile_inner(
                 &self.ssid,
                 link.channel,
                 &self.country,
                 link.width,
-                self.band6,
+                link.band6,
                 self.wmm,
                 self.phy_mode,
                 self.security_mode(),
                 self.punct,
             );
+            if let Some(caps) = self.mld_link_phy_capabilities.get(&link.link_id) {
+                // Capability Information occupies the first two bytes.
+                dot11::apply_phy_capabilities(&mut inner, 2, caps);
+            }
             info.extend_from_slice(&dot11::per_sta_profile(link.link_id, &link.mac, &inner));
         }
         info
+    }
+
+    /// Build the Link Info field for an MLO (Re)Association Response. Only
+    /// partner links requested by this station are included, and each profile
+    /// uses the association-response fixed fields (Capability + Status Code)
+    /// rather than the beacon/probe-response shape.
+    fn mld_assoc_link_info_for(&self, requested: &[(u8, [u8; 6])]) -> Vec<u8> {
+        let mut info = Vec::new();
+        if !self.mld {
+            return info;
+        }
+        for link in self.active_mld_links() {
+            if !requested
+                .iter()
+                .any(|(requested_link_id, _)| *requested_link_id == link.link_id)
+            {
+                continue;
+            }
+            let mut inner = dot11::ap_mld_assoc_profile_inner(
+                &self.ssid,
+                link.channel,
+                &self.country,
+                link.width,
+                link.band6,
+                self.wmm,
+                self.phy_mode,
+                self.punct,
+            );
+            if let Some(caps) = self.mld_link_phy_capabilities.get(&link.link_id) {
+                // Capability Information + Status Code occupy the first four
+                // bytes of an association-response Per-STA Profile.
+                dot11::apply_phy_capabilities(&mut inner, 4, caps);
+            }
+            info.extend_from_slice(&dot11::per_sta_profile(link.link_id, &link.mac, &inner));
+        }
+        info
+    }
+
+    fn mld_max_simultaneous_links_minus_one(&self) -> u8 {
+        self.active_mld_links().len().saturating_sub(1).min(0x0f) as u8
+    }
+
+    /// Apply the AP-mode MLD capabilities reported by the kernel. This mirrors
+    /// hostapd: AP transition/padding delays are zeroed, the active-link count
+    /// replaces the hardware maximum, unsupported TID-to-link negotiation is
+    /// cleared, and link reconfiguration support is advertised.
+    pub fn set_mld_driver_capabilities(&mut self, eml: u16, mld: u16) {
+        const EMLSR_DELAY_MASKS: u16 = 0x000e | 0x0070;
+        self.mld_eml_capability = eml & !EMLSR_DELAY_MASKS;
+        self.mld_driver_capability = Some(mld);
+    }
+
+    /// Set the driver's capability payloads for one affiliated link.
+    pub fn set_mld_link_phy_capabilities(
+        &mut self,
+        link_id: u8,
+        capabilities: dot11::PhyCapabilities,
+    ) {
+        self.mld_link_phy_capabilities.insert(link_id, capabilities);
+    }
+
+    fn advertised_mld_capability(&self) -> u16 {
+        const MAX_SIMULTANEOUS_LINKS_MASK: u16 = 0x000f;
+        const TID_TO_LINK_NEGOTIATION_MASK: u16 = 0x0060;
+        const LINK_RECONFIGURATION_SUPPORT: u16 = 0x2000;
+        let active = u16::from(self.mld_max_simultaneous_links_minus_one());
+        match self.mld_driver_capability {
+            Some(driver) => {
+                let maximum = driver & MAX_SIMULTANEOUS_LINKS_MASK;
+                (driver & !(MAX_SIMULTANEOUS_LINKS_MASK | TID_TO_LINK_NEGOTIATION_MASK))
+                    | active.min(maximum)
+                    | LINK_RECONFIGURATION_SUPPORT
+            }
+            None => active,
+        }
+    }
+
+    fn mld_basic_element(&self, link_id: u8, link_info: &[u8]) -> Vec<u8> {
+        dot11::multi_link_ap_basic_capabilities(
+            &self.mld_mac,
+            link_id,
+            self.bss_change_count,
+            self.mld_eml_capability,
+            self.advertised_mld_capability(),
+            link_info,
+        )
+    }
+
+    fn mld_tid_to_link_element(&self) -> Vec<u8> {
+        self.mld_default_link_mask
+            .map(dot11::tid_to_link_mapping_same_set)
+            .unwrap_or_default()
+    }
+
+    fn mld_link_disabled(&self, link_id: u8) -> bool {
+        self.mld_default_link_mask
+            .is_some_and(|mask| mask & (1u16 << link_id) == 0)
+    }
+
+    /// Advertise every other affiliated link using the MLD form of the Reduced
+    /// Neighbor Report. hostapd emits this independently of its generic `rnr`
+    /// option: it is how a client on (for example) the 5 GHz association link
+    /// learns the real 6 GHz BSSID, channel, width-derived operating class and
+    /// Link ID before it can include that partner in its association MLE.
+    fn mld_rnr_for(&self, reporting_link_id: u8) -> Vec<u8> {
+        if !self.mld {
+            return Vec::new();
+        }
+        let mut reports = Vec::new();
+        for link in self.active_mld_links() {
+            if link.link_id == reporting_link_id {
+                continue;
+            }
+            reports.extend_from_slice(&dot11::mld_reduced_neighbor_report_with_disabled(
+                &link.mac,
+                &self.ssid,
+                dot11::operating_class(link.channel, link.width, link.band6),
+                link.channel,
+                0,
+                link.link_id,
+                self.bss_change_count,
+                self.mld_link_disabled(link.link_id),
+            ));
+        }
+        reports
     }
 
     fn is_valid_peer_mac(mac: &[u8; 6]) -> bool {
@@ -797,10 +955,12 @@ impl Ap {
         self.per_sta_vif = true;
     }
 
-    /// Install the hostapd-style `wpa_psk_file` candidates: `(mac, passphrase)`
+    /// Install the hostapd-style credential-file candidates: `(mac, passphrase)`
     /// pairs (`None` mac = wildcard onboarding entry). Each passphrase is turned
-    /// into a PMK against this AP's SSID. Tried MAC-specific-first on the 4-way.
+    /// into a PMK against this AP's SSID. Once called, this file is authoritative:
+    /// the BSS passphrase is no longer an authentication fallback.
     pub fn set_psk_file(&mut self, entries: &[(Option<[u8; 6]>, String)]) {
+        self.credential_file_authoritative = true;
         let ssid = String::from_utf8_lossy(&self.ssid).to_string();
         self.psk_candidates = entries
             .iter()
@@ -812,21 +972,30 @@ impl Ap {
             .collect();
     }
 
-    /// Select the hostapd-style SAE credential for a station: an exact MAC
-    /// entry wins, then a wildcard onboarding entry, then the configured BSS
-    /// passphrase. hostapd treats wpa_passphrase plus credential-file entries as
-    /// additive, so an unlisted station may still use that configured fallback.
-    fn sae_password_for(&self, sta: &[u8; 6]) -> Option<&[u8]> {
-        self.credential_passwords
-            .iter()
-            .find(|(mac, _)| mac.as_ref() == Some(sta))
+    /// Select an SAE credential using hostapd's non-AP MLD identity rules. An
+    /// exact MLD-MAC entry wins over an exact per-link entry, then the pending
+    /// wildcard is considered. This matters for Apple MLO clients whose SAE
+    /// frame source address can change between affiliated links while the MLD
+    /// address remains the stable SPR device identity.
+    fn sae_password_for(
+        &self,
+        identity: &[u8; 6],
+        link_identity: Option<&[u8; 6]>,
+    ) -> Option<&[u8]> {
+        let exact = |wanted: &[u8; 6]| {
+            self.credential_passwords
+                .iter()
+                .find(|(mac, _)| mac.as_ref() == Some(wanted))
+        };
+        exact(identity)
+            .or_else(|| link_identity.and_then(exact))
             .or_else(|| {
                 self.credential_passwords
                     .iter()
                     .find(|(mac, _)| mac.is_none())
             })
             .map(|(_, password)| password.as_slice())
-            .or(Some(&self.password))
+            .or_else(|| (!self.credential_file_authoritative).then_some(self.password.as_slice()))
     }
 
     /// Whether per-station-VIF mode is enabled.
@@ -904,7 +1073,7 @@ impl Ap {
     pub fn beacon_frame_unprotected_for_link(&self, link: &MldLink) -> Vec<u8> {
         let ts = self.current_timestamp();
         let tail = dot11::security_tail(self.security_mode());
-        let mut frame = if self.band6 {
+        let mut frame = if link.band6 {
             dot11::build_beacon_6ghz(
                 &link.mac,
                 &self.ssid,
@@ -914,6 +1083,7 @@ impl Ap {
                 &self.country,
                 link.width,
                 self.wmm,
+                self.phy_mode,
                 self.punct,
             )
         } else {
@@ -942,13 +1112,10 @@ impl Ap {
             frame.extend_from_slice(&dot11::reduced_neighbor_report(&nb, 131, ch6));
         }
         if self.mld {
+            frame.extend_from_slice(&self.mld_rnr_for(link.link_id));
             let info = self.mld_link_info_for(link.link_id);
-            frame.extend_from_slice(&dot11::multi_link_ap_basic(
-                &self.mld_mac,
-                link.link_id,
-                self.bss_change_count,
-                &info,
-            ));
+            frame.extend_from_slice(&self.mld_basic_element(link.link_id, &info));
+            frame.extend_from_slice(&self.mld_tid_to_link_element());
         }
         frame
     }
@@ -966,6 +1133,7 @@ impl Ap {
                 &self.country,
                 self.channel_width,
                 self.wmm,
+                self.phy_mode,
                 self.punct,
             )
         } else {
@@ -1008,13 +1176,10 @@ impl Ap {
         // 802.11be AP MLD: advertise the Basic Multi-Link element (MLD MAC + this
         // link's Link ID) so MLD-capable clients associate at the MLD level.
         if self.mld {
+            frame.extend_from_slice(&self.mld_rnr_for(self.link_id));
             let info = self.mld_link_info_for(self.link_id);
-            frame.extend_from_slice(&dot11::multi_link_ap_basic(
-                &self.mld_mac,
-                self.link_id,
-                self.bss_change_count,
-                &info,
-            ));
+            frame.extend_from_slice(&self.mld_basic_element(self.link_id, &info));
+            frame.extend_from_slice(&self.mld_tid_to_link_element());
         }
         if self.beacon_prot && protect {
             // Protect the beacon body with a BIP Management MIC Element (BIGTK).
@@ -1144,13 +1309,10 @@ impl Ap {
             dot11::enable_beacon_protection_capability(&mut frame[36..]);
         }
         if self.mld {
+            frame.extend_from_slice(&self.mld_rnr_for(self.link_id));
             let info = self.mld_link_info_for(self.link_id);
-            frame.extend_from_slice(&dot11::multi_link_ap_basic(
-                &self.mld_mac,
-                self.link_id,
-                self.bss_change_count,
-                &info,
-            ));
+            frame.extend_from_slice(&self.mld_basic_element(self.link_id, &info));
+            frame.extend_from_slice(&self.mld_tid_to_link_element());
         }
         out.tx(frame);
     }
@@ -1185,6 +1347,7 @@ impl Ap {
 
         // Open-system authentication (algorithm 0) -- WPA2/PSK, or SAE PMKSA reconnect
         let now = Instant::now();
+        let mut restarted_association = None;
         {
             let entry = self
                 .stations
@@ -1226,6 +1389,9 @@ impl Ap {
                 );
             }
             if !retransmit && !mid_handshake {
+                if entry.associated {
+                    restarted_association = Some(entry.client_mld_mac.unwrap_or(sta));
+                }
                 entry.last_auth = Some(now);
                 entry.anonce = None;
                 entry.eapol_ready = false;
@@ -1247,6 +1413,16 @@ impl Ap {
                 // Mid-handshake re-auth: keep the ANonce/PTK-in-progress state, just
                 // note the auth time so the backoff window tracks the latest attempt.
                 entry.last_auth = Some(now);
+            }
+        }
+        if let Some(mac) = restarted_association {
+            eprintln!(
+                "AP: station {} started a fresh authentication while associated; retiring old session",
+                crate::util::bytes_to_mac(&mac)
+            );
+            self.events.push(ApEvent::Disconnected { mac, reason: 0 });
+            if self.strict_rekey && self.stations.values().any(|s| s.associated) {
+                self.group_rekey_due = true;
             }
         }
 
@@ -1301,19 +1477,70 @@ impl Ap {
             // hunting-and-pecking (whose derivation is made constant-time in
             // `derive_pwe_hunting_pecking` so it has no Dragonblood timing leak).
             let h2e = status == dot11::STATUS_SAE_H2E;
-            let sae_ap = if self.mld { self.mld_mac } else { self.mac };
-            let peer_mld = self
+            let auth_mld = self
                 .mld
                 .then(|| Self::sae_auth_mld_mac(seq, payload))
                 .flatten();
+            // Apple can first try a cached-PMKSA MLO association and only then
+            // fall back to full SAE. That association has already supplied and
+            // validated the non-AP MLD identity. Some drivers deliver the
+            // subsequent SAE commit link-addressed or without exposing its
+            // Authentication MLE to userspace; in that case retain the stable
+            // identity instead of attempting credential lookup by the rotating
+            // link MAC. The later association-to-SAE identity check still
+            // rejects any conflicting MLD address.
+            let known_mld = self
+                .mld
+                .then(|| self.stations.get(sta).and_then(|s| s.client_mld_mac))
+                .flatten();
+            let peer_mld = auth_mld.or(known_mld);
+            // Match hostapd's ap_sta_is_mld() split: an MLD AP still uses its
+            // link address for a legacy station. The MLD address is an SAE
+            // identity only when the peer's Authentication frame identifies
+            // that peer as an MLD.
+            let sae_ap = if peer_mld.is_some() {
+                self.mld_mac
+            } else {
+                self.mac
+            };
             let sae_sta = peer_mld.unwrap_or(*sta);
             // A hostapd-style credential file may bind a different SAE
             // password to each link-addressed station. Select and own it before
             // mutably borrowing the SAE/station state below.
-            let Some(password) = self.sae_password_for(sta).map(<[u8]>::to_vec) else {
+            let Some(password) = self
+                .sae_password_for(&sae_sta, peer_mld.as_ref().map(|_| sta))
+                .map(<[u8]>::to_vec)
+            else {
+                eprintln!(
+                    "AP: SAE credential lookup failed link={} auth_mld={} known_mld={} identity={}",
+                    crate::util::bytes_to_mac(sta),
+                    auth_mld
+                        .as_ref()
+                        .map(crate::util::bytes_to_mac)
+                        .unwrap_or_else(|| "-".to_string()),
+                    known_mld
+                        .as_ref()
+                        .map(crate::util::bytes_to_mac)
+                        .unwrap_or_else(|| "-".to_string()),
+                    crate::util::bytes_to_mac(&sae_sta)
+                );
                 self.record_failure(sta, crate::failures::FailureKind::Sae);
                 return;
             };
+            eprintln!(
+                "AP: SAE commit link={} auth_mld={} known_mld={} identity={} ap_identity={} h2e={h2e}",
+                crate::util::bytes_to_mac(sta),
+                auth_mld
+                    .as_ref()
+                    .map(crate::util::bytes_to_mac)
+                    .unwrap_or_else(|| "-".to_string()),
+                known_mld
+                    .as_ref()
+                    .map(crate::util::bytes_to_mac)
+                    .unwrap_or_else(|| "-".to_string()),
+                crate::util::bytes_to_mac(&sae_sta),
+                crate::util::bytes_to_mac(&sae_ap),
+            );
             let mut sae = if h2e {
                 crate::sae::Sae::new_h2e(&self.ssid, &password, None, &sae_ap, &sae_sta)
             } else {
@@ -1322,24 +1549,48 @@ impl Ap {
                     None => return,
                 }
             };
-            if sae.parse_peer_commit(payload).is_err() {
+            if let Err(err) = sae.parse_peer_commit(payload) {
+                eprintln!(
+                    "AP: SAE commit parse failed from {}: {err:?}",
+                    crate::util::bytes_to_mac(sta)
+                );
                 self.record_failure(sta, crate::failures::FailureKind::Sae);
                 return;
+            }
+            let rejected_groups = sae.peer_rejected_groups();
+            if !rejected_groups.is_empty() {
+                eprintln!(
+                    "AP: SAE H2E peer {} rejected groups {}; applying negotiated key salt",
+                    crate::util::bytes_to_mac(&sae_sta),
+                    rejected_groups
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
             }
             sae.prepare_commit(None);
             // Reject a reflected commit (peer echoing our own scalar + element).
             if sae.is_reflection() {
+                eprintln!(
+                    "AP: SAE reflected commit from {}",
+                    crate::util::bytes_to_mac(sta)
+                );
                 self.record_failure(sta, crate::failures::FailureKind::Sae);
                 return;
             }
-            if sae.process_commit().is_err() {
+            if let Err(err) = sae.process_commit() {
+                eprintln!(
+                    "AP: SAE commit processing failed from {}: {err:?}",
+                    crate::util::bytes_to_mac(sta)
+                );
                 self.record_failure(sta, crate::failures::FailureKind::Sae);
                 return;
             }
 
             let mut commit_body = sae.write_commit();
             let mut confirm_body = sae.write_confirm();
-            if self.mld {
+            if peer_mld.is_some() {
                 let ml = dot11::multi_link_auth(&self.mld_mac);
                 commit_body.extend_from_slice(&ml);
                 confirm_body.extend_from_slice(&ml);
@@ -1395,23 +1646,38 @@ impl Ap {
             out.tx(commit);
             out.tx(confirm);
         } else if seq == 2 {
+            eprintln!(
+                "AP: SAE confirm received from {} payload_len={}",
+                crate::util::bytes_to_mac(sta),
+                payload.len(),
+            );
             // Verify the peer's confirm. Only a verified confirm completes SAE:
             // it gates association (see `handle_assoc_req`) and is the point at
             // which the PMK becomes mutually authenticated, so the PMKSA is
             // cached *here*, not on the unconfirmed commit.
-            let confirm_ok = self
+            let confirm_result = self
                 .stations
                 .get(sta)
                 .and_then(|s| s.sae.as_ref())
-                .map(|sae| sae.check_confirm(payload).is_ok());
-            match confirm_ok {
-                Some(true) => {}
+                .map(|sae| sae.check_confirm(payload));
+            match confirm_result {
+                Some(Ok(())) => {}
                 // Confirm present but invalid -> wrong password / forged confirm.
-                Some(false) => {
+                Some(Err(err)) => {
+                    eprintln!(
+                        "AP: SAE confirm verification failed from {}: {err:?}",
+                        crate::util::bytes_to_mac(sta)
+                    );
                     self.record_failure(sta, crate::failures::FailureKind::Sae);
                     return;
                 }
-                None => return,
+                None => {
+                    eprintln!(
+                        "AP: SAE confirm from {} has no matching commit state",
+                        crate::util::bytes_to_mac(sta)
+                    );
+                    return;
+                }
             }
             let confirmed = self
                 .stations
@@ -1421,6 +1687,10 @@ impl Ap {
             if let Some(s) = self.stations.get_mut(sta) {
                 s.sae_confirmed = true;
             }
+            eprintln!(
+                "AP: SAE confirm verified for {}",
+                crate::util::bytes_to_mac(sta),
+            );
             if let Some((pmkid, pmk)) = confirmed {
                 if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
                     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
@@ -1469,6 +1739,7 @@ impl Ap {
             s.traits = crate::failures::client_traits(&frame.body);
             s.wmm = ap_wmm && client_wmm;
             if frame.body.len() >= 4 {
+                s.capability = u16::from_le_bytes([frame.body[0], frame.body[1]]);
                 s.listen_interval = u16::from_le_bytes([frame.body[2], frame.body[3]]);
             }
             // Remember the station's capability IEs (HT/VHT/HE/rates) so the
@@ -1512,6 +1783,20 @@ impl Ap {
                     self.reject_assoc(&sta, reassoc, out);
                     return;
                 };
+                eprintln!(
+                    "AP: MLD association sta={} mld={} requested_links={}",
+                    crate::util::bytes_to_mac(&sta),
+                    crate::util::bytes_to_mac(&client_mld),
+                    links
+                        .iter()
+                        .map(|(link_id, mac)| format!(
+                            "{}:{}",
+                            link_id,
+                            crate::util::bytes_to_mac(mac)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 let s = self
                     .stations
                     .entry(sta)
@@ -1528,6 +1813,10 @@ impl Ap {
         // so PMKSA fast-reconnect — which skips SAE with a cached PMK — still works.)
         if let Some(s) = self.stations.get(&sta) {
             if s.sae.is_some() && !s.sae_confirmed {
+                eprintln!(
+                    "AP: association from {} deferred because SAE confirm is not complete",
+                    crate::util::bytes_to_mac(&sta),
+                );
                 return;
             }
         }
@@ -1704,13 +1993,14 @@ impl Ap {
                 .map(|s| s.client_mld_mac.is_some())
                 .unwrap_or(false)
         {
-            let info = self.mld_link_info_for(self.link_id);
-            assoc.extend_from_slice(&dot11::multi_link_ap_basic(
-                &self.mld_mac,
-                self.link_id,
-                self.bss_change_count,
-                &info,
-            ));
+            let requested = self
+                .stations
+                .get(&sta)
+                .map(|s| s.client_mld_links.as_slice())
+                .unwrap_or(&[]);
+            let info = self.mld_assoc_link_info_for(requested);
+            assoc.extend_from_slice(&self.mld_basic_element(self.link_id, &info));
+            assoc.extend_from_slice(&self.mld_tid_to_link_element());
         }
         if let Some(dh) = owe_dh_resp {
             assoc.extend_from_slice(&dh); // OWE DH Parameter element
@@ -1896,6 +2186,17 @@ impl Ap {
                     s.pending_eapol = None;
                     s.last_activity = Instant::now();
                 }
+                eprintln!(
+                    "AP: group-key handshake completed for {} replay={}",
+                    crate::util::bytes_to_mac(&sta),
+                    ek.key_replay_counter,
+                );
+            } else {
+                eprintln!(
+                    "AP: group-key message 2 MIC failed for {} replay={}",
+                    crate::util::bytes_to_mac(&sta),
+                    ek.key_replay_counter,
+                );
             }
             return;
         }
@@ -1922,11 +2223,15 @@ impl Ap {
             }
             let computed = dot11::KeyMic::select(sha256_m4, owe_m4).compute(&kck, &to_check);
             if crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
+                let mut event_mac = None;
                 if let Some(s) = self.stations.get_mut(&sta) {
                     s.associated = true;
                     s.awaiting_m4 = false;
                     s.pending_eapol = None; // 4-way complete, nothing to retransmit
-                    self.events.push(ApEvent::Connected { mac: sta });
+                    event_mac = Some(s.client_mld_mac.unwrap_or(sta));
+                }
+                if let Some(mac) = event_mac {
+                    self.events.push(ApEvent::Connected { mac });
                 }
                 // 4-way complete: release the held ANonce so any *future*
                 // reassociation derives a fresh one (KRACK-safe rekey).
@@ -1979,8 +2284,9 @@ impl Ap {
 
         // hostapd `wpa_psk_file` order: a PMK already fixed for this station
         // (SAE / OWE / PMKSA) is used outright; otherwise try the PSK-file entries
-        // whose MAC matches this station, then the wildcard onboarding entries,
-        // then the single default passphrase. The candidate whose PTK verifies
+        // whose MAC matches this station, then the wildcard onboarding entries.
+        // The single BSS passphrase is considered only when no authoritative
+        // credential file is configured. The candidate whose PTK verifies
         // message 2's MIC is this station's password.
         let candidates: Vec<[u8; 32]> = if let Some(p) = sta_pmk {
             vec![p]
@@ -1998,9 +2304,9 @@ impl Ap {
                     .filter(|(m, _)| m.is_none())
                     .map(|(_, p)| *p),
             );
-            // hostapd appends file entries to the configured group PSK, so the
-            // BSS passphrase remains the final fallback for an unlisted MAC.
-            v.push(self.pmk);
+            if !self.credential_file_authoritative {
+                v.push(self.pmk);
+            }
             v
         };
 
@@ -2171,16 +2477,21 @@ impl Ap {
         let gtk_key_id = self.gtk_key_id;
         let mld_station = self.mld && client_mld.is_some();
         let m3 = if mld_station {
-            dot11::build_eapol_m3_mld(
+            let negotiated = self.station_mld_link_ids(&sta);
+            let configured = self.active_mld_links();
+            let link_kdes: Vec<(u8, [u8; 6], &[u8])> = configured
+                .iter()
+                .filter(|link| negotiated.contains(&link.link_id))
+                .map(|link| (link.link_id, link.mac, ap_rsn.as_slice()))
+                .collect();
+            dot11::build_eapol_m3_mld_links(
                 &self.mac,
                 &sta,
                 &anonce,
                 &kck,
                 &kek,
                 &self.mld_mac,
-                self.link_id,
-                &self.mac,
-                &ap_rsn,
+                &link_kdes,
                 gtk_key_id,
                 &gtk,
                 igtk,
@@ -2406,10 +2717,23 @@ impl Ap {
                 {
                     return;
                 }
-                if dot11::decrypt_ccmp_mgmt_sec(frame, &tk, self.mld_mgmt_rx_sec_addrs(&sta))
-                    .is_some()
+                if let Some(plain) =
+                    dot11::decrypt_ccmp_mgmt_sec(frame, &tk, self.mld_mgmt_rx_sec_addrs(&sta))
                 {
-                    self.disconnect(&sta, 0);
+                    let reason = plain
+                        .get(..2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                        .unwrap_or(0);
+                    eprintln!(
+                        "AP: protected {} from {} reason={reason}",
+                        if frame.subtype() == dot11::SUBTYPE_DEAUTH {
+                            "deauth"
+                        } else {
+                            "disassoc"
+                        },
+                        crate::util::bytes_to_mac(&sta),
+                    );
+                    self.disconnect(&sta, reason);
                 } else {
                     self.record_failure(&sta, crate::failures::FailureKind::ProtectedMgmt);
                 }
@@ -2581,6 +2905,18 @@ impl Ap {
                 continue;
             }
             if s.eapol_retries >= MAX_EAPOL_RETRIES {
+                eprintln!(
+                    "AP: {} timeout for {} after {} retries",
+                    if s.group_rekeying {
+                        "group-key handshake"
+                    } else if s.awaiting_m4 {
+                        "4-way message 3"
+                    } else {
+                        "4-way message 1"
+                    },
+                    crate::util::bytes_to_mac(mac),
+                    s.eapol_retries,
+                );
                 timed_out.push(*mac);
             } else {
                 out.frames.push(frame.clone()); // already radiotap-prefixed
@@ -2678,8 +3014,10 @@ impl Ap {
     fn disconnect(&mut self, sta: &[u8; 6], reason: u16) {
         if let Some(s) = self.stations.remove(sta) {
             if s.associated {
-                self.events
-                    .push(ApEvent::Disconnected { mac: *sta, reason });
+                self.events.push(ApEvent::Disconnected {
+                    mac: s.client_mld_mac.unwrap_or(*sta),
+                    reason,
+                });
                 // hostapd `wpa_strict_rekey`: an authorized station that held the
                 // GTK is leaving — rotate the GTK so it can't read future group
                 // traffic. Only worthwhile if other stations remain to receive
@@ -2713,6 +3051,10 @@ impl Ap {
         self.stations.get(sta).map(|s| s.listen_interval)
     }
 
+    pub fn station_capability(&self, sta: &[u8; 6]) -> Option<u16> {
+        self.stations.get(sta).map(|s| s.capability)
+    }
+
     /// The station's MLD MAC, when this link-addressed station authenticated as
     /// a non-AP MLD.
     pub fn station_mld_mac(&self, sta: &[u8; 6]) -> Option<[u8; 6]> {
@@ -2726,11 +3068,52 @@ impl Ap {
             .unwrap_or_default()
     }
 
+    /// MLD links negotiated by this station, including the association link.
+    /// Group keys are installed and delivered per link even though the compact
+    /// userspace key model currently uses one per-station GTK value.
+    pub fn station_mld_link_ids(&self, sta: &[u8; 6]) -> Vec<u8> {
+        let Some(s) = self.stations.get(sta) else {
+            return Vec::new();
+        };
+        if !self.mld || s.client_mld_mac.is_none() {
+            return Vec::new();
+        }
+        let mut ids = vec![self.link_id];
+        for (link_id, _) in &s.client_mld_links {
+            if !ids.contains(link_id)
+                && self
+                    .mld_links
+                    .iter()
+                    .any(|configured| configured.link_id == *link_id)
+            {
+                ids.push(*link_id);
+            }
+        }
+        ids.sort_unstable();
+        ids
+    }
+
     /// Find the link-addressed station entry that corresponds to a STA MLD MAC.
     pub fn station_link_for_mld(&self, mld: &[u8; 6]) -> Option<[u8; 6]> {
         self.stations
             .iter()
             .find_map(|(link, s)| (s.client_mld_mac.as_ref() == Some(mld)).then_some(*link))
+    }
+
+    /// Resolve any address belonging to a non-AP MLD (its MLD MAC, association
+    /// link MAC, or an affiliated partner-link MAC) to the single association-
+    /// link station record used by the userspace MLME. This mirrors hostapd's
+    /// MLO address translation and prevents one client from being treated as
+    /// several independent stations as it sends frames on different links.
+    pub fn station_link_for_peer(&self, peer: &[u8; 6]) -> Option<[u8; 6]> {
+        if self.stations.contains_key(peer) {
+            return Some(*peer);
+        }
+        self.stations.iter().find_map(|(link, s)| {
+            (s.client_mld_mac.as_ref() == Some(peer)
+                || s.client_mld_links.iter().any(|(_, mac)| mac == peer))
+            .then_some(*link)
+        })
     }
 
     /// Administratively deauthenticate a station: tears it down (emitting a
@@ -2950,6 +3333,7 @@ impl Ap {
 
         let mut frames = Vec::new();
         for sta in stations {
+            let mld_link_ids = self.station_mld_link_ids(&sta);
             let (kck, kek, sha256, owe, replay) = {
                 let s = self.stations.get_mut(&sta).unwrap();
                 s.eapol_replay += 1;
@@ -2961,18 +3345,35 @@ impl Ap {
                 None
             };
             let sc = self.next_sc();
-            let frame = dot11::build_group_key_msg1(
-                &self.mac,
-                &sta,
-                &kck,
-                &kek,
-                gtk_key_id,
-                &gtk,
-                igtk_kde,
-                replay,
-                sc,
-                dot11::KeyMic::select(sha256, owe),
-            );
+            let frame = if mld_link_ids.is_empty() {
+                dot11::build_group_key_msg1(
+                    &self.mac,
+                    &sta,
+                    &kck,
+                    &kek,
+                    gtk_key_id,
+                    &gtk,
+                    igtk_kde,
+                    replay,
+                    sc,
+                    dot11::KeyMic::select(sha256, owe),
+                )
+            } else {
+                dot11::build_group_key_msg1_mld(
+                    &self.mac,
+                    &sta,
+                    &kck,
+                    &kek,
+                    &mld_link_ids,
+                    gtk_key_id,
+                    &gtk,
+                    igtk_kde,
+                    None,
+                    replay,
+                    sc,
+                    dot11::KeyMic::select(sha256, owe),
+                )
+            };
             let mut f = dot11::RADIOTAP_TX.to_vec();
             f.extend_from_slice(&frame);
             if let Some(s) = self.stations.get_mut(&sta) {
@@ -3022,6 +3423,7 @@ impl Ap {
 
         let mut frames = Vec::new();
         for sta in stations {
+            let mld_link_ids = self.station_mld_link_ids(&sta);
             let (kck, kek, sha256, owe, replay, gtk) = {
                 let s = self.stations.get_mut(&sta).unwrap();
                 // Rotate this station's own GTK *value*; it goes in at the shared
@@ -3037,18 +3439,35 @@ impl Ap {
                 None
             };
             let sc = self.next_sc();
-            let frame = dot11::build_group_key_msg1(
-                &self.mac,
-                &sta,
-                &kck,
-                &kek,
-                gtk_key_id,
-                &gtk,
-                igtk_kde,
-                replay,
-                sc,
-                dot11::KeyMic::select(sha256, owe),
-            );
+            let frame = if mld_link_ids.is_empty() {
+                dot11::build_group_key_msg1(
+                    &self.mac,
+                    &sta,
+                    &kck,
+                    &kek,
+                    gtk_key_id,
+                    &gtk,
+                    igtk_kde,
+                    replay,
+                    sc,
+                    dot11::KeyMic::select(sha256, owe),
+                )
+            } else {
+                dot11::build_group_key_msg1_mld(
+                    &self.mac,
+                    &sta,
+                    &kck,
+                    &kek,
+                    &mld_link_ids,
+                    gtk_key_id,
+                    &gtk,
+                    igtk_kde,
+                    None,
+                    replay,
+                    sc,
+                    dot11::KeyMic::select(sha256, owe),
+                )
+            };
             let mut f = dot11::RADIOTAP_TX.to_vec();
             f.extend_from_slice(&frame);
             if let Some(s) = self.stations.get_mut(&sta) {

@@ -6,7 +6,7 @@ sudo iw reg set US; sleep 1
 cd /tmp/hwsim6g && make clean >/tmp/mod160.log 2>&1; make >>/tmp/mod160.log 2>&1
 sudo insmod /tmp/hwsim6g/hwsim6g.ko 2>>/tmp/mod160.log && echo "module: loaded ($(sudo dmesg | grep -a hwsim6g | tail -1 | sed 's/.*hwsim6g: //'))" || echo "module: FAILED ($(tail -1 /tmp/mod160.log))"
 sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set wlan0 up
-sudo /tmp/barely-ap --mode netlink --iface wlan0 --channel 36 --width 160 --mac 02:00:00:00:00:00 --ssid turtle160 --psk password1234 > /tmp/ap160.log 2>&1 &
+sudo /tmp/barely-ap --mode netlink --iface wlan0 --band 5 --channel 36 --width 160 --mac 02:00:00:00:00:00 --ssid turtle160 --psk password1234 > /tmp/ap160.log 2>&1 &
 sleep 2
 echo "START_AP ok: $(sudo grep -ac 'START_AP ok' /tmp/ap160.log)   err: $(sudo grep -aiE 'invalid|failed' /tmp/ap160.log | head -1)"
 echo "AP chan: $(sudo iw dev wlan0 info 2>/dev/null | grep -iE 'channel|width' | tr '\n' ' ')"

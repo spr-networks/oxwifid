@@ -2,12 +2,13 @@
 //! state machines against each other through the full SAE exchange, the 4-way
 //! handshake (using the SAE PMK), and a CCMP ping.
 
-use barely_ap::ap::{Ap, MldLink};
+use barely_ap::ap::{Ap, ApEvent, MldLink};
 use barely_ap::client::Client;
+use barely_ap::control::{handle_command_with_station_info, StationControlInfo};
 use barely_ap::dot11;
 use barely_ap::fakenet::FakeNet;
 use barely_ap::sae::Sae;
-use barely_ap::util::mac_to_bytes;
+use barely_ap::util::{bytes_to_mac, mac_to_bytes};
 
 /// Run the AP side for one inbound frame, including the fake-network round-trip.
 fn ap_step(ap: &mut Ap, net: &mut FakeNet, frame: &[u8]) -> Vec<Vec<u8>> {
@@ -130,12 +131,14 @@ fn mld_ap_for_tests() -> Ap {
             mac: ap_link0,
             channel: 1,
             width: 20,
+            band6: false,
         },
         MldLink {
             link_id: 1,
             mac: ap_link1,
             channel: 36,
             width: 20,
+            band6: false,
         },
     ]);
     ap
@@ -155,7 +158,7 @@ fn mld_assoc_req(sta: [u8; 6], sta_mld: [u8; 6], profiles: &[(u8, [u8; 6])]) -> 
         link_info.extend_from_slice(&dot11::per_sta_profile(*link_id, link_mac, &[]));
     }
     let mut frame = dot11::build_assoc_req(&ap_link0, &sta, b"turtlenet", 0x20);
-    frame.extend_from_slice(&dot11::multi_link_ap_basic(&sta_mld, 0, 0, &link_info));
+    frame.extend_from_slice(&dot11::multi_link_ap_basic(&sta_mld, 0, 0, 1, &link_info));
     let mut framed = dot11::RADIOTAP_TX.to_vec();
     framed.extend_from_slice(&frame);
     framed
@@ -167,6 +170,54 @@ fn assoc_status(frame: &[u8]) -> u16 {
         .expect("assoc response parses");
     assert_eq!(parsed.subtype(), dot11::SUBTYPE_ASSOC_RESP);
     u16::from_le_bytes([parsed.body[2], parsed.body[3]])
+}
+
+fn assoc_mld_partner_status(frame: &[u8]) -> (u8, [u8; 6], u16) {
+    let parsed = dot11::strip_radiotap(frame)
+        .and_then(dot11::Dot11::parse)
+        .expect("assoc response parses");
+    let ies = parsed.body.get(6..).expect("assoc response fixed fields");
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let len = ies[i + 1] as usize;
+        assert!(i + 2 + len <= ies.len(), "well-formed response IE");
+        if ies[i] == 255 && len >= 4 && ies[i + 2] == 107 {
+            let ml = &ies[i + 3..i + 2 + len];
+            let common_len = ml[2] as usize;
+            let p = 2 + common_len;
+            let sub = &ml[p + 2..p + 2 + ml[p + 1] as usize];
+            let control = u16::from_le_bytes([sub[0], sub[1]]);
+            let link_id = (control & 0x0f) as u8;
+            let info_len = sub[2] as usize;
+            let mut link_mac = [0u8; 6];
+            link_mac.copy_from_slice(&sub[3..9]);
+            let profile = &sub[2 + info_len..];
+            let status = u16::from_le_bytes([profile[2], profile[3]]);
+            return (link_id, link_mac, status);
+        }
+        i += 2 + len;
+    }
+    panic!("association response has no Basic Multi-Link element");
+}
+
+#[test]
+fn mld_assoc_response_carries_configured_tid_to_link_mapping() {
+    let sta = mac_to_bytes("02:00:00:00:ab:01");
+    let sta_mld = mac_to_bytes("02:00:00:00:ab:00");
+    let sta_link1 = mac_to_bytes("02:00:00:00:ab:02");
+    let mut ap = mld_ap_for_tests();
+    ap.set_mld_default_link_mask(1 << 1);
+    open_auth(&mut ap, sta);
+
+    let out = ap.handle_incoming(&mld_assoc_req(sta, sta_mld, &[(1, sta_link1)]));
+    assert_eq!(assoc_status(&out.frames[0]), dot11::STATUS_SUCCESS);
+    let ttlm = dot11::tid_to_link_mapping_same_set(1 << 1);
+    assert!(
+        out.frames[0]
+            .windows(ttlm.len())
+            .any(|window| window == ttlm),
+        "association response carries the same advertised mapping as the beacons"
+    );
 }
 
 #[test]
@@ -221,7 +272,7 @@ fn wpa3_sae_hunting_and_pecking_handshake() {
 }
 
 #[test]
-fn mld_ap_sae_uses_ap_mld_address() {
+fn legacy_sae_station_on_mld_ap_uses_link_address() {
     let ap_link = mac_to_bytes("02:00:00:00:00:00");
     let ap_mld = mac_to_bytes("02:00:00:11:22:33");
     let sta_link = mac_to_bytes("02:00:00:00:01:00");
@@ -231,7 +282,9 @@ fn mld_ap_sae_uses_ap_mld_address() {
     ap.mld = true;
     ap.mld_mac = ap_mld;
 
-    let mut sta_sae = Sae::new_h2e(b"turtlenet", b"password1234", None, &sta_link, &ap_mld);
+    // A non-MLO station does not carry a Multi-Link element in Authentication
+    // and derives SAE using the AP link BSSID, even though the AP is an MLD.
+    let mut sta_sae = Sae::new_h2e(b"turtlenet", b"password1234", None, &sta_link, &ap_link);
     sta_sae.prepare_commit(None);
     let auth = dot11::build_sae_auth(
         &ap_link,
@@ -262,12 +315,17 @@ fn mld_ap_sae_uses_ap_mld_address() {
     );
     let ap_commit = dot11::parse_auth(&ap_commit_frame.body).expect("AP commit auth body");
     assert_eq!(ap_commit.seq, 1);
+    assert_eq!(
+        ap_commit.payload.len(),
+        2 + 3 * 32,
+        "legacy SAE response must not append a Multi-Link element"
+    );
     sta_sae
         .parse_peer_commit(ap_commit.payload)
         .expect("AP commit parses");
     sta_sae
         .process_commit()
-        .expect("MLD SAE shared secret derives");
+        .expect("legacy SAE shared secret derives from link addresses");
 
     let ap_confirm_frame = dot11::strip_radiotap(&out.frames[1])
         .and_then(dot11::Dot11::parse)
@@ -276,7 +334,7 @@ fn mld_ap_sae_uses_ap_mld_address() {
     assert_eq!(ap_confirm.seq, 2);
     sta_sae
         .check_confirm(ap_confirm.payload)
-        .expect("AP confirm verifies with AP-MLD SAE identity");
+        .expect("AP confirm verifies with AP link SAE identity");
 }
 
 #[test]
@@ -290,6 +348,11 @@ fn mld_ap_sae_uses_sta_mld_from_auth_element() {
     ap.enable_sae();
     ap.mld = true;
     ap.mld_mac = ap_mld;
+    ap.set_psk_file(&[
+        (Some(sta_air), "wrong-link-password".to_string()),
+        (Some(sta_mld), "password1234".to_string()),
+        (None, "wrong-wildcard-password".to_string()),
+    ]);
 
     let mut sta_sae = Sae::new_h2e(b"turtlenet", b"password1234", None, &sta_mld, &ap_mld);
     sta_sae.prepare_commit(None);
@@ -340,6 +403,73 @@ fn mld_ap_sae_uses_sta_mld_from_auth_element() {
 }
 
 #[test]
+fn mld_sae_uses_identity_learned_from_prior_pmksa_assoc_attempt() {
+    let ap_link = mac_to_bytes("02:00:00:00:10:01");
+    let ap_mld = mac_to_bytes("02:00:00:00:10:00");
+    let sta_mld = mac_to_bytes("02:00:00:00:01:00");
+    let sta_air = mac_to_bytes("32:4f:53:27:65:f3");
+
+    let mut ap = mld_ap_for_tests();
+    ap.enable_sae();
+    ap.set_psk_file(&[(Some(sta_mld), "password1234".to_string())]);
+
+    // Model Apple's stale-PMKSA sequence: the first association attempt tells
+    // the AP the stable MLD identity but cannot succeed because its PMKID is no
+    // longer cached after an AP restart.
+    open_auth(&mut ap, sta_air);
+    let stale = ap.handle_incoming(&mld_assoc_req(
+        sta_air,
+        sta_mld,
+        &[(1, mac_to_bytes("02:00:00:00:01:01"))],
+    ));
+    assert!(!stale.frames.is_empty());
+    assert_eq!(ap.station_mld_mac(&sta_air), Some(sta_mld));
+
+    // The subsequent full-SAE commit is link-addressed and deliberately omits
+    // the Authentication MLE, as can happen with driver address translation.
+    // RustAP must retain the known MLD identity for both credential lookup and
+    // H2E PWE derivation.
+    let mut sta_sae = Sae::new_h2e(b"turtlenet", b"password1234", None, &sta_mld, &ap_mld);
+    sta_sae.prepare_commit(None);
+    let auth = dot11::build_sae_auth(
+        &ap_link,
+        &sta_air,
+        &ap_link,
+        0,
+        0,
+        1,
+        dot11::STATUS_SAE_H2E,
+        &sta_sae.write_commit(),
+    );
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.extend_from_slice(&auth);
+
+    let out = ap.handle_incoming(&framed);
+    assert_eq!(
+        out.frames.len(),
+        2,
+        "known MLD identity must yield SAE commit and confirm responses"
+    );
+    let ap_commit_frame = dot11::strip_radiotap(&out.frames[0])
+        .and_then(dot11::Dot11::parse)
+        .expect("AP commit frame parses");
+    let ap_commit = dot11::parse_auth(&ap_commit_frame.body).expect("AP commit auth body");
+    sta_sae
+        .parse_peer_commit(ap_commit.payload)
+        .expect("AP commit parses");
+    sta_sae
+        .process_commit()
+        .expect("known MLD identity derives the same shared secret");
+    let ap_confirm_frame = dot11::strip_radiotap(&out.frames[1])
+        .and_then(dot11::Dot11::parse)
+        .expect("AP confirm frame parses");
+    let ap_confirm = dot11::parse_auth(&ap_confirm_frame.body).expect("AP confirm auth body");
+    sta_sae
+        .check_confirm(ap_confirm.payload)
+        .expect("AP confirm verifies with the retained MLD identity");
+}
+
+#[test]
 fn mld_assoc_rejects_duplicate_and_reused_link_macs() {
     let mut ap = mld_ap_for_tests();
     let sta1 = mac_to_bytes("02:00:00:00:20:01");
@@ -349,6 +479,11 @@ fn mld_assoc_rejects_duplicate_and_reused_link_macs() {
 
     let ok = ap.handle_incoming(&mld_assoc_req(sta1, mld1, &[(1, link1)]));
     assert_eq!(assoc_status(&ok.frames[0]), dot11::STATUS_SUCCESS);
+    assert_eq!(
+        assoc_mld_partner_status(&ok.frames[0]),
+        (1, mac_to_bytes("02:00:00:00:10:02"), dot11::STATUS_SUCCESS),
+        "response accepts the requested partner link using the AP link address"
+    );
     assert_eq!(ap.station_mld_mac(&sta1), Some(mld1));
     assert_eq!(ap.station_mld_link_macs(&sta1), vec![(1, link1)]);
 
@@ -399,6 +534,40 @@ fn mld_sae_userspace_data_uses_mld_ccmp_addresses() {
 
     assert_eq!(sta.connected, 4, "MLD SAE station must complete the 4-way");
     assert!(ap.is_associated(&sta_link0));
+    assert_eq!(
+        ap.station_link_for_peer(&sta_mld),
+        Some(sta_link0),
+        "MLD address resolves to the association station"
+    );
+    assert_eq!(
+        ap.station_link_for_peer(&sta_link1),
+        Some(sta_link0),
+        "partner-link address resolves to the association station"
+    );
+    let station_info = |mac: &[u8; 6]| {
+        (*mac == sta_mld).then(|| StationControlInfo {
+            vlan_id: 4096,
+            ifname: "wlan3.4096".to_string(),
+            telemetry: None,
+        })
+    };
+    let first = handle_command_with_station_info(&mut ap, "STA-FIRST", &station_info).0;
+    assert!(
+        first.starts_with(&format!("{}\n", bytes_to_mac(&sta_mld))),
+        "hostapd control station identity must be the MLD MAC: {first}"
+    );
+    let by_mld = handle_command_with_station_info(
+        &mut ap,
+        &format!("STA {}", bytes_to_mac(&sta_mld)),
+        &station_info,
+    )
+    .0;
+    assert!(by_mld.contains("vlan_id=4096\n"), "{by_mld}");
+    assert!(
+        ap.drain_events()
+            .contains(&ApEvent::Connected { mac: sta_mld }),
+        "SPR connect event uses the stable MLD identity"
+    );
 
     let ping = sta.build_ping(&ap_link0, [10, 10, 10, 2], [10, 10, 10, 1], 0);
     let ping_frame = sta.encrypt_uplink(&ping).expect("MLD uplink encrypts");
@@ -451,6 +620,13 @@ fn mld_sae_userspace_data_uses_mld_ccmp_addresses() {
     assert!(
         !ap.is_associated(&sta_link0),
         "AP must accept STA->AP MLD-protected deauth"
+    );
+    assert!(
+        ap.drain_events().contains(&ApEvent::Disconnected {
+            mac: sta_mld,
+            reason: 3,
+        }),
+        "SPR disconnect event uses the stable MLD identity and client reason"
     );
 }
 

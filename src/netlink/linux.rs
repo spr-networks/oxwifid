@@ -393,6 +393,36 @@ fn nl_add_link(
     sock.request_ack(m)
 }
 
+/// Complete AP bring-up with the SET_BSS operation hostapd issues after every
+/// successful START_AP/SET_BEACON. ath12k can acknowledge START_AP and expose
+/// the MLD links through `iw` while transmitting no beacons until these
+/// per-link BSS parameters have been installed.
+fn nl_set_bss(
+    sock: &mut NetlinkSocket,
+    family: u16,
+    ifindex: u32,
+    link_id: Option<u8>,
+    ht_enabled: bool,
+) -> io::Result<()> {
+    // 6, 12 and 24 Mbps in nl80211's 500-kbps units, matching hostapd's
+    // mandatory OFDM basic-rate set on 5/6 GHz.
+    const AP_BASIC_RATES: [u8; 3] = [0x0c, 0x18, 0x30];
+    let seq = sock.next_seq();
+    let mut m = GenlMessage::new(family, NL80211_CMD_SET_BSS, 0, seq)
+        .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
+        .attr(Attr::u8(NL80211_ATTR_BSS_CTS_PROT, 0))
+        .attr(Attr::u8(NL80211_ATTR_BSS_SHORT_PREAMBLE, 1))
+        .attr(Attr::u8(NL80211_ATTR_AP_ISOLATE, 0))
+        .attr(Attr::bytes(NL80211_ATTR_BSS_BASIC_RATES, &AP_BASIC_RATES));
+    if ht_enabled {
+        m = m.attr(Attr::u16v(NL80211_ATTR_BSS_HT_OPMODE, 0));
+    }
+    if let Some(link_id) = link_id {
+        m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
+    }
+    sock.request_ack(m)
+}
+
 /// Send an EAPOL payload to `dst` over the nl80211 control port (unencrypted,
 /// pre-key). The kernel wraps it into an 802.11 data frame to the station.
 fn nl_send_eapol(
@@ -521,6 +551,44 @@ fn find_ext_ie(ies: &[u8], ext_id: u8) -> Option<&[u8]> {
     None
 }
 
+fn station_ie<'a>(outer: &'a [u8], link: Option<&'a [u8]>, id: u8) -> Option<&'a [u8]> {
+    link.and_then(|ies| dot11::find_ie(ies, id))
+        .or_else(|| dot11::find_ie(outer, id))
+}
+
+fn station_ext_ie<'a>(outer: &'a [u8], link: Option<&'a [u8]>, ext_id: u8) -> Option<&'a [u8]> {
+    link.and_then(|ies| find_ext_ie(ies, ext_id))
+        .or_else(|| find_ext_ie(outer, ext_id))
+}
+
+/// Attach the same station PHY capability attributes hostapd sends. A partner
+/// link's Per-STA Profile overrides the outer association IEs; anything it
+/// omits is inherited from the outer request.
+fn with_station_phy_capabilities(
+    mut msg: GenlMessage,
+    outer: &[u8],
+    link: Option<&[u8]>,
+) -> GenlMessage {
+    if let Some(ht) = station_ie(outer, link, 45) {
+        msg = msg.attr(Attr::bytes(NL80211_ATTR_HT_CAPABILITY, ht));
+    }
+    if let Some(vht) = station_ie(outer, link, 191) {
+        msg = msg.attr(Attr::bytes(NL80211_ATTR_VHT_CAPABILITY, vht));
+    }
+    if std::env::var_os("RUSTAP_NO_HE_CAP").is_none() {
+        if let Some(he) = station_ext_ie(outer, link, 35) {
+            msg = msg.attr(Attr::bytes(NL80211_ATTR_HE_CAPABILITY, he));
+        }
+        if let Some(he6) = station_ext_ie(outer, link, 59) {
+            msg = msg.attr(Attr::bytes(NL80211_ATTR_HE_6GHZ_CAPABILITY, he6));
+        }
+    }
+    if let Some(eht) = station_ext_ie(outer, link, 108) {
+        msg = msg.attr(Attr::bytes(NL80211_ATTR_EHT_CAPABILITY, eht));
+    }
+    msg
+}
+
 /// Extract the QoS Info byte from the station's WMM Information element (vendor
 /// element 221, OUI 00:50:f2, OUI-type 2, subtype 0). Iterates all vendor IEs
 /// since a station may carry several. Used to enable A-MPDU aggregation.
@@ -551,6 +619,7 @@ fn nl_set_station_assoc(
     assoc_ies: Option<&[u8]>,
     mld_mac: Option<&[u8; 6]>,
     link_id: Option<u8>,
+    eml_capability: Option<u16>,
     force_wme: bool,
     mfp: bool,
 ) {
@@ -598,29 +667,16 @@ fn nl_set_station_assoc(
     if let Some(mld_mac) = mld_mac {
         m = m.attr(Attr::bytes(NL80211_ATTR_MLD_ADDR, mld_mac));
     }
-    // Carry the station's HT/VHT/HE capabilities (from its Assoc Request) so the
+    if mld_mac.is_some() {
+        if let Some(eml) = eml_capability.filter(|eml| *eml != 0) {
+            m = m.attr(Attr::u16v(NL80211_ATTR_EML_CAPABILITY, eml));
+        }
+    }
+    // Carry the station's HT/VHT/HE/EHT capabilities (from its Assoc Request) so the
     // driver's rate control can use MCS rates — without these it is treated as a
     // legacy station stuck on the 6 Mbps basic rate.
     if let Some(ies) = assoc_ies {
-        if let Some(ht) = dot11::find_ie(ies, 45) {
-            m = m.attr(Attr::bytes(NL80211_ATTR_HT_CAPABILITY, ht));
-        }
-        if let Some(vht) = dot11::find_ie(ies, 191) {
-            m = m.attr(Attr::bytes(NL80211_ATTR_VHT_CAPABILITY, vht));
-        }
-        // Pass the station's HE Capabilities (the element body after the ext-id,
-        // exactly what the kernel + hostapd expect) so the driver can set up HE
-        // downlink rates + A-MPDU aggregation for it. Without this, an HE-
-        // associated station gives the driver no HE info: on real HE hardware
-        // (e.g. mt7915e) the AP can't TX HE to it and *downlink* stalls near 0,
-        // while uplink — driven by the station's own TX aggregation — still works.
-        // Default on, matching hostapd; escape hatch RUSTAP_NO_HE_CAP=1 disables
-        // it if a particular driver ever regresses.
-        if let Some(he) = find_ext_ie(ies, 35) {
-            if std::env::var_os("RUSTAP_NO_HE_CAP").is_none() {
-                m = m.attr(Attr::bytes(NL80211_ATTR_HE_CAPABILITY, he));
-            }
-        }
+        m = with_station_phy_capabilities(m, ies, None);
         // Mark the station QoS/WMM-capable so the kernel enables A-MPDU
         // aggregation. The QoS Info byte comes from the station's WMM Information
         // element; without this nest a VHT/HE station negotiates a high MCS but
@@ -665,14 +721,16 @@ fn nl_add_link_station(
     listen_interval: u16,
     capability: u16,
     assoc_ies: Option<&[u8]>,
+    link_ies: Option<&[u8]>,
+    eml_capability: Option<u16>,
     mfp: bool,
 ) {
     let mut rates: Vec<u8> = Vec::new();
     if let Some(ies) = assoc_ies {
-        if let Some(sr) = dot11::find_ie(ies, 1) {
+        if let Some(sr) = station_ie(ies, link_ies, 1) {
             rates.extend_from_slice(sr);
         }
-        if let Some(er) = dot11::find_ie(ies, 50) {
+        if let Some(er) = station_ie(ies, link_ies, 50) {
             rates.extend_from_slice(er);
         }
     }
@@ -710,12 +768,10 @@ fn nl_add_link_station(
             ],
         ));
     if let Some(ies) = assoc_ies {
-        if let Some(ht) = dot11::find_ie(ies, 45) {
-            m = m.attr(Attr::bytes(NL80211_ATTR_HT_CAPABILITY, ht));
-        }
-        if let Some(vht) = dot11::find_ie(ies, 191) {
-            m = m.attr(Attr::bytes(NL80211_ATTR_VHT_CAPABILITY, vht));
-        }
+        m = with_station_phy_capabilities(m, ies, link_ies);
+    }
+    if let Some(eml) = eml_capability.filter(|eml| *eml != 0) {
+        m = m.attr(Attr::u16v(NL80211_ATTR_EML_CAPABILITY, eml));
     }
     match sock.request_ack(m) {
         Ok(()) => eprintln!(
@@ -729,41 +785,6 @@ fn nl_add_link_station(
             link_id,
             crate::util::bytes_to_mac(link_sta)
         ),
-    }
-}
-
-fn nl_authorize_link_station(
-    sock: &mut NetlinkSocket,
-    family: u16,
-    ifindex: u32,
-    mld_mac: &[u8; 6],
-    link_id: u8,
-    link_sta: &[u8; 6],
-    mfp: bool,
-) {
-    let mut flags = (1u32 << NL80211_STA_FLAG_AUTHORIZED)
-        | (1u32 << NL80211_STA_FLAG_AUTHENTICATED)
-        | (1u32 << NL80211_STA_FLAG_ASSOCIATED)
-        | (1u32 << NL80211_STA_FLAG_WME);
-    if mfp {
-        flags |= 1u32 << NL80211_STA_FLAG_MFP;
-    }
-    let seq = sock.next_seq();
-    let m = GenlMessage::new(family, NL80211_CMD_MODIFY_LINK_STA, 0, seq)
-        .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
-        .attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id))
-        .attr(Attr::bytes(NL80211_ATTR_MLD_ADDR, mld_mac))
-        .attr(Attr::bytes(NL80211_ATTR_MAC, link_sta))
-        .attr(Attr::bytes(
-            NL80211_ATTR_STA_FLAGS2,
-            &sta_flags(flags, flags),
-        ));
-    if let Err(e) = sock.request_ack(m) {
-        eprintln!(
-            "netlink AP: MODIFY_LINK_STA(authorize) link_id={} link_sta={} failed: {e}",
-            link_id,
-            crate::util::bytes_to_mac(link_sta)
-        );
     }
 }
 
@@ -922,29 +943,59 @@ fn nl_del_key(sock: &mut NetlinkSocket, family: u16, ifindex: u32, idx: u8, link
 }
 
 /// Mark a station 802.1X-authorized so the kernel forwards its data frames.
-fn nl_authorize(
-    sock: &mut NetlinkSocket,
-    family: u16,
-    ifindex: u32,
-    sta: &[u8; 6],
-    link_id: Option<u8>,
-) {
+fn authorize_station_message(family: u16, ifindex: u32, sta: &[u8; 6], seq: u32) -> GenlMessage {
     let bit = 1u32 << NL80211_STA_FLAG_AUTHORIZED;
     let mut flags = bit.to_ne_bytes().to_vec(); // mask
     flags.extend_from_slice(&bit.to_ne_bytes()); // set
-    let seq = sock.next_seq();
-    let mut m = GenlMessage::new(family, NL80211_CMD_SET_STATION, 0, seq)
+    GenlMessage::new(family, NL80211_CMD_SET_STATION, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
         .attr(Attr::bytes(NL80211_ATTR_MAC, sta))
-        .attr(Attr::bytes(NL80211_ATTR_STA_FLAGS2, &flags));
-    if let Some(link_id) = link_id {
-        m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
-    }
+        .attr(Attr::bytes(NL80211_ATTR_STA_FLAGS2, &flags))
+}
+
+fn nl_authorize(sock: &mut NetlinkSocket, family: u16, ifindex: u32, sta: &[u8; 6]) {
+    let seq = sock.next_seq();
+    let m = authorize_station_message(family, ifindex, sta, seq);
     if let Err(e) = sock.request_ack(m) {
         eprintln!(
             "netlink AP: SET_STATION(authorize) {} failed: {e}",
             crate::util::bytes_to_mac(sta)
         );
+    }
+}
+
+#[cfg(test)]
+mod station_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn mld_authorization_uses_only_the_peer_mld_address() {
+        let mld = [0x6e, 0x45, 0xbe, 0x78, 0x3b, 0xf2];
+        let msg = authorize_station_message(42, 343, &mld, 7);
+
+        assert_eq!(msg.cmd, NL80211_CMD_SET_STATION);
+        assert_eq!(
+            msg.attrs
+                .iter()
+                .find(|attr| attr.typ == NL80211_ATTR_MAC)
+                .map(|attr| attr.data.as_slice()),
+            Some(mld.as_slice())
+        );
+        assert!(
+            msg.attrs
+                .iter()
+                .all(|attr| attr.typ != NL80211_ATTR_MLD_ADDR
+                    && attr.typ != NL80211_ATTR_MLO_LINK_ID),
+            "hostapd authorizes MLD state once; it does not address a link station"
+        );
+        let flags = msg
+            .attrs
+            .iter()
+            .find(|attr| attr.typ == NL80211_ATTR_STA_FLAGS2)
+            .expect("STA_FLAGS2");
+        let bit = 1u32 << NL80211_STA_FLAG_AUTHORIZED;
+        assert_eq!(&flags.data[..4], &bit.to_ne_bytes());
+        assert_eq!(&flags.data[4..], &bit.to_ne_bytes());
     }
 }
 
@@ -1059,7 +1110,26 @@ struct WiphyCapabilities {
     vht: Option<Vec<u8>>,
     he: Option<Vec<u8>>,
     eht: Option<Vec<u8>>,
+    eml: Option<u16>,
+    mld: Option<u16>,
 }
+
+impl WiphyCapabilities {
+    fn phy_capabilities(&self) -> dot11::PhyCapabilities {
+        dot11::PhyCapabilities {
+            ht: self.ht.clone(),
+            vht: self.vht.clone(),
+            he: self.he.clone(),
+            eht: self.eht.clone(),
+        }
+    }
+}
+
+// `enum nl80211_band` values from linux/nl80211.h. Keep these named: band 4
+// is S1GHz, not 6 GHz, and querying it silently yields no HE/EHT capabilities.
+const NL80211_BAND_2GHZ: u16 = 0;
+const NL80211_BAND_5GHZ: u16 = 1;
+const NL80211_BAND_6GHZ: u16 = 3;
 
 fn he_ppe_len(header: u8, phy: &[u8]) -> usize {
     if phy.get(6).copied().unwrap_or(0) & 0x80 == 0 {
@@ -1130,10 +1200,10 @@ fn build_eht_capability(attrs: &[(u16, &[u8])], he: &[u8], band: u16) -> Option<
         4 // 20 MHz-only encoding
     } else {
         let mut len = 3; // <=80 MHz
-        if band == 1 && he_width & (0x08 | 0x10) != 0 {
+        if band != NL80211_BAND_2GHZ && he_width & (0x08 | 0x10) != 0 {
             len += 3; // 160/80+80 MHz
         }
-        if band == 4 && phy[0] & 0x02 != 0 {
+        if band == NL80211_BAND_6GHZ && phy[0] & 0x02 != 0 {
             len += 3; // 320 MHz in 6 GHz
         }
         len
@@ -1143,7 +1213,7 @@ fn build_eht_capability(attrs: &[(u16, &[u8])], he: &[u8], band: u16) -> Option<
     }
     // The 320 MHz bit is meaningful only in the 6 GHz band; hostapd clears it
     // in lower-band beacons even when the same radio supports 320 MHz elsewhere.
-    if band != 4 {
+    if band != NL80211_BAND_6GHZ {
         phy[0] &= !0x02;
     }
     phy[0] &= !(0x20 | 0x40); // SU beamformer + SU beamformee
@@ -1209,6 +1279,34 @@ mod wiphy_capability_tests {
                 0x22, 0x22, 0x22,
             ]
         );
+
+        let eht6 =
+            build_eht_capability(&attrs, &he, NL80211_BAND_6GHZ).expect("6 GHz EHT capability");
+        assert_eq!(
+            eht6.len(),
+            20,
+            "6 GHz carries <=80, 160, and 320 MHz MCS maps"
+        );
+        assert_ne!(eht6[2] & 0x02, 0, "6 GHz retains the 320 MHz capability");
+    }
+
+    #[test]
+    fn parses_ap_mld_capabilities_from_per_iftype_wiphy_data() {
+        let entry = Attr::nested(
+            1,
+            &[
+                Attr::u32(NL80211_ATTR_IFTYPE, NL80211_IFTYPE_AP),
+                Attr::bytes(169, &[0]),
+                Attr::bytes(170, &[0]),
+                Attr::u16v(NL80211_ATTR_EML_CAPABILITY, 0x406b),
+                Attr::u16v(NL80211_ATTR_MLD_CAPA_AND_OPS, 0x0024),
+            ],
+        );
+        let message = GenlMessage::new(30, NL80211_CMD_GET_WIPHY, 0, 1)
+            .attr(Attr::nested(NL80211_ATTR_IFTYPE_EXT_CAPA, &[entry]))
+            .to_bytes(1);
+        let attrs = msg::parse_attrs(&message[20..]);
+        assert_eq!(parse_wiphy_mld_capabilities(&attrs), Some((0x406b, 0x0024)));
     }
 }
 
@@ -1288,7 +1386,35 @@ fn parse_wiphy_capabilities(attrs: &[(u16, &[u8])], band: u16) -> Option<WiphyCa
             break;
         }
     }
-    Some(WiphyCapabilities { ht, vht, he, eht })
+    Some(WiphyCapabilities {
+        ht,
+        vht,
+        he,
+        eht,
+        eml: None,
+        mld: None,
+    })
+}
+
+fn parse_wiphy_mld_capabilities(attrs: &[(u16, &[u8])]) -> Option<(u16, u16)> {
+    let entries = msg::find_attr(attrs, NL80211_ATTR_IFTYPE_EXT_CAPA)?;
+    for (_, entry) in msg::parse_attrs(entries) {
+        let entry_attrs = msg::parse_attrs(entry);
+        let iftype = msg::find_attr(&entry_attrs, NL80211_ATTR_IFTYPE)
+            .and_then(|value| value.get(..4))
+            .map(|value| u32::from_ne_bytes(value.try_into().unwrap()));
+        if iftype != Some(NL80211_IFTYPE_AP) {
+            continue;
+        }
+        let eml = msg::find_attr(&entry_attrs, NL80211_ATTR_EML_CAPABILITY)
+            .and_then(|value| value.get(..2))
+            .map(|value| u16::from_ne_bytes(value.try_into().unwrap()))?;
+        let mld = msg::find_attr(&entry_attrs, NL80211_ATTR_MLD_CAPA_AND_OPS)
+            .and_then(|value| value.get(..2))
+            .map(|value| u16::from_ne_bytes(value.try_into().unwrap()))?;
+        return Some((eml, mld));
+    }
+    None
 }
 
 fn nl_get_wiphy_capabilities(
@@ -1309,6 +1435,19 @@ fn nl_get_wiphy_capabilities(
         }
         if src.eht.is_some() {
             dst.eht = src.eht.take();
+        }
+        if src.eml.is_some() {
+            dst.eml = src.eml.take();
+        }
+        if src.mld.is_some() {
+            dst.mld = src.mld.take();
+        }
+    }
+
+    fn merge_mld(dst: &mut WiphyCapabilities, attrs: &[(u16, &[u8])]) {
+        if let Some((eml, mld)) = parse_wiphy_mld_capabilities(attrs) {
+            dst.eml = Some(eml);
+            dst.mld = Some(mld);
         }
     }
 
@@ -1343,6 +1482,7 @@ fn nl_get_wiphy_capabilities(
                 wiphy = msg::find_attr(&attrs, NL80211_ATTR_WIPHY)
                     .and_then(|v| v.get(..4))
                     .map(|v| u32::from_ne_bytes(v.try_into().unwrap()));
+                merge_mld(&mut caps, &attrs);
                 if let Some(found) = parse_wiphy_capabilities(&attrs, band) {
                     merge(&mut caps, found);
                 }
@@ -1391,6 +1531,7 @@ fn nl_get_wiphy_capabilities(
                 .map(|v| u32::from_ne_bytes(v.try_into().unwrap()) == wiphy)
                 .unwrap_or(false);
             if same_wiphy {
+                merge_mld(&mut caps, &attrs);
                 if let Some(found) = parse_wiphy_capabilities(&attrs, band) {
                     merge(&mut caps, found);
                 }
@@ -1398,43 +1539,6 @@ fn nl_get_wiphy_capabilities(
         }
     }
     Some(caps)
-}
-
-fn replace_ie_payload(
-    frame: &mut Vec<u8>,
-    mut pos: usize,
-    id: u8,
-    ext_id: Option<u8>,
-    body: &[u8],
-) {
-    while pos + 2 <= frame.len() {
-        let len = frame[pos + 1] as usize;
-        let end = pos + 2 + len;
-        if end > frame.len() {
-            return;
-        }
-        let matches = frame[pos] == id
-            && match ext_id {
-                Some(ext) => len >= 1 && frame[pos + 2] == ext,
-                None => true,
-            };
-        if matches {
-            let extra = usize::from(ext_id.is_some());
-            if body.len() + extra > u8::MAX as usize {
-                return;
-            }
-            let mut replacement = Vec::with_capacity(2 + extra + body.len());
-            replacement.push(id);
-            replacement.push((extra + body.len()) as u8);
-            if let Some(ext) = ext_id {
-                replacement.push(ext);
-            }
-            replacement.extend_from_slice(body);
-            frame.splice(pos..end, replacement);
-            return;
-        }
-        pos = end;
-    }
 }
 
 fn apply_wiphy_capabilities(frame: &mut Vec<u8>, caps: &WiphyCapabilities) {
@@ -1448,18 +1552,7 @@ fn apply_wiphy_capabilities(frame: &mut Vec<u8>, caps: &WiphyCapabilities) {
         0x10 | 0x30 => 24 + 6,
         _ => return,
     };
-    if let Some(ht) = &caps.ht {
-        replace_ie_payload(frame, ies, 45, None, ht);
-    }
-    if let Some(vht) = &caps.vht {
-        replace_ie_payload(frame, ies, 191, None, vht);
-    }
-    if let Some(he) = &caps.he {
-        replace_ie_payload(frame, ies, 255, Some(35), he);
-    }
-    if let Some(eht) = &caps.eht {
-        replace_ie_payload(frame, ies, 255, Some(108), eht);
-    }
+    dot11::apply_phy_capabilities(frame, ies, &caps.phy_capabilities());
 }
 
 /// hostapd's nl80211 flush operation: DEL_STATION without NL80211_ATTR_MAC
@@ -1540,7 +1633,7 @@ pub fn run_offload_ap(
     spr_api_socket: Option<&str>,
     spr_dhcp_helper: Option<&str>,
 ) -> io::Result<()> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     let mut sock = NetlinkSocket::open()?;
     let (family_id, mlme_group) = resolve_family(&mut sock, "nl80211", "mlme")?;
@@ -1552,22 +1645,47 @@ pub fn run_offload_ap(
     let mld_links = ap.active_mld_links();
     // Primary frequency: 6 GHz is 5950 + 5*chan, otherwise the 2.4/5 GHz table.
     let band6 = ap.band6();
-    let nl_band = if band6 {
-        4 // NL80211_BAND_6GHZ
-    } else if dot11::is_5ghz(channel) {
-        1 // NL80211_BAND_5GHZ
-    } else {
-        0 // NL80211_BAND_2GHZ
-    };
-    let wiphy_caps =
-        nl_get_wiphy_capabilities(&mut sock, family_id, ifindex, nl_band).unwrap_or_default();
-    eprintln!(
-        "netlink AP: radio capabilities HT={} VHT={} HE={} EHT={} bytes",
-        wiphy_caps.ht.as_ref().map_or(0, Vec::len),
-        wiphy_caps.vht.as_ref().map_or(0, Vec::len),
-        wiphy_caps.he.as_ref().map_or(0, Vec::len),
-        wiphy_caps.eht.as_ref().map_or(0, Vec::len),
-    );
+    // nl80211 reports HE/EHT capability blobs per band. An MLD spanning 5 and
+    // 6 GHz must not reuse the primary link's 5 GHz blob for its 6 GHz beacon
+    // or Association Response: strict clients then classify that link as HE/AX.
+    let mut wiphy_caps_by_link: HashMap<u8, WiphyCapabilities> = HashMap::new();
+    for link in &mld_links {
+        let nl_band = if link.band6 {
+            NL80211_BAND_6GHZ
+        } else if dot11::is_5ghz(link.channel) {
+            NL80211_BAND_5GHZ
+        } else {
+            NL80211_BAND_2GHZ
+        };
+        let caps =
+            nl_get_wiphy_capabilities(&mut sock, family_id, ifindex, nl_band).unwrap_or_default();
+        eprintln!(
+            "netlink AP: link_id={} {} GHz capabilities HT={} VHT={} HE={} EHT={} bytes",
+            link.link_id,
+            if link.band6 {
+                "6"
+            } else if dot11::is_5ghz(link.channel) {
+                "5"
+            } else {
+                "2.4"
+            },
+            caps.ht.as_ref().map_or(0, Vec::len),
+            caps.vht.as_ref().map_or(0, Vec::len),
+            caps.he.as_ref().map_or(0, Vec::len),
+            caps.eht.as_ref().map_or(0, Vec::len),
+        );
+        ap.set_mld_link_phy_capabilities(link.link_id, caps.phy_capabilities());
+        wiphy_caps_by_link.insert(link.link_id, caps);
+    }
+    if ap.mld {
+        if let Some((eml, mld)) = wiphy_caps_by_link
+            .values()
+            .find_map(|caps| caps.eml.zip(caps.mld))
+        {
+            ap.set_mld_driver_capabilities(eml, mld);
+            eprintln!("netlink AP: AP MLD driver capabilities EML=0x{eml:04x} MLD=0x{mld:04x}");
+        }
+    }
     let freq: u32 = if band6 {
         5950 + 5 * channel as u32
     } else {
@@ -1640,23 +1758,6 @@ pub fn run_offload_ap(
                 .attr(Attr::bytes(NL80211_ATTR_FRAME_MATCH, &[])),
         );
     }
-    if ap.mld {
-        for link in &mld_links {
-            nl_add_link(&mut sock, family_id, ifindex, link.link_id, &link.mac).map_err(|e| {
-                io::Error::other(format!(
-                    "ADD_LINK link_id={} mac={} failed: {e}",
-                    link.link_id,
-                    crate::util::bytes_to_mac(&link.mac)
-                ))
-            })?;
-            eprintln!(
-                "netlink AP: ADD_LINK link_id={} mac={} ok",
-                link.link_id,
-                crate::util::bytes_to_mac(&link.mac)
-            );
-        }
-    }
-
     // Derive the nl80211 auth type + RSN AKM suite(s) from the AP's configured
     // security mode, instead of hardcoding open-system + WPA2-PSK. The AKM suite
     // list distinguishes the modes; Transition advertises BOTH PSK and SAE AKMs so
@@ -1708,8 +1809,29 @@ pub fn run_offload_ap(
     if let Some(g) = mlme_group {
         let _ = sock.join_multicast(g);
     }
+    // Create the complete MLD topology before installing any beacon template.
+    // Every template contains the other affiliated link's profile, and ath12k
+    // can accept START_AP while silently suppressing that beacon if its partner
+    // link does not exist yet.
+    if ap.mld {
+        for link in &mld_links {
+            nl_add_link(&mut sock, family_id, ifindex, link.link_id, &link.mac).map_err(|e| {
+                io::Error::other(format!(
+                    "ADD_LINK link_id={} mac={} failed: {e}",
+                    link.link_id,
+                    crate::util::bytes_to_mac(&link.mac)
+                ))
+            })?;
+            eprintln!(
+                "netlink AP: ADD_LINK link_id={} mac={} ok",
+                link.link_id,
+                crate::util::bytes_to_mac(&link.mac)
+            );
+        }
+    }
     for link in &mld_links {
-        let link_freq: u32 = if band6 {
+        let link_band6 = link.band6;
+        let link_freq: u32 = if link_band6 {
             5950 + 5 * link.channel as u32
         } else {
             msg::freq_for_channel(link.channel)
@@ -1724,18 +1846,18 @@ pub fn run_offload_ap(
         };
         let link_center_freq1: u32 = if link_width >= 40 {
             dot11::channel_to_center_freq(
-                dot11::center_channel(link.channel, link_width, band6),
-                band6,
+                dot11::center_channel(link.channel, link_width, link_band6),
+                link_band6,
             )
         } else {
             link_freq
         };
         let link_center_chan = if link_width >= 40 {
-            dot11::center_channel(link.channel, link_width, band6)
+            dot11::center_channel(link.channel, link_width, link_band6)
         } else {
             link.channel
         };
-        if !band6 && chandef_is_dfs(link_center_chan, link_width) {
+        if !link_band6 && chandef_is_dfs(link_center_chan, link_width) {
             do_cac(
                 &mut sock,
                 family_id,
@@ -1753,7 +1875,17 @@ pub fn run_offload_ap(
         let mut beacon = dot11::strip_radiotap(&beacon_rt)
             .map(<[u8]>::to_vec)
             .unwrap_or(beacon_rt);
-        apply_wiphy_capabilities(&mut beacon, &wiphy_caps);
+        let link_caps = wiphy_caps_by_link
+            .get(&link.link_id)
+            .expect("capabilities collected for every active link");
+        apply_wiphy_capabilities(&mut beacon, link_caps);
+        if ap.mld {
+            eprintln!(
+                "netlink AP: link_id={} beacon template MLE partner_info={} bytes",
+                link.link_id,
+                dot11::basic_mle_link_info_len(&beacon[36..]).unwrap_or(0)
+            );
+        }
         let (head, tail) = split_beacon_at_tim(&beacon);
         let seq = sock.next_seq();
         let mut start = GenlMessage::new(family_id, NL80211_CMD_START_AP, 0, seq)
@@ -1790,8 +1922,15 @@ pub fn run_offload_ap(
             start = start.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link.link_id));
         }
         sock.request_ack(start)?;
+        nl_set_bss(
+            &mut sock,
+            family_id,
+            ifindex,
+            ap.mld.then_some(link.link_id),
+            !link.band6,
+        )?;
         eprintln!(
-            "netlink AP: START_AP ok — kernel beaconing {:?} link_id={} on {} MHz (ifindex {ifindex})",
+            "netlink AP: START_AP + SET_BSS ok — kernel beaconing {:?} link_id={} on {} MHz (ifindex {ifindex})",
             String::from_utf8_lossy(&ap.ssid),
             link.link_id,
             link_freq
@@ -1814,6 +1953,44 @@ pub fn run_offload_ap(
             ap.mld.then_some(link.link_id),
         );
         eprintln!("netlink AP: broadcast Deauth sent after BSS restart");
+    }
+    // hostapd updates every affiliated link's beacon after all links have
+    // reached START_AP. During the first START_AP the partner link is not yet
+    // active, so mac80211/ath12k retains only the Basic MLE Common Info and
+    // drops the Per-STA Profile that references that inactive link. Re-submit
+    // the complete templates now that every affiliated link exists.
+    if ap.mld && mld_links.len() > 1 {
+        for link in &mld_links {
+            let beacon_rt = ap.beacon_frame_unprotected_for_link(link);
+            let mut beacon = dot11::strip_radiotap(&beacon_rt)
+                .map(<[u8]>::to_vec)
+                .unwrap_or(beacon_rt);
+            let link_caps = wiphy_caps_by_link
+                .get(&link.link_id)
+                .expect("capabilities collected for every active link");
+            apply_wiphy_capabilities(&mut beacon, link_caps);
+            let partner_info = dot11::basic_mle_link_info_len(&beacon[36..]).unwrap_or(0);
+            let (head, tail) = split_beacon_at_tim(&beacon);
+            let seq = sock.next_seq();
+            sock.request_ack(
+                GenlMessage::new(family_id, NL80211_CMD_SET_BEACON, 0, seq)
+                    .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
+                    .attr(Attr::bytes(NL80211_ATTR_BEACON_HEAD, head))
+                    .attr(Attr::bytes(NL80211_ATTR_BEACON_TAIL, tail))
+                    .attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link.link_id)),
+            )?;
+            nl_set_bss(
+                &mut sock,
+                family_id,
+                ifindex,
+                Some(link.link_id),
+                !link.band6,
+            )?;
+            eprintln!(
+                "netlink AP: SET_BEACON + SET_BSS link_id={} with MLE partner_info={} bytes",
+                link.link_id, partner_info
+            );
+        }
     }
     if ap.mld {
         eprintln!(
@@ -1853,7 +2030,14 @@ pub fn run_offload_ap(
         .map(|l| {
             (
                 l.link_id,
-                (l.mac, crate::netlink::msg::freq_for_channel(l.channel)),
+                (
+                    l.mac,
+                    if l.band6 {
+                        5950 + 5 * l.channel as u32
+                    } else {
+                        crate::netlink::msg::freq_for_channel(l.channel)
+                    },
+                ),
             )
         })
         .collect();
@@ -1875,12 +2059,12 @@ pub fn run_offload_ap(
     let mut bigtk_state: std::collections::HashMap<Option<u8>, (u8, [u8; 16])> =
         std::collections::HashMap::new();
     let mut beacon_prot_on = ap.beacon_prot();
-    // Per-STA-VIF: the GTK (key index, bytes) currently installed on each
-    // station's AP_VLAN. Re-installed whenever the AP rotates that station's own
-    // per-station GTK (group rekey toggles its index 1<->2), removing the stale
-    // index — the per-AP_VLAN analogue of the BSS-wide two-phase rekey, so an
-    // AP_VLAN never keeps a stale kernel key and isolation is preserved.
-    let mut vlan_gtk: std::collections::HashMap<[u8; 6], (u8, [u8; 16])> =
+    // Per-STA-VIF: the GTK (key index, bytes) currently installed on every
+    // negotiated link of each station's AP_VLAN. An MLD Group Key message
+    // carries one KDE per link, so the kernel must have the matching key on
+    // every link too; installing it only on the association link pins traffic
+    // there and leaves a partner link without a usable group-key context.
+    let mut vlan_gtk: std::collections::HashMap<([u8; 6], Option<u8>), (u8, [u8; 16])> =
         std::collections::HashMap::new();
     let mut vlan = VlanState {
         enabled: ap.per_sta_vif(),
@@ -1949,9 +2133,9 @@ pub fn run_offload_ap(
                         if fr.len() >= 6 && msg::find_attr(&attrs, NL80211_ATTR_ACK).is_some() {
                             let mut dst = [0u8; 6];
                             dst.copy_from_slice(&fr[..6]);
-                            // Non-MLD: dst is the station MAC. MLD: dst is the MLD
-                            // MAC, so map it to the link station the core tracks.
-                            let sta = ap.station_link_for_mld(&dst).unwrap_or(dst);
+                            // Map an MLD or affiliated-link destination to the
+                            // association-link station the core tracks.
+                            let sta = ap.station_link_for_peer(&dst).unwrap_or(dst);
                             ap.note_eapol_acked(&sta);
                         }
                     }
@@ -1977,6 +2161,22 @@ pub fn run_offload_ap(
                     let Some(tx) = dot11::Dot11::parse(fr) else {
                         continue;
                     };
+                    if tx.subtype() == dot11::SUBTYPE_AUTH {
+                        let (seq, status) = if tx.body.len() >= 6 {
+                            (
+                                u16::from_le_bytes([tx.body[2], tx.body[3]]),
+                                u16::from_le_bytes([tx.body[4], tx.body[5]]),
+                            )
+                        } else {
+                            (0, 0)
+                        };
+                        eprintln!(
+                            "netlink AP: AUTH TX-STATUS dst={} seq={seq} status={status} acked={acked} link={:?}",
+                            crate::util::bytes_to_mac(&tx.addr1),
+                            msg::find_attr(&attrs, NL80211_ATTR_MLO_LINK_ID)
+                                .and_then(|v| v.first()),
+                        );
+                    }
                     let is_assoc_resp = matches!(
                         tx.subtype(),
                         dot11::SUBTYPE_ASSOC_RESP | dot11::SUBTYPE_REASSOC_RESP
@@ -1993,6 +2193,7 @@ pub fn run_offload_ap(
                         continue;
                     }
                     assoc_tx.remove(&sta);
+                    let core_sta = ap.station_link_for_peer(&sta).unwrap_or(sta);
                     if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
                         eprintln!(
                             "netlink AP: ASSOC-RESP TX-STATUS sta={} acked={acked} sc={sc}",
@@ -2001,7 +2202,7 @@ pub fn run_offload_ap(
                     }
                     if acked {
                         if let Some(frame) = held_assoc_eapol.remove(&sta) {
-                            ap.note_eapol_transmitted(&sta);
+                            ap.note_eapol_transmitted(&core_sta);
                             let released = crate::ap::Outgoing {
                                 frames: vec![frame],
                                 to_network: Vec::new(),
@@ -2019,28 +2220,41 @@ pub fn run_offload_ap(
                                 &ap,
                                 &link_route,
                                 &link_params,
-                                &wiphy_caps,
+                                &wiphy_caps_by_link,
                                 &mut assoc_tx,
                                 &mut held_assoc_eapol,
                             );
                         }
+                    } else if ap.is_associated(&core_sta) {
+                        // A delayed negative status for a duplicate/stale
+                        // Association Response must not tear down a station that
+                        // has since proved connectivity by completing m4.
+                        held_assoc_eapol.remove(&sta);
                     } else {
                         held_assoc_eapol.remove(&sta);
-                        ap.note_assoc_response_not_acked(&sta);
+                        ap.note_assoc_response_not_acked(&core_sta);
                         let old_vlan = if vlan.enabled {
-                            vlan.map.remove(&sta)
+                            vlan.map.remove(&core_sta)
                         } else {
                             None
                         };
                         match old_vlan {
                             Some(assignment) => {
-                                nl_del_station(&mut cmd, family_id, assignment.ifindex, &sta);
+                                nl_del_station(
+                                    &mut cmd,
+                                    family_id,
+                                    assignment.ifindex,
+                                    &assignment.sta_addr,
+                                );
                                 nl_del_iface(&mut cmd, family_id, assignment.ifindex);
                             }
-                            None => nl_del_station(&mut cmd, family_id, ifindex, &sta),
+                            None => {
+                                let kernel_addr = ap.station_mld_mac(&core_sta).unwrap_or(core_sta);
+                                nl_del_station(&mut cmd, family_id, ifindex, &kernel_addr);
+                            }
                         }
-                        stations.retain(|s| s != &sta);
-                        keyed.remove(&sta);
+                        stations.retain(|s| s != &core_sta);
+                        keyed.remove(&core_sta);
                     }
                     continue;
                 }
@@ -2104,39 +2318,63 @@ pub fn run_offload_ap(
                             eprintln!("netlink AP: MLD frame head={head}");
                         }
                         // MLD RX translation: learn which link the client is on
-                        // (from MLO_LINK_ID) and rewrite the target link-BSSID
-                        // (addr1 RA + addr3 BSSID) to the canonical `bssid` so the
-                        // single-address `Ap` matches it. addr2 (the client) is
-                        // left untouched.
+                        // and rewrite the target link-BSSID (addr1 RA + addr3
+                        // BSSID) to the canonical `bssid` so the single-address
+                        // `Ap` matches it. ath12k does not consistently attach
+                        // MLO_LINK_ID to pre-association management frames, so
+                        // fall back to the link BSSID and event frequency instead
+                        // of silently dropping a valid Authentication request.
                         let mut fbytes = f.to_vec();
                         if ap.mld {
                             if fbytes.len() < 22 {
                                 continue;
                             }
-                            // Validate before translating: only accept a frame whose
-                            // reported link is configured and whose RA (addr1) and
-                            // BSSID (addr3) match that link's BSSID (or the AP MLD
-                            // MAC). This keeps bogus MLO_LINK_ID/BSSID metadata from
-                            // steering the per-link route or being rewritten to us.
-                            let lid = msg::find_attr(&attrs, NL80211_ATTR_MLO_LINK_ID)
+                            let reported_lid = msg::find_attr(&attrs, NL80211_ATTR_MLO_LINK_ID)
                                 .and_then(|v| v.first())
                                 .copied();
+                            let event_freq = msg::find_attr(&attrs, NL80211_ATTR_WIPHY_FREQ)
+                                .and_then(|v| v.get(..4))
+                                .map(|v| u32::from_ne_bytes(v.try_into().unwrap()));
                             let mut ra = [0u8; 6];
                             ra.copy_from_slice(&fbytes[4..10]);
                             let mut frame_bssid = [0u8; 6];
                             frame_bssid.copy_from_slice(&fbytes[16..22]);
-                            let Some((link_bssid, _)) = lid.and_then(|l| link_params.get(&l))
-                            else {
+                            let Some(lid) = resolve_mld_rx_link(
+                                &link_params,
+                                reported_lid,
+                                event_freq,
+                                &ra,
+                                &frame_bssid,
+                                &ap.mld_mac,
+                                fbytes[0] >> 4 == dot11::SUBTYPE_PROBE_REQ,
+                            ) else {
+                                eprintln!(
+                                    "netlink AP: dropped MLD mgmt subtype={} reported_link={reported_lid:?} freq={event_freq:?} ra={} bssid={} (no matching configured link)",
+                                    fbytes[0] >> 4,
+                                    crate::util::bytes_to_mac(&ra),
+                                    crate::util::bytes_to_mac(&frame_bssid),
+                                );
                                 continue;
                             };
-                            let link_ok = (*link_bssid == ra || ra == ap.mld_mac)
-                                && (*link_bssid == frame_bssid || frame_bssid == ap.mld_mac);
-                            if !link_ok {
-                                continue;
+                            if reported_lid.is_none() {
+                                eprintln!(
+                                    "netlink AP: inferred missing MLO_LINK_ID={} for mgmt subtype={} freq={event_freq:?} ra={}",
+                                    lid,
+                                    fbytes[0] >> 4,
+                                    crate::util::bytes_to_mac(&ra),
+                                );
                             }
                             let mut client = [0u8; 6];
                             client.copy_from_slice(&fbytes[10..16]);
-                            link_route.insert(client, lid.unwrap());
+                            // hostapd translates every address belonging to the
+                            // peer MLD back to the association station before
+                            // running its MLME. Without this, an iPhone that
+                            // later uses its MLD MAC (or partner-link MAC) is
+                            // mistaken for a new station and the live AP_VLAN is
+                            // repeatedly destroyed and recreated.
+                            let core_client = ap.station_link_for_peer(&client).unwrap_or(client);
+                            link_route.insert(core_client, lid);
+                            fbytes[10..16].copy_from_slice(&core_client);
                             fbytes[4..10].copy_from_slice(&bssid);
                             fbytes[16..22].copy_from_slice(&bssid);
                         }
@@ -2157,7 +2395,7 @@ pub fn run_offload_ap(
                         let mut sta = [0u8; 6];
                         sta.copy_from_slice(src);
                         if ap.mld {
-                            if let Some(link_sta) = ap.station_link_for_mld(&sta) {
+                            if let Some(link_sta) = ap.station_link_for_peer(&sta) {
                                 sta = link_sta;
                             }
                             if let Some(&lid) = msg::find_attr(&attrs, NL80211_ATTR_MLO_LINK_ID)
@@ -2196,7 +2434,7 @@ pub fn run_offload_ap(
                     &ap,
                     &link_route,
                     &link_params,
-                    &wiphy_caps,
+                    &wiphy_caps_by_link,
                     &mut assoc_tx,
                     &mut held_assoc_eapol,
                 );
@@ -2221,7 +2459,7 @@ pub fn run_offload_ap(
                 &ap,
                 &link_route,
                 &link_params,
-                &wiphy_caps,
+                &wiphy_caps_by_link,
                 &mut assoc_tx,
                 &mut held_assoc_eapol,
             );
@@ -2236,10 +2474,13 @@ pub fn run_offload_ap(
         let live: HashSet<[u8; 6]> = ap.station_macs().into_iter().collect();
         stations.retain(|s| live.contains(s));
         keyed.retain(|s| live.contains(s));
-        assoc_tx.retain(|s, _| live.contains(s));
-        held_assoc_eapol.retain(|s, _| live.contains(s));
+        // MLO Association Responses and their first EAPOL frame are addressed
+        // to the peer MLD while the core station table is keyed by the
+        // association-link MAC. Preserve either representation.
+        assoc_tx.retain(|s, _| live.contains(s) || ap.station_link_for_peer(s).is_some());
+        held_assoc_eapol.retain(|s, _| live.contains(s) || ap.station_link_for_peer(s).is_some());
         if vlan.enabled {
-            vlan_gtk.retain(|s, _| live.contains(s));
+            vlan_gtk.retain(|(s, _), _| live.contains(s));
             let gone: Vec<[u8; 6]> = vlan
                 .map
                 .keys()
@@ -2252,7 +2493,12 @@ pub fn run_offload_ap(
                     Some(assignment) => match assignment.retire_at {
                         Some(deadline) => now >= deadline,
                         None => {
-                            nl_del_station(&mut cmd, family_id, assignment.ifindex, &s);
+                            nl_del_station(
+                                &mut cmd,
+                                family_id,
+                                assignment.ifindex,
+                                &assignment.sta_addr,
+                            );
                             assignment.retire_at = Some(now + VLAN_EVENT_GRACE);
                             false
                         }
@@ -2287,7 +2533,6 @@ pub fn run_offload_ap(
             if let Some(tk) = ap.station_tk(sta) {
                 let mld_mac = ap.mld.then(|| ap.station_mld_mac(sta)).flatten();
                 let key_sta = mld_mac.as_ref().unwrap_or(sta);
-                let key_link_id = mld_mac.map(|_| ap.link_id);
                 // MLO pairwise keys are addressed to the peer MLD. The kernel
                 // rejects MLO_LINK_ID on pairwise NEW_KEY; per-link scoping only
                 // applies to group/management keys.
@@ -2306,35 +2551,27 @@ pub fn run_offload_ap(
                     // every station); only the per-station GTK *value* differs.
                     let gidx = ap.gtk_key_id();
                     let gkey = ap.station_gtk(sta);
-                    nl_new_key(
-                        &mut cmd,
-                        family_id,
-                        key_if,
-                        None,
-                        gidx,
-                        &gkey,
-                        false,
-                        key_link_id,
-                    );
-                    vlan_gtk.insert(*sta, (gidx, gkey));
-                }
-                nl_authorize(&mut cmd, family_id, key_if, key_sta, key_link_id);
-                if let Some(mld) = mld_mac {
-                    for (peer_link_id, peer_link_mac) in ap.station_mld_link_macs(sta) {
-                        if peer_link_id == ap.link_id {
-                            continue;
-                        }
-                        nl_authorize_link_station(
-                            &mut cmd,
-                            family_id,
-                            key_if,
-                            &mld,
-                            peer_link_id,
-                            &peer_link_mac,
-                            ap.is_pmf(),
+                    let group_links: Vec<Option<u8>> = if mld_mac.is_some() {
+                        ap.station_mld_link_ids(sta).into_iter().map(Some).collect()
+                    } else if ap.mld {
+                        vec![Some(ap.link_id)]
+                    } else {
+                        vec![None]
+                    };
+                    for link_id in group_links {
+                        nl_new_key(
+                            &mut cmd, family_id, key_if, None, gidx, &gkey, false, link_id,
                         );
+                        vlan_gtk.insert((*sta, link_id), (gidx, gkey));
                     }
                 }
+                // Authorization is MLD-level state. Match hostapd: select an
+                // MLO peer by its MLD MAC and issue one plain SET_STATION,
+                // without MLO_LINK_ID/MLD_ADDR and without MODIFY_LINK_STA on
+                // partner links. Applying AUTHORIZED/WME/MFP to link stations
+                // can leave ath12k's data scheduler anchored to the association
+                // link even though the partner station was added successfully.
+                nl_authorize(&mut cmd, family_id, key_if, key_sta);
                 keyed.insert(*sta);
                 newly_keyed = true;
                 eprintln!(
@@ -2395,15 +2632,25 @@ pub fn run_offload_ap(
                 // Shared BSS-wide index, per-station value (see initial install).
                 let gidx = ap.gtk_key_id();
                 let gkey = ap.station_gtk(sta);
-                if vlan_gtk.get(sta) != Some(&(gidx, gkey)) {
-                    let link_id = ap.mld.then_some(ap.link_id);
-                    nl_new_key(&mut cmd, family_id, vidx, None, gidx, &gkey, false, link_id);
-                    if let Some(&(old_idx, _)) = vlan_gtk.get(sta) {
-                        if old_idx != gidx {
-                            nl_del_key(&mut cmd, family_id, vidx, old_idx, link_id);
+                let mld_station = ap.mld && ap.station_mld_mac(sta).is_some();
+                let group_links: Vec<Option<u8>> = if mld_station {
+                    ap.station_mld_link_ids(sta).into_iter().map(Some).collect()
+                } else if ap.mld {
+                    vec![Some(ap.link_id)]
+                } else {
+                    vec![None]
+                };
+                for link_id in group_links {
+                    let state_key = (*sta, link_id);
+                    if vlan_gtk.get(&state_key) != Some(&(gidx, gkey)) {
+                        nl_new_key(&mut cmd, family_id, vidx, None, gidx, &gkey, false, link_id);
+                        if let Some(&(old_idx, _)) = vlan_gtk.get(&state_key) {
+                            if old_idx != gidx {
+                                nl_del_key(&mut cmd, family_id, vidx, old_idx, link_id);
+                            }
                         }
+                        vlan_gtk.insert(state_key, (gidx, gkey));
                     }
-                    vlan_gtk.insert(*sta, (gidx, gkey));
                 }
             }
         }
@@ -2499,7 +2746,7 @@ pub fn run_offload_ap(
                 // route_outputs uses `cmd` below.
                 let stats_sock = std::cell::RefCell::new(&mut cmd);
                 let station_info = |mac: &[u8; 6]| {
-                    vlan.map.get(mac).map(|assignment| {
+                    vlan.assignment_for(mac).map(|assignment| {
                         let telemetry = nl_get_station_telemetry(
                             &mut stats_sock.borrow_mut(),
                             family_id,
@@ -2533,7 +2780,7 @@ pub fn run_offload_ap(
                     &ap,
                     &link_route,
                     &link_params,
-                    &wiphy_caps,
+                    &wiphy_caps_by_link,
                     &mut assoc_tx,
                     &mut held_assoc_eapol,
                 );
@@ -2544,7 +2791,7 @@ pub fn run_offload_ap(
             // action script ignores that extra argv today and synchronously asks
             // `STA <mac>` for `vlan_id`, which the control responder above serves.
             let line = match &ev {
-                crate::ap::ApEvent::Connected { mac } => match vlan.map.get(mac) {
+                crate::ap::ApEvent::Connected { mac } => match vlan.assignment_for(mac) {
                     Some(assignment) => format!("{} vlanid={}", ev.to_line(), assignment.vlan_id),
                     None => ev.to_line(),
                 },
@@ -2564,8 +2811,7 @@ pub fn run_offload_ap(
                     | ApEvent::AuthFailed { mac, .. } => mac,
                 };
                 let iface = vlan
-                    .map
-                    .get(mac)
+                    .assignment_for(mac)
                     .map(|assignment| assignment.ifname.clone())
                     .unwrap_or_else(|| vlan.base_iface.clone());
                 let mac = crate::util::bytes_to_mac(mac);
@@ -2795,12 +3041,16 @@ fn nl_set_sta_vlan(
     ap_ifindex: u32,
     sta: &[u8; 6],
     vlan_ifindex: u32,
+    link_id: Option<u8>,
 ) -> io::Result<()> {
     let seq = sock.next_seq();
-    let m = GenlMessage::new(family, NL80211_CMD_SET_STATION, 0, seq)
+    let mut m = GenlMessage::new(family, NL80211_CMD_SET_STATION, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ap_ifindex))
         .attr(Attr::bytes(NL80211_ATTR_MAC, sta))
         .attr(Attr::u32(NL80211_ATTR_STA_VLAN, vlan_ifindex));
+    if let Some(link_id) = link_id {
+        m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
+    }
     sock.request_ack(m)
 }
 
@@ -2821,6 +3071,9 @@ struct VlanAssignment {
     ifindex: u32,
     vlan_id: u32,
     ifname: String,
+    /// nl80211 indexes an MLO peer by its MLD MAC even though RustAP's frame
+    /// state remains keyed by the association-link MAC.
+    sta_addr: [u8; 6],
     retire_at: Option<Instant>,
 }
 
@@ -2838,6 +3091,139 @@ impl VlanState {
             .ok_or_else(|| io::Error::other("no free per-station VIF id"))?;
         let ifname = per_sta_vif_name(&self.base_iface, vlan_id).map_err(io::Error::other)?;
         Ok((vlan_id, ifname))
+    }
+
+    fn assignment_for(&self, mac: &[u8; 6]) -> Option<&VlanAssignment> {
+        self.map.get(mac).or_else(|| {
+            self.map
+                .values()
+                .find(|assignment| &assignment.sta_addr == mac)
+        })
+    }
+}
+
+/// Resolve the affiliated link carrying a received MLD management frame.
+///
+/// nl80211 normally supplies `MLO_LINK_ID`, but ath12k can omit it for
+/// pre-association Authentication frames. In that case the on-air RA/BSSID
+/// identifies a unique link; an MLD-addressed frame can additionally be
+/// disambiguated by the event frequency. A present-but-inconsistent link ID is
+/// never overridden.
+fn resolve_mld_rx_link(
+    link_params: &std::collections::HashMap<u8, ([u8; 6], u32)>,
+    reported_link_id: Option<u8>,
+    event_freq: Option<u32>,
+    ra: &[u8; 6],
+    frame_bssid: &[u8; 6],
+    ap_mld_mac: &[u8; 6],
+    allow_broadcast: bool,
+) -> Option<u8> {
+    let broadcast = [0xff; 6];
+    let address_matches = |link_bssid: &[u8; 6]| {
+        (ra == link_bssid || ra == ap_mld_mac || (allow_broadcast && ra == &broadcast))
+            && (frame_bssid == link_bssid
+                || frame_bssid == ap_mld_mac
+                || (allow_broadcast && frame_bssid == &broadcast))
+    };
+
+    if let Some(link_id) = reported_link_id {
+        return link_params
+            .get(&link_id)
+            .filter(|(link_bssid, _)| address_matches(link_bssid))
+            .map(|_| link_id);
+    }
+
+    let candidates: Vec<(u8, u32)> = link_params
+        .iter()
+        .filter(|(_, (link_bssid, _))| address_matches(link_bssid))
+        .map(|(link_id, (_, freq))| (*link_id, *freq))
+        .collect();
+    if candidates.len() == 1 {
+        return Some(candidates[0].0);
+    }
+    event_freq.and_then(|freq| {
+        let matching: Vec<u8> = candidates
+            .iter()
+            .filter(|(_, link_freq)| *link_freq == freq)
+            .map(|(link_id, _)| *link_id)
+            .collect();
+        (matching.len() == 1).then_some(matching[0])
+    })
+}
+
+#[cfg(test)]
+mod mld_rx_link_tests {
+    use super::resolve_mld_rx_link;
+    use std::collections::HashMap;
+
+    fn links() -> HashMap<u8, ([u8; 6], u32)> {
+        HashMap::from([
+            (0, ([0x06, 0xf0, 0x21, 0xc9, 0x1e, 0xef], 5180)),
+            (1, ([0x06, 0xf0, 0x21, 0xc9, 0x1e, 0xee], 6135)),
+        ])
+    }
+
+    #[test]
+    fn missing_link_id_is_inferred_from_link_bssid() {
+        let links = links();
+        let mld = [0x04, 0xf0, 0x21, 0xc9, 0x1e, 0xff];
+        let link1 = links[&1].0;
+        assert_eq!(
+            resolve_mld_rx_link(&links, None, None, &link1, &link1, &mld, false),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn mld_address_is_disambiguated_by_event_frequency() {
+        let links = links();
+        let mld = [0x04, 0xf0, 0x21, 0xc9, 0x1e, 0xff];
+        assert_eq!(
+            resolve_mld_rx_link(&links, None, Some(6135), &mld, &mld, &mld, false),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn inconsistent_reported_link_is_rejected() {
+        let links = links();
+        let mld = [0x04, 0xf0, 0x21, 0xc9, 0x1e, 0xff];
+        let link1 = links[&1].0;
+        assert_eq!(
+            resolve_mld_rx_link(&links, Some(0), Some(6135), &link1, &link1, &mld, false,),
+            None
+        );
+    }
+
+    #[test]
+    fn broadcast_probe_uses_reported_link() {
+        let links = links();
+        let mld = [0x04, 0xf0, 0x21, 0xc9, 0x1e, 0xff];
+        let broadcast = [0xff; 6];
+        assert_eq!(
+            resolve_mld_rx_link(
+                &links,
+                Some(0),
+                Some(5180),
+                &broadcast,
+                &broadcast,
+                &mld,
+                true,
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn directed_probe_with_broadcast_ra_uses_reported_link() {
+        let links = links();
+        let mld = [0x04, 0xf0, 0x21, 0xc9, 0x1e, 0xff];
+        let broadcast = [0xff; 6];
+        let link1 = links[&1].0;
+        assert_eq!(
+            resolve_mld_rx_link(&links, Some(1), Some(6135), &broadcast, &link1, &mld, true,),
+            Some(1)
+        );
     }
 }
 
@@ -2886,7 +3272,7 @@ fn route_outputs(
     ap: &crate::ap::Ap,
     link_route: &std::collections::HashMap<[u8; 6], u8>,
     link_params: &std::collections::HashMap<u8, ([u8; 6], u32)>,
-    wiphy_caps: &WiphyCapabilities,
+    wiphy_caps_by_link: &std::collections::HashMap<u8, WiphyCapabilities>,
     assoc_tx: &mut std::collections::HashMap<[u8; 6], u16>,
     held_assoc_eapol: &mut std::collections::HashMap<[u8; 6], Vec<u8>>,
 ) {
@@ -2918,9 +3304,10 @@ fn route_outputs(
             // leave the ensuing 4-way frames queued against a torn-down peer.
             // Configure only successful responses; rejected associations must
             // never create a kernel station.
-            if assoc_succeeded && !(stations.contains(&d.addr1) && !keyed.contains(&d.addr1)) {
-                let cap = u16::from_le_bytes([d.body[0], d.body[1]]);
+            let sta_addr = ap.station_link_for_peer(&d.addr1).unwrap_or(d.addr1);
+            if assoc_succeeded && !(stations.contains(&sta_addr) && !keyed.contains(&sta_addr)) {
                 let aid = u16::from_le_bytes([d.body[4], d.body[5]]) & 0x3fff;
+                let mld_mac = ap.mld.then(|| ap.station_mld_mac(&sta_addr)).flatten();
                 // (Re-)association: tear down any prior incarnation of this
                 // station and rebuild it, and drop it from `keyed` so the fresh
                 // 4-way re-installs keys (a rejoining client derives new keys).
@@ -2928,16 +3315,19 @@ fn route_outputs(
                 // from *that* interface, then its VLAN torn down — deleting it on
                 // the main AP leaves a stale station on the old VLAN.
                 let old_vlan = if vlan.enabled {
-                    vlan.map.remove(&d.addr1)
+                    vlan.map.remove(&sta_addr)
                 } else {
                     None
                 };
                 match old_vlan {
                     Some(assignment) => {
-                        nl_del_station(cmd, family, assignment.ifindex, &d.addr1);
+                        nl_del_station(cmd, family, assignment.ifindex, &assignment.sta_addr);
                         nl_del_iface(cmd, family, assignment.ifindex);
                     }
-                    None => nl_del_station(cmd, family, ifindex, &d.addr1),
+                    None => {
+                        let kernel_addr = mld_mac.unwrap_or(sta_addr);
+                        nl_del_station(cmd, family, ifindex, &kernel_addr);
+                    }
                 }
                 // HT/VHT caps go in SET_STATION (the only place rate control reads
                 // them); NEW_STATION adds the station unassociated first so SET can
@@ -2946,31 +3336,49 @@ fn route_outputs(
                 let sta_caps = if std::env::var_os("RUSTAP_NO_STA_CAPS").is_some() {
                     None
                 } else {
-                    ap.station_assoc_ies(&d.addr1)
+                    ap.station_assoc_ies(&sta_addr)
                 };
-                let listen_interval = ap.station_listen_interval(&d.addr1).unwrap_or(0);
-                let mld_mac = ap.mld.then(|| ap.station_mld_mac(&d.addr1)).flatten();
-                let link_id = mld_mac.map(|_| ap.link_id);
-                nl_new_station(cmd, family, ifindex, &d.addr1, mld_mac.as_ref(), link_id);
-                nl_set_station_assoc(
-                    cmd,
-                    family,
-                    ifindex,
-                    &d.addr1,
-                    aid,
-                    listen_interval,
-                    cap,
-                    sta_caps,
-                    mld_mac.as_ref(),
-                    link_id,
-                    mld_mac.is_some(),
-                    ap.is_pmf(),
-                );
+                let listen_interval = ap.station_listen_interval(&sta_addr).unwrap_or(0);
+                let capability = ap.station_capability(&sta_addr).unwrap_or(0);
+                // An AP MLD must scope every station add/modify request to its
+                // association link. A legacy station has no MLD_ADDR, but it
+                // still requires MLO_LINK_ID or cfg80211 rejects NEW_STATION.
+                let link_id = ap.mld.then_some(ap.link_id);
+                let eml_capability = sta_caps.and_then(dot11::parse_mld_eml_capability);
+                let mld_capability = sta_caps.and_then(dot11::parse_mld_capability);
                 if let Some(mld) = mld_mac {
-                    for (peer_link_id, peer_link_mac) in ap.station_mld_link_macs(&d.addr1) {
+                    eprintln!(
+                        "netlink AP: MLD station link={} mld={} EML=0x{:04x} MLD=0x{:04x} max_simultaneous_links={} negotiated_links={:?}",
+                        crate::util::bytes_to_mac(&sta_addr),
+                        crate::util::bytes_to_mac(&mld),
+                        eml_capability.unwrap_or(0),
+                        mld_capability.unwrap_or(0),
+                        mld_capability.map(|cap| (cap & 0x000f) + 1).unwrap_or(0),
+                        ap.station_mld_link_ids(&sta_addr),
+                    );
+                }
+                // Match hostapd's MLO state-transition order exactly:
+                //
+                //   1. NEW_STATION creates the association-link peer unassociated.
+                //   2. ADD_LINK_STA creates every negotiated partner peer.
+                //   3. SET_STATION advances the complete MLD to ASSOCIATED.
+                //
+                // ath12k prepares its firmware peer-association MLO partner list
+                // only during step 3. Associating the primary before step 2 leaves
+                // num_partner_links=0 in WMI; ADD_LINK_STA then succeeds in the
+                // kernel but never enrolls that late peer in firmware scheduling.
+                nl_new_station(cmd, family, ifindex, &sta_addr, mld_mac.as_ref(), link_id);
+                if let Some(mld) = mld_mac {
+                    let link_profiles = sta_caps
+                        .map(dot11::parse_mld_link_profiles)
+                        .unwrap_or_default();
+                    for (peer_link_id, peer_link_mac) in ap.station_mld_link_macs(&sta_addr) {
                         if peer_link_id == ap.link_id {
                             continue;
                         }
+                        let profile = link_profiles.iter().find(|profile| {
+                            profile.link_id == peer_link_id && profile.mac == peer_link_mac
+                        });
                         nl_add_link_station(
                             cmd,
                             family,
@@ -2980,15 +3388,34 @@ fn route_outputs(
                             &peer_link_mac,
                             aid,
                             listen_interval,
-                            cap,
+                            profile
+                                .and_then(|profile| profile.capability)
+                                .unwrap_or(capability),
                             sta_caps,
+                            profile.map(|profile| profile.ies.as_slice()),
+                            eml_capability,
                             ap.is_pmf(),
                         );
                     }
                 }
-                keyed.remove(&d.addr1);
-                if !stations.contains(&d.addr1) {
-                    stations.push(d.addr1);
+                nl_set_station_assoc(
+                    cmd,
+                    family,
+                    ifindex,
+                    &sta_addr,
+                    aid,
+                    listen_interval,
+                    capability,
+                    sta_caps,
+                    mld_mac.as_ref(),
+                    link_id,
+                    eml_capability,
+                    mld_mac.is_some(),
+                    ap.is_pmf(),
+                );
+                keyed.remove(&sta_addr);
+                if !stations.contains(&sta_addr) {
+                    stations.push(sta_addr);
                 }
                 if vlan.enabled {
                     // Per-station VIF: give this station its own AP_VLAN so its
@@ -3003,22 +3430,30 @@ fn route_outputs(
                     };
                     match nl_create_ap_vlan(cmd, family, ifindex, &name) {
                         Ok(vidx) => {
-                            if let Err(e) = nl_set_sta_vlan(cmd, family, ifindex, &d.addr1, vidx) {
+                            // cfg80211 stores an MLO peer under its MLD MAC.
+                            // hostapd translates the station identity before
+                            // SET_STATION(STA_VLAN); using the link address here
+                            // returns ENOENT on ath12k.
+                            let kernel_addr = mld_mac.unwrap_or(sta_addr);
+                            if let Err(e) =
+                                nl_set_sta_vlan(cmd, family, ifindex, &kernel_addr, vidx, link_id)
+                            {
                                 eprintln!("netlink AP: set_sta_vlan failed: {e}");
                                 nl_del_iface(cmd, family, vidx);
                             } else {
                                 vlan.map.insert(
-                                    d.addr1,
+                                    sta_addr,
                                     VlanAssignment {
                                         ifindex: vidx,
                                         vlan_id,
                                         ifname: name.clone(),
+                                        sta_addr: kernel_addr,
                                         retire_at: None,
                                     },
                                 );
                                 eprintln!(
                                     "netlink AP: station {} -> {name} (vlan_id {vlan_id}, ifindex {vidx})",
-                                    crate::util::bytes_to_mac(&d.addr1)
+                                    crate::util::bytes_to_mac(&kernel_addr)
                                 );
                             }
                         }
@@ -3042,7 +3477,12 @@ fn route_outputs(
                     tx[16..22].copy_from_slice(&lb);
                 }
             }
-            apply_wiphy_capabilities(&mut tx, wiphy_caps);
+            if let Some(caps) = tlink
+                .and_then(|link_id| wiphy_caps_by_link.get(&link_id))
+                .or_else(|| wiphy_caps_by_link.get(&ap.link_id))
+            {
+                apply_wiphy_capabilities(&mut tx, caps);
+            }
             nl_send_mgmt(sock, family, ifindex, tfreq, &tx, tlink);
         } else if d.frame_type() == dot11::TYPE_DATA && d.body.len() > 8 {
             if assoc_tx.contains_key(&d.addr1) {
@@ -3058,13 +3498,14 @@ fn route_outputs(
                 }
                 continue;
             }
-            let mld_mac = ap.mld.then(|| ap.station_mld_mac(&d.addr1)).flatten();
+            let core_sta = ap.station_link_for_peer(&d.addr1).unwrap_or(d.addr1);
+            let mld_mac = ap.mld.then(|| ap.station_mld_mac(&core_sta)).flatten();
             let dst = mld_mac.as_ref().unwrap_or(&d.addr1);
             // Send the EAPOL on the client's link (the kernel builds the MPDU
             // with that link's address from the link id). Uses the command socket:
             // the send is synchronous (NLM_F_ACK) so kernel rejections surface,
             // and waiting on the event socket would drop frame events.
-            let (_f, link_id) = mld_route(ap, link_route, link_params, freq, &d.addr1);
+            let (_f, link_id) = mld_route(ap, link_route, link_params, freq, &core_sta);
             let eapol = &d.body[8..];
             nl_send_eapol(cmd, family, ifindex, dst, eapol, link_id);
         }

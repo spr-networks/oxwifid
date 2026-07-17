@@ -1,5 +1,5 @@
 //! hostapd-style `wpa_psk_file` candidate selection: per-MAC entries tried
-//! before wildcard (00:00:00:00:00:00) onboarding entries, verified against the
+//! before wildcard onboarding entries, verified against the
 //! 4-way handshake's message-2 MIC. Deterministic in-process handshakes (no
 //! hwsim) so the credential-matching logic is tested independent of the medium.
 
@@ -109,6 +109,30 @@ fn wrong_password_is_rejected() {
 }
 
 #[test]
+fn configured_bss_password_is_not_a_fallback_when_file_is_authoritative() {
+    let sta_mac = mac_to_bytes("02:00:00:00:00:df");
+    let (mut ap, mut net) = ap_with_file(&[(None, "onboardpass")]);
+    let mut sta = Client::new("pnet", "the-default-psk", sta_mac);
+    assert_ne!(
+        try_connect(&mut ap, &mut net, &mut sta),
+        4,
+        "JSON/default password bypassed the authoritative credential file"
+    );
+}
+
+#[test]
+fn empty_authoritative_file_fails_closed() {
+    let sta_mac = mac_to_bytes("02:00:00:00:00:e0");
+    let (mut ap, mut net) = ap_with_file(&[]);
+    let mut sta = Client::new("pnet", "the-default-psk", sta_mac);
+    assert_ne!(
+        try_connect(&mut ap, &mut net, &mut sta),
+        4,
+        "empty credential file fell back to the configured password"
+    );
+}
+
+#[test]
 fn re_auth_with_different_password_after_pin() {
     // Onboard on the wildcard (pins that PMK), then the SAME station re-auths
     // with its now-assigned device password — the stale wildcard pin must be
@@ -143,10 +167,14 @@ fn sae_uses_mac_specific_credential() {
 }
 
 #[test]
-fn sae_uses_configured_fallback_for_unlisted_station() {
+fn sae_rejects_configured_fallback_for_unlisted_station() {
     let allowed = mac_to_bytes("02:00:00:00:00:f1");
     let (mut ap, mut net) = sae_ap_with_file(&[(Some(allowed), "devicepass")]);
     let mut sta = Client::new("pnet", "the-default-psk", mac_to_bytes("02:00:00:00:00:f2"));
     sta.enable_sae();
-    assert_eq!(try_connect(&mut ap, &mut net, &mut sta), 4);
+    assert_ne!(
+        try_connect(&mut ap, &mut net, &mut sta),
+        4,
+        "SAE bypassed the authoritative per-device credential file"
+    );
 }

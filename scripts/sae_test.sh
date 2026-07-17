@@ -19,7 +19,7 @@ AP=${HW[0]:-}; STA=${HW[1]:-}
 echo "AP=$AP STA=$STA phy=$PHY" > "$W/info.txt"
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up
 ip addr flush dev "$AP"; ip addr add 10.10.10.1/24 dev "$AP"
-setsid "$B" --mode netlink --iface "$AP" --channel 36 --width 80 --phy "$PHY" --sae \
+setsid "$B" --mode netlink --iface "$AP" --band 5 --channel 36 --width 80 --phy "$PHY" --sae \
   --ssid saetest --psk password1234 </dev/null >"$W/ap.log" 2>&1 &
 sleep 5
 grep -aq "START_AP ok" "$W/ap.log" || { echo "ERR: AP failed: $(tail -1 "$W/ap.log")" > "$W/result.txt"; exit 1; }

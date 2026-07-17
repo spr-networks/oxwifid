@@ -9,6 +9,18 @@
 use hmac::{Hmac, Mac};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
+use p256::{
+    elliptic_curve::{
+        array::Array,
+        consts::U48,
+        ops::Reduce,
+        sec1::{FromSec1Point, ToSec1Point},
+        Group, PrimeField,
+    },
+    hash2curve::MapToCurve,
+    AffinePoint as P256AffinePoint, FieldBytes, NistP256, ProjectivePoint as P256ProjectivePoint,
+    Scalar as P256Scalar,
+};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -73,6 +85,45 @@ pub enum Point {
     Affine(BigUint, BigUint),
 }
 
+fn point_to_p256(point: &Point) -> Option<P256ProjectivePoint> {
+    match point {
+        Point::Infinity => Some(P256ProjectivePoint::IDENTITY),
+        Point::Affine(x, y) => {
+            let mut sec1 = [0u8; 1 + 2 * PRIME_LEN];
+            sec1[0] = 0x04;
+            sec1[1..1 + PRIME_LEN].copy_from_slice(&scalar_pad(x, PRIME_LEN));
+            sec1[1 + PRIME_LEN..].copy_from_slice(&scalar_pad(y, PRIME_LEN));
+            P256AffinePoint::from_sec1_bytes(&sec1)
+                .ok()
+                .map(P256ProjectivePoint::from)
+        }
+    }
+}
+
+fn point_from_p256(point: P256ProjectivePoint) -> Point {
+    if bool::from(point.is_identity()) {
+        return Point::Infinity;
+    }
+    let encoded = point.to_affine().to_sec1_point(false);
+    let bytes = encoded.as_bytes();
+    Point::Affine(
+        BigUint::from_bytes_be(&bytes[1..1 + PRIME_LEN]),
+        BigUint::from_bytes_be(&bytes[1 + PRIME_LEN..]),
+    )
+}
+
+fn scalar_to_p256(value: &BigUint, modulus: &BigUint) -> P256Scalar {
+    let reduced = value % modulus;
+    let mut bytes = FieldBytes::default();
+    bytes.copy_from_slice(&scalar_pad(&reduced, PRIME_LEN));
+    Option::<P256Scalar>::from(P256Scalar::from_repr(bytes)).expect("scalar reduced modulo n")
+}
+
+fn scalar_from_p256(value: &P256Scalar) -> BigUint {
+    let bytes: FieldBytes = value.into();
+    BigUint::from_bytes_be(&bytes)
+}
+
 pub struct Curve {
     pub p: BigUint,
     pub a: BigUint,
@@ -94,118 +145,23 @@ impl Curve {
         }
     }
 
-    fn fmul(&self, a: &BigUint, b: &BigUint) -> BigUint {
-        (a * b) % &self.p
-    }
-    fn fadd(&self, a: &BigUint, b: &BigUint) -> BigUint {
-        (a + b) % &self.p
-    }
-    fn fsub(&self, a: &BigUint, b: &BigUint) -> BigUint {
-        // (a - b) mod p, avoiding negatives
-        let am = a % &self.p;
-        let bm = b % &self.p;
-        (&am + &self.p - bm) % &self.p
-    }
-    fn finv(&self, a: &BigUint) -> BigUint {
-        // Fermat: a^(p-2) mod p
-        a.modpow(&(&self.p - 2u32), &self.p)
-    }
-    /// sqrt for p == 3 (mod 4): a^((p+1)/4) mod p.
-    pub fn fsqrt(&self, a: &BigUint) -> BigUint {
-        let exp = (&self.p + 1u32) >> 2;
-        a.modpow(&exp, &self.p)
-    }
-    /// Legendre-style: returns true if a is a quadratic residue (or zero).
-    fn is_qr(&self, a: &BigUint) -> bool {
-        if a.is_zero() {
-            return true;
-        }
-        let exp = (&self.p - 1u32) >> 1;
-        a.modpow(&exp, &self.p).is_one()
-    }
-
-    /// Strict quadratic-residue test (non-zero square), for hunting-and-pecking.
-    fn is_quadratic_residue(&self, a: &BigUint) -> bool {
-        !a.is_zero() && {
-            let exp = (&self.p - 1u32) >> 1;
-            a.modpow(&exp, &self.p).is_one()
-        }
-    }
-
-    /// y^2 = x^3 + a*x + b mod p.
-    fn y_sqr(&self, x: &BigUint) -> BigUint {
-        let x3 = self.fmul(&self.fmul(x, x), x);
-        self.fadd(&self.fadd(&x3, &self.fmul(&self.a, x)), &self.b)
-    }
-
     pub fn on_curve(&self, pt: &Point) -> bool {
-        match pt {
-            Point::Infinity => true,
-            Point::Affine(x, y) => {
-                let lhs = self.fmul(y, y);
-                let x3 = self.fmul(&self.fmul(x, x), x);
-                let ax = self.fmul(&self.a, x);
-                let rhs = self.fadd(&self.fadd(&x3, &ax), &self.b);
-                lhs == rhs
-            }
-        }
+        point_to_p256(pt).is_some()
     }
 
     pub fn negate(&self, pt: &Point) -> Point {
-        match pt {
-            Point::Infinity => Point::Infinity,
-            Point::Affine(x, y) => Point::Affine(x.clone(), (&self.p - y) % &self.p),
-        }
-    }
-
-    fn double(&self, pt: &Point) -> Point {
-        match pt {
-            Point::Infinity => Point::Infinity,
-            Point::Affine(x, y) => {
-                if y.is_zero() {
-                    return Point::Infinity;
-                }
-                // lambda = (3x^2 + a) / (2y)
-                let three_x2 = self.fmul(&BigUint::from(3u32), &self.fmul(x, x));
-                let num = self.fadd(&three_x2, &self.a);
-                let den = self.finv(&self.fmul(&BigUint::from(2u32), y));
-                let lam = self.fmul(&num, &den);
-                let x3 = self.fsub(&self.fmul(&lam, &lam), &self.fmul(&BigUint::from(2u32), x));
-                let y3 = self.fsub(&self.fmul(&lam, &self.fsub(x, &x3)), y);
-                Point::Affine(x3, y3)
-            }
-        }
+        point_from_p256(-point_to_p256(pt).expect("validated P-256 point"))
     }
 
     pub fn add(&self, p1: &Point, p2: &Point) -> Point {
-        match (p1, p2) {
-            (Point::Infinity, _) => p2.clone(),
-            (_, Point::Infinity) => p1.clone(),
-            (Point::Affine(x1, y1), Point::Affine(x2, y2)) => {
-                if x1 == x2 {
-                    if y1 == y2 {
-                        return self.double(p1);
-                    }
-                    return Point::Infinity; // p1 == -p2
-                }
-                let lam = self.fmul(&self.fsub(y2, y1), &self.finv(&self.fsub(x2, x1)));
-                let x3 = self.fsub(&self.fsub(&self.fmul(&lam, &lam), x1), x2);
-                let y3 = self.fsub(&self.fmul(&lam, &self.fsub(x1, &x3)), y1);
-                Point::Affine(x3, y3)
-            }
-        }
+        let p1 = point_to_p256(p1).expect("validated P-256 point");
+        let p2 = point_to_p256(p2).expect("validated P-256 point");
+        point_from_p256(p1 + p2)
     }
 
     pub fn scalar_mul(&self, k: &BigUint, pt: &Point) -> Point {
-        let mut result = Point::Infinity;
-        let bits = k.bits();
-        for i in (0..bits).rev() {
-            result = self.double(&result);
-            if k.bit(i) {
-                result = self.add(&result, pt);
-            }
-        }
-        result
+        let point = point_to_p256(pt).expect("validated P-256 point");
+        point_from_p256(point * scalar_to_p256(k, &self.n))
     }
 
     /// Serialize an affine point as x||y (big-endian, prime_len each).
@@ -228,16 +184,11 @@ impl Curve {
         if data.len() != 2 * PRIME_LEN {
             return None;
         }
-        let x = BigUint::from_bytes_be(&data[..PRIME_LEN]);
-        let y = BigUint::from_bytes_be(&data[PRIME_LEN..]);
-        if x >= self.p || y >= self.p {
-            return None;
-        }
-        let pt = Point::Affine(x, y);
-        if !self.on_curve(&pt) {
-            return None;
-        }
-        Some(pt)
+        let mut sec1 = Vec::with_capacity(1 + data.len());
+        sec1.push(0x04);
+        sec1.extend_from_slice(data);
+        let affine = P256AffinePoint::from_sec1_bytes(&sec1).ok()?;
+        Some(point_from_p256(P256ProjectivePoint::from(affine)))
     }
 
     /// Serialize a point in SEC1 compressed form (0x02/0x03 || X), as OWE and
@@ -257,87 +208,22 @@ impl Curve {
     /// Parse a SEC1 compressed point (0x02/0x03 || X), recovering Y. P-256 has
     /// p ≡ 3 (mod 4), so the square root is `v^((p+1)/4) mod p`.
     pub fn point_from_compressed(&self, data: &[u8]) -> Option<Point> {
-        if data.len() != 1 + PRIME_LEN || (data[0] != 0x02 && data[0] != 0x03) {
-            return None;
-        }
-        let x = BigUint::from_bytes_be(&data[1..]);
-        if x >= self.p {
-            return None;
-        }
-        let p = &self.p;
-        // rhs = x^3 + a*x + b mod p
-        let rhs = (&x * &x % p * &x % p + &self.a * &x % p + &self.b) % p;
-        let exp = (p + BigUint::one()) >> 2; // (p+1)/4
-        let mut y = rhs.modpow(&exp, p);
-        if &y * &y % p != rhs {
-            return None; // x is not on the curve
-        }
-        if y.bit(0) != (data[0] == 0x03) {
-            y = p - &y;
-        }
-        let pt = Point::Affine(x, y);
-        if !self.on_curve(&pt) {
-            return None;
-        }
-        Some(pt)
+        let affine = P256AffinePoint::from_sec1_bytes(data).ok()?;
+        Some(point_from_p256(P256ProjectivePoint::from(affine)))
     }
 }
 
-// ---------------------------------------------------------------------------
-// SSWU (Simplified SWU) map for group 19 (z = -10), per hostap sswu()
-// ---------------------------------------------------------------------------
-
-fn sswu(c: &Curve, u: &BigUint) -> Point {
-    let p = &c.p;
-    let z = (p - 10u32) % p; // z = -10 mod p
-    let one = BigUint::one();
-
-    // m = z^2*u^4 + z*u^2  (t1 = z*u^2 ; m = t1 + t1^2)
-    let u2 = c.fmul(u, u);
-    let t1 = c.fmul(&z, &u2);
-    let t2 = c.fmul(&t1, &t1);
-    let m = c.fadd(&t1, &t2);
-    let m_is_zero = m.is_zero();
-
-    // t = m^(p-2) (inverse, or 0 if m==0)
-    let t = m.modpow(&(p - 2u32), p);
-
-    // x1a = b / (z*a)
-    let x1a = c.fmul(&c.b, &c.finv(&c.fmul(&z, &c.a)));
-    // x1b = (-b/a) * (1 + t)
-    let neg_b = c.fsub(&BigUint::zero(), &c.b);
-    let neg_b_over_a = c.fmul(&neg_b, &c.finv(&c.a));
-    let x1b = c.fmul(&neg_b_over_a, &c.fadd(&one, &t));
-
-    let x1 = if m_is_zero { x1a } else { x1b };
-
-    // gx1 = x1^3 + a*x1 + b
-    let gx1 = c.fadd(
-        &c.fadd(&c.fmul(&c.fmul(&x1, &x1), &x1), &c.fmul(&c.a, &x1)),
-        &c.b,
-    );
-    // x2 = z*u^2*x1
-    let x2 = c.fmul(&c.fmul(&z, &u2), &x1);
-    // gx2 = x2^3 + a*x2 + b
-    let gx2 = c.fadd(
-        &c.fadd(&c.fmul(&c.fmul(&x2, &x2), &x2), &c.fmul(&c.a, &x2)),
-        &c.b,
-    );
-
-    let gx1_is_qr = c.is_qr(&gx1);
-    let v = if gx1_is_qr { gx1.clone() } else { gx2.clone() };
-    let x = if gx1_is_qr { x1 } else { x2 };
-
-    let mut y = c.fsqrt(&v);
-
-    // y has the same LSB as u
-    let u_odd = u.bit(0);
-    let y_odd = y.bit(0);
-    if u_odd != y_odd {
-        y = (p - &y) % p;
-    }
-
-    Point::Affine(x, y)
+// RustCrypto's P-256 hash-to-curve implementation uses the same RFC 9380
+// Simplified SWU map and z=-10 parameter required by SAE group 19. SAE supplies
+// its own HKDF-expanded 48-byte field input, then delegates both reduction and
+// mapping to the constant-time library implementation.
+fn sswu_from_okm(okm: &[u8]) -> Point {
+    debug_assert_eq!(okm.len(), 48);
+    let mut uniform = Array::<u8, U48>::default();
+    uniform.copy_from_slice(okm);
+    let element =
+        <<NistP256 as MapToCurve>::FieldElement as Reduce<Array<u8, U48>>>::reduce(&uniform);
+    point_from_p256(NistP256::map_to_curve(element))
 }
 
 // ---------------------------------------------------------------------------
@@ -364,12 +250,10 @@ pub fn derive_pt(c: &Curve, ssid: &[u8], password: &[u8], identifier: Option<&[u
     let pwd_value_len = PRIME_LEN + PRIME_LEN.div_ceil(2);
 
     let pv1 = hkdf_expand(&pwd_seed, b"SAE Hash to Element u1 P1", pwd_value_len);
-    let u1 = BigUint::from_bytes_be(&pv1) % &c.p;
-    let p1 = sswu(c, &u1);
+    let p1 = sswu_from_okm(&pv1);
 
     let pv2 = hkdf_expand(&pwd_seed, b"SAE Hash to Element u2 P2", pwd_value_len);
-    let u2 = BigUint::from_bytes_be(&pv2) % &c.p;
-    let p2 = sswu(c, &u2);
+    let p2 = sswu_from_okm(&pv2);
 
     c.add(&p1, &p2)
 }
@@ -396,7 +280,7 @@ pub fn derive_pwe_hunting_pecking(
     // ~2^-40 chance of not finding a PWE, and the *first* valid counter is still
     // the one selected, so the derived PWE is unchanged.
     const ITERATIONS: u8 = 40;
-    let mut found: Option<(BigUint, bool)> = None;
+    let mut found: Option<Point> = None;
     for counter in 1u8..=ITERATIONS {
         // pwd-seed = HMAC-SHA256(MAX||MIN, password || counter)
         let pwd_seed = hmac_sha256(&salt, &[password, &[counter]]);
@@ -408,23 +292,24 @@ pub fn derive_pwe_hunting_pecking(
             PRIME_LEN,
         );
         let x = BigUint::from_bytes_be(&pwd_value);
-        // Always run the QR test (on a fixed in-range dummy when x >= p) so the
-        // expensive modular exponentiation happens every iteration.
-        let cand = if x < c.p { x.clone() } else { BigUint::one() };
-        let is_pwe = x < c.p && c.is_quadratic_residue(&c.y_sqr(&cand));
+        // Always ask RustCrypto to decompress a candidate point (using a fixed
+        // in-range dummy X when x >= p), so every iteration executes the same
+        // constant-time P-256 square-root/validation path.
+        let candidate_x = if x < c.p {
+            scalar_pad(&x, PRIME_LEN)
+        } else {
+            scalar_pad(&BigUint::one(), PRIME_LEN)
+        };
+        let mut compressed = Vec::with_capacity(1 + PRIME_LEN);
+        compressed.push(if pwd_seed[31] & 0x01 == 1 { 0x03 } else { 0x02 });
+        compressed.extend_from_slice(&candidate_x);
+        let candidate = c.point_from_compressed(&compressed);
+        let is_pwe = x < c.p && candidate.is_some();
         if is_pwe && found.is_none() {
-            found = Some((x, pwd_seed[31] & 0x01 == 1));
+            found = candidate;
         }
     }
-
-    let (x, seed_odd) = found?;
-    let y2 = c.y_sqr(&x);
-    let mut y = c.fsqrt(&y2);
-    // pick the root whose LSB matches the pwd-seed's LSB
-    if y.bit(0) != seed_odd {
-        y = (&c.p - &y) % &c.p;
-    }
-    Some(Point::Affine(x, y))
+    found
 }
 
 /// Derive PWE from PT for a specific pair of MAC addresses.
@@ -445,6 +330,7 @@ pub fn derive_pwe_from_pt(c: &Curve, pt: &Point, addr1: &[u8; 6], addr2: &[u8; 6
 pub enum SaeError {
     BadGroup,
     BadFormat,
+    BadRejectedGroups,
     BadElement,
     BadScalar,
     NotReady,
@@ -459,6 +345,13 @@ pub struct Sae {
     pub commit_element: Point,
     peer_scalar: Option<BigUint>,
     peer_element: Option<Point>,
+    /// H2E Rejected Groups element payloads. IEEE 802.11 includes these in
+    /// address order as the HKDF salt for KCK/PMK derivation. Omitting a peer's
+    /// list makes the commit parse successfully but guarantees that Confirm
+    /// verification fails.
+    own_rejected_groups: Option<Vec<u8>>,
+    peer_rejected_groups: Option<Vec<u8>>,
+    own_addr_higher: bool,
     pub kck: Vec<u8>,
     pub pmk: Vec<u8>,
     pub pmkid: Vec<u8>,
@@ -466,13 +359,17 @@ pub struct Sae {
 }
 
 fn rand_scalar(n: &BigUint) -> BigUint {
-    // random in [2, n-1]
+    // Rejection-sample uniformly in [2, n-1]. RustCrypto performs the scalar
+    // range check; unlike `% n`, this introduces no modulo bias.
     loop {
         let mut buf = [0u8; 32];
         getrandom::getrandom(&mut buf).expect("OS RNG");
-        let v = BigUint::from_bytes_be(&buf) % n;
-        if v > BigUint::one() {
-            return v;
+        let bytes = FieldBytes::from(buf);
+        if let Some(scalar) = Option::<P256Scalar>::from(P256Scalar::from_repr(bytes)) {
+            let value = scalar_from_p256(&scalar);
+            if value > BigUint::one() && value < *n {
+                return value;
+            }
         }
     }
 }
@@ -497,6 +394,9 @@ impl Sae {
             commit_element: Point::Infinity,
             peer_scalar: None,
             peer_element: None,
+            own_rejected_groups: None,
+            peer_rejected_groups: None,
+            own_addr_higher: addr1 > addr2,
             kck: Vec::new(),
             pmk: Vec::new(),
             pmkid: Vec::new(),
@@ -510,7 +410,9 @@ impl Sae {
         let (rand, mask) =
             fixed.unwrap_or_else(|| (rand_scalar(&self.curve.n), rand_scalar(&self.curve.n)));
         self.rand = rand.clone();
-        self.commit_scalar = (&rand + &mask) % &self.curve.n;
+        let commit_scalar =
+            scalar_to_p256(&rand, &self.curve.n) + scalar_to_p256(&mask, &self.curve.n);
+        self.commit_scalar = scalar_from_p256(&commit_scalar);
         // COMMIT-ELEMENT = inverse(mask * PWE) == -(mask * PWE)
         let mp = self.curve.scalar_mul(&mask, &self.pwe);
         self.commit_element = self.curve.negate(&mp);
@@ -527,6 +429,14 @@ impl Sae {
                 .point_to_bin(&self.commit_element)
                 .expect("finite element"),
         );
+        if let Some(groups) = self.own_rejected_groups.as_deref() {
+            // Extension IE 92: Rejected Groups. The payload is a sequence of
+            // little-endian group identifiers.
+            v.push(255);
+            v.push((1 + groups.len()) as u8);
+            v.push(92);
+            v.extend_from_slice(groups);
+        }
         v
     }
 
@@ -547,9 +457,63 @@ impl Sae {
             .curve
             .point_from_bin(&body[2 + PRIME_LEN..2 + 3 * PRIME_LEN])
             .ok_or(SaeError::BadElement)?;
+        let mut rejected_groups = None;
+        let mut pos = 2 + 3 * PRIME_LEN;
+        while pos < body.len() {
+            if body.len() - pos < 2 {
+                return Err(SaeError::BadFormat);
+            }
+            let len = body[pos + 1] as usize;
+            let end = pos
+                .checked_add(2 + len)
+                .filter(|end| *end <= body.len())
+                .ok_or(SaeError::BadFormat)?;
+            if body[pos] == 255 && len >= 1 && body[pos + 2] == 92 {
+                if rejected_groups.is_some() {
+                    return Err(SaeError::BadRejectedGroups);
+                }
+                let groups = &body[pos + 3..end];
+                if groups.is_empty() || groups.len() % 2 != 0 {
+                    return Err(SaeError::BadRejectedGroups);
+                }
+                if groups
+                    .chunks_exact(2)
+                    .any(|g| u16::from_le_bytes([g[0], g[1]]) == SAE_GROUP_19)
+                {
+                    // A peer cannot reject the group it selected for this
+                    // commit.
+                    return Err(SaeError::BadRejectedGroups);
+                }
+                rejected_groups = Some(groups.to_vec());
+            }
+            pos = end;
+        }
         self.peer_scalar = Some(scalar);
         self.peer_element = Some(element);
+        self.peer_rejected_groups = rejected_groups;
         Ok(())
+    }
+
+    /// Advertise groups rejected while selecting this H2E commit group.
+    pub fn set_rejected_groups(&mut self, groups: &[u16]) -> Result<(), SaeError> {
+        if groups.is_empty() {
+            self.own_rejected_groups = None;
+            return Ok(());
+        }
+        if groups.contains(&SAE_GROUP_19) || groups.len() > 127 {
+            return Err(SaeError::BadRejectedGroups);
+        }
+        self.own_rejected_groups = Some(groups.iter().flat_map(|g| g.to_le_bytes()).collect());
+        Ok(())
+    }
+
+    pub fn peer_rejected_groups(&self) -> Vec<u16> {
+        self.peer_rejected_groups
+            .as_deref()
+            .unwrap_or_default()
+            .chunks_exact(2)
+            .map(|g| u16::from_le_bytes([g[0], g[1]]))
+            .collect()
     }
 
     /// True if the peer's commit reflects our own scalar AND element — an SAE
@@ -578,12 +542,38 @@ impl Sae {
     }
 
     fn derive_keys(&mut self, k: &[u8], peer_scalar: &BigUint) {
-        // keyseed = HKDF-Extract(0^32, k)   (H2E, no rejected groups)
-        let salt = [0u8; 32];
-        let keyseed = hkdf_extract(&salt, &[k]);
+        // H2E normally uses 0^hash-length as the HKDF salt. If either peer
+        // advertised a Rejected Groups list, the salt is instead the two lists
+        // concatenated in descending MAC-address order.
+        let mut rejected_groups = Vec::new();
+        if self.own_addr_higher {
+            if let Some(own) = self.own_rejected_groups.as_deref() {
+                rejected_groups.extend_from_slice(own);
+            }
+            if let Some(peer) = self.peer_rejected_groups.as_deref() {
+                rejected_groups.extend_from_slice(peer);
+            }
+        } else {
+            if let Some(peer) = self.peer_rejected_groups.as_deref() {
+                rejected_groups.extend_from_slice(peer);
+            }
+            if let Some(own) = self.own_rejected_groups.as_deref() {
+                rejected_groups.extend_from_slice(own);
+            }
+        }
+        let zero_salt = [0u8; 32];
+        let salt = if rejected_groups.is_empty() {
+            zero_salt.as_slice()
+        } else {
+            rejected_groups.as_slice()
+        };
+        let keyseed = hkdf_extract(salt, &[k]);
 
         // context = (commit_scalar + peer_scalar) mod n, left-padded to order_len
-        let sum = (&self.commit_scalar + peer_scalar) % &self.curve.n;
+        let sum = scalar_from_p256(
+            &(scalar_to_p256(&self.commit_scalar, &self.curve.n)
+                + scalar_to_p256(peer_scalar, &self.curve.n)),
+        );
         let context = scalar_pad(&sum, PRIME_LEN);
 
         // KCK || PMK = KDF-Hash(keyseed, "SAE KCK and PMK", context), 32 + 32
@@ -664,6 +654,9 @@ impl Sae {
             commit_element: Point::Infinity,
             peer_scalar: None,
             peer_element: None,
+            own_rejected_groups: None,
+            peer_rejected_groups: None,
+            own_addr_higher: addr1 > addr2,
             kck: Vec::new(),
             pmk: Vec::new(),
             pmkid: Vec::new(),
@@ -686,6 +679,9 @@ impl Sae {
             commit_element: Point::Infinity,
             peer_scalar: None,
             peer_element: None,
+            own_rejected_groups: None,
+            peer_rejected_groups: None,
+            own_addr_higher: false,
             kck: Vec::new(),
             pmk: Vec::new(),
             pmkid: Vec::new(),

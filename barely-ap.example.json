@@ -3,6 +3,7 @@
   "passphrase": "password1234",
   "key_mgmt": "sae",
   "country_code": "US",
+  "band": 5,
   "channel": 36,
   "mode": "netlink",
   "interface": "wlan0",

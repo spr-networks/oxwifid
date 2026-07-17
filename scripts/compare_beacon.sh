@@ -48,7 +48,7 @@ pkill -9 -x hostapd 2>/dev/null; sleep 2
 # --- barely-ap (--phy ax) ---
 ip link set "$AP" down 2>/dev/null; iw dev "$AP" set type __ap 2>/dev/null; ip link set "$AP" up
 ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null
-setsid "$B" --mode netlink --iface "$AP" --channel 36 --width 80 --phy ax --ssid barely-he --psk password1234 </dev/null >/tmp/bap.log 2>&1 &
+setsid "$B" --mode netlink --iface "$AP" --band 5 --channel 36 --width 80 --phy ax --ssid barely-he --psk password1234 </dev/null >/tmp/bap.log 2>&1 &
 sleep 4
 echo "" >> "$R"; echo "=== barely-ap (--phy ax) HE beacon elements ===" >> "$R"
 grab barely-he >> "$R"

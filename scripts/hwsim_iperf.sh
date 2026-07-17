@@ -21,7 +21,7 @@ echo "AP=$AP STA=$STA" >> "$R"
 # (not HE/EHT), so ac maximises the achievable hwsim rate. WPA2-PSK for simplicity.
 cat > /tmp/iperf.json <<EOF
 { "ssid": "iperf", "passphrase": "password1234", "key_mgmt": "psk",
-  "phy": "ax", "mode": "netlink", "iface": "$AP", "channel": 36, "width": 80 }
+  "phy": "ax", "mode": "netlink", "iface": "$AP", "band": 5, "channel": 36, "width": 80 }
 EOF
 ip link set "$AP" down 2>/dev/null; iw dev "$AP" set type __ap 2>/dev/null; ip link set "$AP" up
 ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null

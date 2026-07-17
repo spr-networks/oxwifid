@@ -10,7 +10,7 @@ sudo iw reg set US; sleep 1
 sudo insmod /tmp/hwsim6g/hwsim6g.ko 2>/dev/null && echo "hwsim6g loaded"
 sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set wlan0 up
 sudo ip addr flush dev wlan0 2>/dev/null; sudo ip addr add 192.168.213.1/24 dev wlan0
-sudo /tmp/barely-ap --mode netlink --iface wlan0 --channel 37 --width 320 --band6 --sae --mac 02:00:00:00:00:00 --ssid turtle320 --psk password1234 > /tmp/ap320.log 2>&1 &
+sudo /tmp/barely-ap --mode netlink --iface wlan0 --channel 37 --width 320 --band 6 --sae --mac 02:00:00:00:00:00 --ssid turtle320 --psk password1234 > /tmp/ap320.log 2>&1 &
 sleep 2
 echo "START_AP ok: $(sudo grep -ac 'START_AP ok' /tmp/ap320.log)"
 echo "AP width: $(sudo iw dev wlan0 info 2>/dev/null | grep -oiE 'width: [0-9]+ MHz')"

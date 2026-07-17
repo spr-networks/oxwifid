@@ -125,7 +125,7 @@ dir_a() {
         sudo ip link set "$AP_IF" up
         sudo ip addr flush dev "$AP_IF" 2>/dev/null
         sudo ip addr add 10.10.10.1/24 dev "$AP_IF"
-        ( sudo "$AP" --mode netlink --iface "$AP_IF" --channel 36 --width 80 $apflags \
+        ( sudo "$AP" --mode netlink --iface "$AP_IF" --band 5 --channel 36 --width 80 $apflags \
             --ssid "$SSID" --psk "$PSK" >"/tmp/iop_ap_$L.log" 2>&1 & )
         sleep 4
         grep -aq "START_AP ok" "/tmp/iop_ap_$L.log" || { note=" (START_AP failed: $(tail -1 "/tmp/iop_ap_$L.log"))"; continue; }

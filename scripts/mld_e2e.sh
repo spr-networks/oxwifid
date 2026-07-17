@@ -41,10 +41,10 @@ cat > /tmp/mld.json <<EOF
 { "ssid": "mld-test", "passphrase": "password1234", "key_mgmt": "sae",
   "phy": "be", "mode": "netlink", "iface": "$AP",
   "mld": true,
-  "channel": 1, "width": 20, "link_id": 0,
+  "band": 2.4, "channel": 1, "width": 20, "link_id": 0,
   "mld_links": [
-    { "link_id": 0, "mac": "02:00:00:00:aa:01", "channel": 1,  "width": 20 },
-    { "link_id": 1, "mac": "02:00:00:00:aa:02", "channel": 36, "width": 80 } ] }
+    { "link_id": 0, "mac": "02:00:00:00:aa:01", "band": 2.4, "channel": 1,  "width": 20 },
+    { "link_id": 1, "mac": "02:00:00:00:aa:02", "band": 5, "channel": 36, "width": 80 } ] }
 EOF
 ip link set "$AP" down 2>/dev/null; iw dev "$AP" set type __ap 2>/dev/null; ip link set "$AP" up
 ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null

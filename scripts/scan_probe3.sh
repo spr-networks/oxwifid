@@ -16,7 +16,7 @@ iw reg set US 2>/dev/null; sleep 1
 mapfile -t HW < <(for n in $(ls /sys/class/net|grep ^wlan); do [ "$(basename "$(readlink /sys/class/net/$n/device/driver 2>/dev/null)")" = mac80211_hwsim ] && echo "$n"; done)
 AP=${HW[0]}
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up; ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null
-setsid "$B" --mode netlink --iface "$AP" --channel 36 --width 80 --phy ax --ssid probe --psk password1234 </dev/null >/tmp/probe3_ap.log 2>&1 &
+setsid "$B" --mode netlink --iface "$AP" --band 5 --channel 36 --width 80 --phy ax --ssid probe --psk password1234 </dev/null >/tmp/probe3_ap.log 2>&1 &
 sleep 5
 grep -aq "START_AP ok" /tmp/probe3_ap.log && APOK=yes || APOK=no
 sc() { local d=$1 pfx=$2 s=0 i; for i in 1 2 3; do $pfx iw dev "$d" scan freq 5180 2>/dev/null | grep -aq "SSID: probe" && s=$((s+1)); done; echo "$s/3"; }

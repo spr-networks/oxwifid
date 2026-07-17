@@ -56,6 +56,12 @@ fn parse_args() -> Config {
                     std::process::exit(1);
                 })
             }
+            "--band" => {
+                cfg.band = barely_ap::config::parse_band_str(&next(i)).unwrap_or_else(|e| {
+                    eprintln!("barely-ap: {e}");
+                    std::process::exit(1);
+                })
+            }
             "--ip" => cfg.ip = parse_ip(&next(i)).unwrap_or(cfg.ip),
             "--country" => {
                 cfg.country = barely_ap::config::parse_country(&next(i)).unwrap_or_else(|e| {
@@ -75,14 +81,13 @@ fn parse_args() -> Config {
             "--ocv" => cfg.ocv = true,
             "--btm" => cfg.btm = true,
             "--rnr" => cfg.rnr = true,
-            "--band6" => cfg.band6 = true,
             "--per-sta-vif" => cfg.per_sta_vif = true,
             "-h" | "--help" => {
                 eprintln!("barely-ap [--config FILE.json] [--ssid NAME] [--psk PASS] [--mac MAC]");
                 eprintln!(
                     "          [--channel N] [--ip IP] [--mode stdio|iface|netlink] [--iface NAME]"
                 );
-                eprintln!("          [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--band6] [--per-sta-vif]");
+                eprintln!("          [--band 2.4|5|6] [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--per-sta-vif]");
                 eprintln!("          [--ctrl PATH]   (netlink: hostapd-style control socket; multi-BSS via config `bss`)");
                 eprintln!("          [--spr-api-socket PATH] (direct SPR HTTP over a Unix socket; no action-script exec)");
                 eprintln!("          [--spr-dhcp-helper PATH] (invoke SPR DHCP/XDP helper for AP_VLAN clients)");
@@ -164,7 +169,7 @@ fn main() {
         "stdio" => {
             raw_frames::run(node, StdioLink::new());
         }
-        "iface" => run_iface(node, &cfg.iface, channel, cfg.band6),
+        "iface" => run_iface(node, &cfg.iface, channel, cfg.band.is_6ghz()),
         other => {
             eprintln!("unknown mode {other:?} (use stdio, iface, or netlink)");
             std::process::exit(1);

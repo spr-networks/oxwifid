@@ -11,7 +11,7 @@ sudo iw dev wlan0 del; sudo iw phy $PHYA interface add mon0 type monitor; sudo i
 # capture monitor at 6135
 sudo iw dev wlan2 del; sudo iw phy $PHYC interface add mon2 type monitor; sudo ip link set mon2 up; sudo iw dev mon2 set freq 6135
 sleep 1
-sudo /tmp/barely-ap --mode iface --iface mon0 --channel 37 --band6 --mac 02:00:00:00:00:00 --ssid turtle6 --psk password1234 > /tmp/ap6.log 2>&1 &
+sudo /tmp/barely-ap --mode iface --iface mon0 --channel 37 --band 6 --mac 02:00:00:00:00:00 --ssid turtle6 --psk password1234 > /tmp/ap6.log 2>&1 &
 sleep 2
 sudo timeout 5 tcpdump -i mon2 -nn -c 2 -w /tmp/b6r.pcap 'type mgt subtype beacon and wlan host 02:00:00:00:00:00' 2>/dev/null
 echo "=== rust 6GHz beacon decoded ==="

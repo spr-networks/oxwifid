@@ -20,6 +20,29 @@ fn mac6(s: &str) -> [u8; 6] {
     mac_to_bytes(s)
 }
 
+fn mlo_kde_link_ids(key_data: &[u8], kde_type: u8) -> Vec<u8> {
+    let mut ids = Vec::new();
+    let mut i = 0;
+    while i + 2 <= key_data.len() {
+        let len = key_data[i + 1] as usize;
+        if i + 2 + len > key_data.len() {
+            break;
+        }
+        let body = &key_data[i + 2..i + 2 + len];
+        if key_data[i] == 0xdd && body.len() >= 5 && body[..4] == [0x00, 0x0f, 0xac, kde_type] {
+            let link_id = match kde_type {
+                0x10 => body[4] >> 4,         // MLO GTK: Key ID | Link ID
+                0x11 | 0x12 => body[12] >> 4, // MLO IGTK/BIGTK
+                0x13 => body[4] & 0x0f,       // MLO Link KDE
+                _ => unreachable!(),
+            };
+            ids.push(link_id);
+        }
+        i += 2 + len;
+    }
+    ids
+}
+
 const FIXED_TS: u64 = 0x0011_2233_4455_6677;
 
 #[test]
@@ -173,12 +196,22 @@ fn channel_36_80mhz_advertisements_are_consistent() {
 }
 
 #[test]
-fn band6_ies_are_he_only() {
-    // 6 GHz: HE-only. No DSSS (3), HT (45) or VHT (191) elements; instead the HE
+fn band6_ies_have_he_without_legacy_ht_vht() {
+    // 6 GHz: no legacy HT/VHT. No DSSS (3), HT (45) or VHT (191) elements; the HE
     // Capabilities (ext 35), HE Operation (ext 36) and HE 6 GHz Band
     // Capabilities (ext 59) elements, plus operating class 131.
     assert_eq!(dot11::channel_to_freq_6ghz(37), 6135);
-    let ies = dot11::make_beacon_ies_6ghz(b"x", 37, b"US", 20, true, &dot11::RSN, None, 0);
+    let ies = dot11::make_beacon_ies_6ghz(
+        b"x",
+        37,
+        b"US",
+        20,
+        true,
+        dot11::PhyMode::He,
+        &dot11::RSN,
+        None,
+        0,
+    );
     assert!(!has_ie(&ies, 3), "6 GHz must not carry a DS Parameter Set");
     assert!(!has_ie(&ies, 45), "6 GHz must not carry HT Capabilities");
     assert!(!has_ie(&ies, 191), "6 GHz must not carry VHT Capabilities");
@@ -361,32 +394,191 @@ fn ap_basic_multi_link_element_carries_link_id_and_profiles() {
     assert_eq!(sta_control & 0x0f, 1, "Link ID in STA Control");
     assert_eq!(sta_control & 0x10, 0x10, "Complete Profile bit");
     assert_eq!(sta_control & 0x20, 0x20, "MAC Address Present bit");
-    assert_eq!(prof[4], 7, "STA Info length (len + MAC)");
+    assert_eq!(prof[4], 19, "STA Info length with AP-link timing fields");
     assert_eq!(&prof[5..11], &link1_mac, "affiliated link MAC");
+    assert_eq!(&prof[11..13], &100u16.to_le_bytes(), "beacon interval");
+    assert_eq!(&prof[13..21], &[0; 8], "TSF offset");
+    assert_eq!(&prof[21..23], &[0, 2], "DTIM count and period");
 
     // AP Basic ML element for link 0 with the other link's profile in Link Info.
-    let ml = dot11::multi_link_ap_basic(&mld, 0, 3, &prof);
+    let ml = dot11::multi_link_ap_basic(&mld, 0, 3, 1, &prof);
     assert_eq!(ml[0], 255);
     assert_eq!(ml[2], 107, "Multi-Link ext id");
     let control = u16::from_le_bytes([ml[3], ml[4]]);
     assert_eq!(control & 0x07, 0, "Type = Basic");
     assert_eq!(
-        control, 0x0130,
-        "Link ID + BSS Change Count + MLD Capabilities present"
+        control, 0x01b0,
+        "Link ID + BSS Change Count + EML + MLD Capabilities present"
     );
     assert_eq!(
-        ml[5], 11,
-        "Common Info length (len + MLD MAC + Link ID + BSS Change + MLD Caps)"
+        ml[5], 13,
+        "Common Info length (len + MLD MAC + Link ID + BSS Change + EML + MLD Caps)"
     );
     assert_eq!(&ml[6..12], &mld, "Common Info MLD MAC");
     assert_eq!(ml[12] & 0x0f, 0, "this link's Link ID = 0");
     assert_eq!(ml[13], 3, "BSS Parameters Change Count");
-    assert_eq!(&ml[14..16], &[0, 0], "MLD Capabilities");
+    assert_eq!(&ml[14..16], &[0, 0], "EML Capabilities");
+    assert_eq!(&ml[16..18], &[1, 0], "two simultaneous links");
     // the Per-STA Profile for link 1 follows in Link Info
     assert_eq!(
-        ml[16], 0,
+        ml[18], 0,
         "Link Info begins with a Per-STA Profile subelement"
     );
+    assert_eq!(
+        dot11::basic_mle_link_info_len(&ml),
+        Some(prof.len()),
+        "diagnostic reports the complete partner profile"
+    );
+    assert_eq!(
+        dot11::parse_mld_eml_capability(&ml),
+        Some(0),
+        "EML Capabilities are parsed from Common Info"
+    );
+    assert_eq!(
+        dot11::parse_mld_capability(&ml),
+        Some(1),
+        "MLD Capabilities report two simultaneous links"
+    );
+}
+
+#[test]
+fn ap_basic_multi_link_element_carries_driver_eml_and_mld_capabilities() {
+    let mld = mac6("02:00:00:00:10:00");
+    let ml = dot11::multi_link_ap_basic_capabilities(&mld, 0, 0, 0x4001, 0x2001, &[]);
+    assert_eq!(&ml[14..16], &0x4001u16.to_le_bytes());
+    assert_eq!(&ml[16..18], &0x2001u16.to_le_bytes());
+}
+
+#[test]
+fn station_mld_capability_is_parsed_when_eml_is_absent() {
+    let mld = mac6("02:00:00:00:10:00");
+    let mut ml = vec![255, 12, 107, 0x00, 0x01, 9];
+    ml.extend_from_slice(&mld);
+    ml.extend_from_slice(&0x0021u16.to_le_bytes());
+    assert_eq!(dot11::parse_mld_eml_capability(&ml), None);
+    assert_eq!(dot11::parse_mld_capability(&ml), Some(0x0021));
+}
+
+#[test]
+fn association_mle_exposes_partner_capability_ies() {
+    let mld = mac6("02:00:00:00:0b:00");
+    let link1_mac = mac6("02:00:00:00:0b:02");
+    let mut sta_profile = 0x1234u16.to_le_bytes().to_vec();
+    sta_profile.extend_from_slice(&dot11::he_capabilities());
+    sta_profile.extend_from_slice(&dot11::eht_capabilities(160));
+    let profile = dot11::per_sta_profile(1, &link1_mac, &sta_profile);
+    let ml = dot11::multi_link_ap_basic(&mld, 0, 0, 1, &profile);
+
+    let parsed = dot11::parse_mld_link_profiles(&ml);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].link_id, 1);
+    assert_eq!(parsed[0].mac, link1_mac);
+    assert_eq!(parsed[0].capability, Some(0x1234));
+    assert_eq!(
+        dot11::find_ie(&parsed[0].ies, 255).map(|ie| ie[0]),
+        Some(35),
+        "link-specific HE Capabilities are retained"
+    );
+}
+
+#[test]
+fn ap_mld_profile_excludes_restricted_ssid_element() {
+    let profile = dot11::ap_mld_profile_inner(
+        b"mld-profile",
+        37,
+        b"US",
+        160,
+        true,
+        true,
+        dot11::PhyMode::Eht,
+        dot11::SecurityMode::Wpa3Sae,
+        0,
+    );
+    let mut i = 2; // Capability Information precedes the inherited IE list.
+    while i + 2 <= profile.len() {
+        let len = profile[i + 1] as usize;
+        assert!(i + 2 + len <= profile.len(), "well-formed profile IE");
+        assert_ne!(profile[i], 0, "SSID is restricted in an AP link profile");
+        i += 2 + len;
+    }
+    assert_eq!(i, profile.len());
+}
+
+#[test]
+fn ap_mld_assoc_profile_has_success_status_before_ies() {
+    let profile = dot11::ap_mld_assoc_profile_inner(
+        b"mld-profile",
+        37,
+        b"US",
+        160,
+        true,
+        true,
+        dot11::PhyMode::Eht,
+        0,
+    );
+    assert!(profile.len() > 4);
+    assert_eq!(
+        u16::from_le_bytes([profile[2], profile[3]]),
+        dot11::STATUS_SUCCESS,
+        "a requested partner link is explicitly accepted"
+    );
+    assert!(
+        matches!(profile[4], 1 | 50 | 45 | 191 | 255 | 221),
+        "IE block starts after Capability Information and Status Code"
+    );
+}
+
+#[test]
+fn partner_profile_uses_band_specific_driver_capabilities() {
+    let mut profile = dot11::ap_mld_assoc_profile_inner(
+        b"mld-profile",
+        37,
+        b"US",
+        160,
+        true,
+        true,
+        dot11::PhyMode::Eht,
+        0,
+    );
+    let driver_he = vec![
+        0x0d, 0x00, 0x08, 0x9a, 0x40, 0x18, 0x0c, 0x63, 0x40, 0x08, 0xfc, 0xd9, 0x9f, 0x1c, 0x11,
+        0x0e, 0x00, 0xfa, 0xff, 0xfa, 0xff, 0xfa, 0xff, 0xfa, 0xff,
+    ];
+    let driver_eht = vec![
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22, 0x22, 0x22,
+        0x22, 0x22,
+    ];
+    dot11::apply_phy_capabilities(
+        &mut profile,
+        4,
+        &dot11::PhyCapabilities {
+            he: Some(driver_he.clone()),
+            eht: Some(driver_eht.clone()),
+            ..Default::default()
+        },
+    );
+
+    let ies = &profile[4..];
+    assert_eq!(
+        dot11::find_ie(ies, 255),
+        Some(&[&[35][..], &driver_he[..]].concat()[..]),
+        "the partner HE element uses the driver's 6 GHz bytes"
+    );
+    let mut pos = 0;
+    let mut found_eht = false;
+    while pos + 2 <= ies.len() {
+        let len = ies[pos + 1] as usize;
+        if pos + 2 + len > ies.len() {
+            break;
+        }
+        if ies[pos] == 255 && len > 0 && ies[pos + 2] == 108 {
+            assert_eq!(&ies[pos + 3..pos + 2 + len], &driver_eht);
+            found_eht = true;
+            break;
+        }
+        pos += 2 + len;
+    }
+    assert!(found_eht, "the partner EHT element remains present");
 }
 
 #[test]
@@ -395,7 +587,7 @@ fn mld_mac_round_trips_through_ml_element() {
     // A Basic ML element embedded in an IE block (e.g. an assoc request) with
     // some other IEs around it.
     let mut ies = dot11::ie(0, b"net");
-    ies.extend_from_slice(&dot11::multi_link_ap_basic(&mld, 2, 0, &[]));
+    ies.extend_from_slice(&dot11::multi_link_ap_basic(&mld, 2, 0, 0, &[]));
     ies.extend_from_slice(&dot11::ie(1, &[0x8c]));
     assert_eq!(
         dot11::parse_mld_mac(&ies),
@@ -468,6 +660,57 @@ fn reduced_neighbor_report_advertises_6ghz_ap() {
     assert_eq!(p[2], 131, "operating class = 6 GHz (131)");
     assert_eq!(p[3], 37, "channel");
     assert_eq!(&p[5..11], &nb, "neighbour BSSID");
+}
+
+#[test]
+fn mld_reduced_neighbor_report_uses_partner_link_identity() {
+    let nb = mac6("06:f0:21:c9:1e:ee");
+    let rnr = dot11::mld_reduced_neighbor_report(&nb, b"rustaptest", 134, 37, 0, 1, 0xab);
+    let p = ie_payload(&rnr, 201).unwrap();
+
+    assert_eq!(p[0], 0, "one TBTT entry, type zero");
+    assert_eq!(p[1], 16, "MLO RNR uses the 16-byte TBTT form");
+    assert_eq!(p[2], 134, "6 GHz 160 MHz operating class");
+    assert_eq!(p[3], 37, "partner primary channel");
+    assert_eq!(p[4], 0xff, "unknown TBTT offset");
+    assert_eq!(&p[5..11], &nb, "actual partner-link BSSID");
+    assert_eq!(
+        &p[11..15],
+        &dot11::short_ssid(b"rustaptest").to_le_bytes(),
+        "hostapd-compatible Short SSID"
+    );
+    assert_eq!(p[15], 0x42, "same SSID and co-located BSS flags");
+    assert_eq!(p[16], 127, "unknown/max 20 MHz PSD encoding");
+    assert_eq!(p[17], 0, "matching transmitted BSSID MLD ID");
+    assert_eq!(p[18], 0xb1, "low BPCC nibble plus partner Link ID");
+    assert_eq!(p[19], 0x0a, "high BPCC nibble");
+}
+
+#[test]
+fn mld_reduced_neighbor_report_marks_a_dormant_partner_link() {
+    let nb = mac6("06:f0:21:c9:1e:ee");
+    let rnr = dot11::mld_reduced_neighbor_report_with_disabled(
+        &nb,
+        b"rustaptest",
+        134,
+        37,
+        0,
+        1,
+        0xab,
+        true,
+    );
+    let p = ie_payload(&rnr, 201).unwrap();
+    assert_eq!(p[19], 0x2a, "Link Disabled bit plus high BPCC nibble");
+}
+
+#[test]
+fn advertised_tid_to_link_mapping_matches_hostapd_layout() {
+    let built = dot11::tid_to_link_mapping_same_set(1 << 1);
+    let mut expected = vec![255, 19, 109, 2, 0xff];
+    for _ in 0..8 {
+        expected.extend_from_slice(&2u16.to_le_bytes());
+    }
+    assert_eq!(built, expected);
 }
 
 #[test]
@@ -838,20 +1081,22 @@ fn eapol_m3_mld_uses_mlo_group_kdes() {
     let igtk: [u8; 16] = (0u8..16).collect::<Vec<_>>().try_into().unwrap();
     let ap_mld = mac6("02:00:00:00:0a:00");
     let ap_link = mac6("02:00:00:00:00:00");
+    let ap_link1 = mac6("02:00:00:00:00:01");
     let sta = mac6(f["sta"].as_str().unwrap());
     let mut link_rsne = dot11::RSN_WPA3.to_vec();
     link_rsne.extend_from_slice(&dot11::RSNXE_H2E);
 
-    let built = dot11::build_eapol_m3_mld(
+    let built = dot11::build_eapol_m3_mld_links(
         &ap_link,
         &sta,
         &anonce,
         &kck,
         &kek,
         &ap_mld,
-        2,
-        &ap_link,
-        &link_rsne,
+        &[
+            (0, ap_link, link_rsne.as_slice()),
+            (1, ap_link1, link_rsne.as_slice()),
+        ],
         1,
         &gtk,
         Some((4, [0; 6], igtk)),
@@ -881,14 +1126,49 @@ fn eapol_m3_mld_uses_mlo_group_kdes() {
     assert_eq!(got_gtk, gtk);
     assert_eq!(
         dot11::parse_mlo_igtk_kde(&unwrapped),
-        Some((2, 4, [0; 6], igtk))
+        Some((0, 4, [0; 6], igtk))
     );
+    assert_eq!(mlo_kde_link_ids(&unwrapped, 0x13), [0, 1]);
+    assert_eq!(mlo_kde_link_ids(&unwrapped, 0x10), [0, 1]);
+    assert_eq!(mlo_kde_link_ids(&unwrapped, 0x11), [0, 1]);
     assert!(
         unwrapped
             .windows(link_rsne.len())
             .any(|w| w == link_rsne.as_slice()),
         "MLO Link KDE carries link RSNE/RSNXE"
     );
+}
+
+#[test]
+fn mld_group_rekey_carries_every_link_without_legacy_kdes() {
+    let bssid = mac6("02:00:00:00:00:00");
+    let sta = mac6("02:00:00:00:ab:cd");
+    let kck = [0x11; 16];
+    let kek = [0x22; 16];
+    let gtk = [0x33; 16];
+    let igtk = [0x44; 16];
+    let built = dot11::build_group_key_msg1_mld(
+        &bssid,
+        &sta,
+        &kck,
+        &kek,
+        &[0, 1],
+        2,
+        &gtk,
+        Some((5, [1, 2, 3, 4, 5, 6], igtk)),
+        None,
+        9,
+        64,
+        dot11::KeyMic::AesCmac,
+    );
+    let frame = dot11::Dot11::parse(&built).unwrap();
+    let ek = dot11::EapolKey::parse(frame.eapol_key_body().unwrap()).unwrap();
+    let unwrapped = crypto::aes_unwrap(&kek, &ek.key_data).expect("group key data unwraps");
+
+    assert_eq!(dot11::parse_gtk_kde_full(&unwrapped), None);
+    assert_eq!(dot11::parse_igtk_kde(&unwrapped), None);
+    assert_eq!(mlo_kde_link_ids(&unwrapped, 0x10), [0, 1]);
+    assert_eq!(mlo_kde_link_ids(&unwrapped, 0x11), [0, 1]);
 }
 
 #[test]
@@ -1227,6 +1507,7 @@ fn wmm_element_gated_by_config() {
         b"US",
         20,
         true,
+        dot11::PhyMode::He,
         &dot11::RSN,
         None,
         0
@@ -1237,6 +1518,7 @@ fn wmm_element_gated_by_config() {
         b"US",
         20,
         false,
+        dot11::PhyMode::He,
         &dot11::RSN,
         None,
         0
@@ -1289,6 +1571,43 @@ fn phy_mode_gates_he_and_eht() {
     // be (11be/EHT): HE still present plus EHT Operation (ext 106).
     assert!(has_ext_ie(&be, 35), "be still advertises HE");
     assert!(has_ext_ie(&be, 106), "be advertises EHT Operation");
+}
+
+#[test]
+fn band6_phy_mode_not_width_controls_eht() {
+    use barely_ap::dot11::PhyMode;
+
+    let be80 = dot11::make_beacon_ies_6ghz(
+        b"x",
+        37,
+        b"US",
+        80,
+        true,
+        PhyMode::Eht,
+        &dot11::RSN,
+        None,
+        0,
+    );
+    assert!(
+        has_ext_ie(&be80, 108),
+        "an 80 MHz 6 GHz 802.11be BSS must advertise EHT capabilities"
+    );
+
+    let ax160 = dot11::make_beacon_ies_6ghz(
+        b"x",
+        37,
+        b"US",
+        160,
+        true,
+        PhyMode::He,
+        &dot11::RSN,
+        None,
+        0,
+    );
+    assert!(
+        !has_ext_ie(&ax160, 108),
+        "a 160 MHz 6 GHz 802.11ax BSS must not be promoted to EHT"
+    );
 }
 
 #[test]

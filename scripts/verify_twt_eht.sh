@@ -36,7 +36,7 @@ PY
 # EHT (--phy be) 80 MHz with the 3rd 20 MHz subchannel punctured (bitmap 0x0004)
 cat > /tmp/te.json <<EOF
 { "ssid": "te", "passphrase": "password1234", "key_mgmt": "sae",
-  "channel": 36, "width": 80, "phy": "be", "mode": "netlink",
+  "band": 5, "channel": 36, "width": 80, "phy": "be", "mode": "netlink",
   "iface": "$AP", "punct_bitmap": 4 }
 EOF
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up; ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null

@@ -60,13 +60,27 @@ fn frequency(ap: &Ap) -> u32 {
     }
 }
 
+/// hostapd exposes a non-AP MLD as one station keyed by its stable MLD MAC,
+/// regardless of which affiliated link carried the association.
+fn control_station_macs(ap: &Ap) -> Vec<[u8; 6]> {
+    let mut macs: Vec<[u8; 6]> = ap
+        .station_macs()
+        .into_iter()
+        .map(|link| ap.station_mld_mac(&link).unwrap_or(link))
+        .collect();
+    macs.sort_unstable();
+    macs.dedup();
+    macs
+}
+
 fn station_reply(
     ap: &Ap,
     mac: &[u8; 6],
     station_info: &dyn Fn(&[u8; 6]) -> Option<StationControlInfo>,
 ) -> String {
-    let assoc_ies = ap.station_assoc_ies(mac).unwrap_or(&[]);
-    let flags = station_flags(ap.is_associated(mac), assoc_ies);
+    let core_mac = ap.station_link_for_peer(mac).unwrap_or(*mac);
+    let assoc_ies = ap.station_assoc_ies(&core_mac).unwrap_or(&[]);
+    let flags = station_flags(ap.is_associated(&core_mac), assoc_ies);
     // hostapd's STA/STA-FIRST/STA-NEXT replies begin with the raw MAC line.
     // hostapd_cli all_sta relies on that exact shape while SPR consumes vlan_id.
     let mut reply = format!("{}\nflags={flags}\n", bytes_to_mac(mac));
@@ -169,12 +183,18 @@ pub fn handle_command_with_context(
     match it.next().unwrap_or("") {
         "PING" => ("PONG\n".to_string(), vec![]),
         "STATUS" => {
-            let macs = ap.station_macs();
-            let assoc = macs.iter().filter(|m| ap.is_associated(m)).count();
+            let macs = control_station_macs(ap);
+            let assoc = macs
+                .iter()
+                .filter(|m| {
+                    let core = ap.station_link_for_peer(m).unwrap_or(**m);
+                    ap.is_associated(&core)
+                })
+                .count();
             let phy = ap.phy_mode();
             (
                 format!(
-                    "state=ENABLED\nphy={}\nfreq={}\nchannel={}\nwidth={}\nieee80211n=1\nieee80211ac={}\nieee80211ax={}\nieee80211be={}\nbss[0]={}\nbssid[0]={}\nssid[0]={}\nssid={}\nnum_sta[0]={}\nstations={}\nassociated={}\n",
+                    "state=ENABLED\nbackend=rustap\ndriver=rustap-netlink\nphy={}\nfreq={}\nchannel={}\nwidth={}\nieee80211n=1\nieee80211ac={}\nieee80211ax={}\nieee80211be={}\nbss[0]={}\nbssid[0]={}\nssid[0]={}\nssid={}\nnum_sta[0]={}\nstations={}\nassociated={}\n",
                     match phy {
                         crate::dot11::PhyMode::Ht => "HT",
                         crate::dot11::PhyMode::Vht => "VHT",
@@ -200,8 +220,9 @@ pub fn handle_command_with_context(
         }
         "STA-DUMP" | "LIST-STA" => {
             let mut s = String::new();
-            for m in ap.station_macs() {
-                let state = if ap.is_associated(&m) {
+            for m in control_station_macs(ap) {
+                let core = ap.station_link_for_peer(&m).unwrap_or(m);
+                let state = if ap.is_associated(&core) {
                     "ASSOCIATED"
                 } else {
                     "HANDSHAKING"
@@ -217,7 +238,7 @@ pub fn handle_command_with_context(
             Some(arg) => match crate::util::try_mac_to_bytes(arg) {
                 Some(mac) => {
                     let info = station_info(&mac);
-                    let known = ap.station_macs().contains(&mac) || info.is_some();
+                    let known = ap.station_link_for_peer(&mac).is_some() || info.is_some();
                     if !known {
                         ("FAIL unknown station\n".to_string(), vec![])
                     } else {
@@ -229,8 +250,7 @@ pub fn handle_command_with_context(
             None => ("FAIL usage: STA <mac>\n".to_string(), vec![]),
         },
         "STA-FIRST" => {
-            let mut macs = ap.station_macs();
-            macs.sort_unstable();
+            let macs = control_station_macs(ap);
             match macs.first() {
                 Some(mac) => (station_reply(ap, mac, station_info), vec![]),
                 None => ("FAIL\n".to_string(), vec![]),
@@ -238,8 +258,7 @@ pub fn handle_command_with_context(
         }
         "STA-NEXT" => match it.next().and_then(crate::util::try_mac_to_bytes) {
             Some(after) => {
-                let mut macs = ap.station_macs();
-                macs.sort_unstable();
+                let macs = control_station_macs(ap);
                 match macs.into_iter().find(|mac| *mac > after) {
                     Some(mac) => (station_reply(ap, &mac, station_info), vec![]),
                     None => ("FAIL\n".to_string(), vec![]),
@@ -255,7 +274,10 @@ pub fn handle_command_with_context(
                 // even when the station has already disappeared. SPR sends
                 // DISASSOCIATE followed by DEAUTHENTICATE, so the second must
                 // remain idempotent.
-                Some(mac) => ("OK\n".to_string(), ap.kick(&mac).into_iter().collect()),
+                Some(mac) => {
+                    let core = ap.station_link_for_peer(&mac).unwrap_or(mac);
+                    ("OK\n".to_string(), ap.kick(&core).into_iter().collect())
+                }
                 None => ("FAIL invalid MAC\n".to_string(), vec![]),
             },
             None => ("FAIL usage: DEAUTHENTICATE <mac>\n".to_string(), vec![]),
@@ -301,6 +323,7 @@ mod tests {
         let mut ap = ap();
         assert_eq!(handle_command(&mut ap, "PING").0, "PONG\n");
         let status = handle_command(&mut ap, "STATUS").0;
+        assert!(status.contains("backend=rustap"), "{status}");
         assert!(status.contains("ssid=turtlenet"), "{status}");
         assert!(status.contains("channel=6"), "{status}");
         assert!(status.contains("stations=0"), "{status}");

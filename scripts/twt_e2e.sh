@@ -12,7 +12,7 @@ iw reg set US 2>/dev/null; sleep 1
 mapfile -t HW < <(for n in $(ls /sys/class/net|grep ^wlan); do [ "$(basename "$(readlink /sys/class/net/$n/device/driver 2>/dev/null)")" = mac80211_hwsim ] && echo "$n"; done)
 AP=${HW[0]}; STA=${HW[1]}
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up; ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null
-setsid "$B" --mode netlink --iface "$AP" --channel 36 --width 80 --phy ax --ssid twt --psk password1234 </dev/null >/tmp/twt_ap.log 2>&1 &
+setsid "$B" --mode netlink --iface "$AP" --band 5 --channel 36 --width 80 --phy ax --ssid twt --psk password1234 </dev/null >/tmp/twt_ap.log 2>&1 &
 sleep 4
 grep -aq "START_AP ok" /tmp/twt_ap.log && echo "AP up" >> "$R" || { echo "AP FAILED" >> "$R"; exit 1; }
 ip netns add "$NS"; iw phy "$(cat /sys/class/net/$STA/phy80211/name)" set netns name "$NS"

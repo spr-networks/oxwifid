@@ -141,6 +141,42 @@ fn full_h2e_exchange_between_two_peers_agrees() {
 }
 
 #[test]
+fn h2e_rejected_groups_are_included_in_key_salt() {
+    let ssid = b"rustaptest";
+    let pw = b"password1234";
+    let ap_mac = [0x06, 0xf0, 0x21, 0xc9, 0x1e, 0xef];
+    let sta_mac = [0x6e, 0x45, 0xbe, 0x78, 0x3b, 0xf2];
+
+    let mut ap = Sae::new_h2e(ssid, pw, None, &ap_mac, &sta_mac);
+    let mut sta = Sae::new_h2e(ssid, pw, None, &sta_mac, &ap_mac);
+    // A real MLO-capable iPhone can report groups it considered and rejected
+    // before selecting group 19. Only that peer transmits the list, but both
+    // peers must incorporate it into the keyseed salt.
+    sta.set_rejected_groups(&[20, 21])
+        .expect("valid rejected group list");
+
+    ap.prepare_commit(None);
+    sta.prepare_commit(None);
+    ap.parse_peer_commit(&sta.write_commit())
+        .expect("AP parses STA commit and Rejected Groups element");
+    sta.parse_peer_commit(&ap.write_commit())
+        .expect("STA parses AP commit");
+    assert_eq!(ap.peer_rejected_groups(), vec![20, 21]);
+
+    ap.process_commit().expect("AP derives keys");
+    sta.process_commit().expect("STA derives keys");
+    assert_eq!(ap.kck, sta.kck);
+    assert_eq!(ap.pmk, sta.pmk);
+
+    let sta_confirm = sta.write_confirm();
+    ap.check_confirm(&sta_confirm)
+        .expect("AP verifies STA confirm with negotiated salt");
+    let ap_confirm = ap.write_confirm();
+    sta.check_confirm(&ap_confirm)
+        .expect("STA verifies AP confirm with negotiated salt");
+}
+
+#[test]
 fn owe_two_parties_derive_the_same_pmk() {
     // OWE (RFC 8110): the STA and AP independently derive the same PMK/PMKID
     // from the ephemeral Diffie-Hellman exchange.

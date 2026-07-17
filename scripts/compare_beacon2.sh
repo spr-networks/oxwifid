@@ -67,7 +67,7 @@ pkill -9 -x hostapd 2>/dev/null; sleep 2
 # barely-ap HE
 ip link set "$AP" down 2>/dev/null; iw dev "$AP" set type __ap 2>/dev/null; ip link set "$AP" up
 ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null
-setsid "$B" --mode netlink --iface "$AP" --channel 36 --width 80 --phy ax --ssid barely-he --psk password1234 </dev/null >/tmp/bap.log 2>&1 &
+setsid "$B" --mode netlink --iface "$AP" --band 5 --channel 36 --width 80 --phy ax --ssid barely-he --psk password1234 </dev/null >/tmp/bap.log 2>&1 &
 sleep 4
 timeout 4 tcpdump -i "$MON" -c 4 -w /tmp/b.pcap 'type mgt subtype beacon' >/dev/null 2>&1
 echo "" >> "$R"; echo "=== element IDs (255/N = ext element N) ===" >> "$R"

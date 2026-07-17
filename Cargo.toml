@@ -28,6 +28,7 @@ hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "hash2curve"] }
 getrandom = "0.2"
 num-bigint = "0.4"
 num-traits = "0.2"

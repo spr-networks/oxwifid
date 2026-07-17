@@ -5,7 +5,7 @@ sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hws
 sudo iw reg set US; sleep 1
 sudo insmod /tmp/hwsim6g/hwsim6g.ko 2>/dev/null && echo "hwsim6g: $(sudo dmesg|grep -a hwsim6g|tail -1|sed 's/.*hwsim6g: //')"
 sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set wlan0 up
-sudo /tmp/barely-ap --mode netlink --iface wlan0 --channel 37 --width 320 --band6 --sae --ssid turtle320 --psk password1234 > /tmp/ap320.log 2>&1 &
+sudo /tmp/barely-ap --mode netlink --iface wlan0 --channel 37 --width 320 --band 6 --sae --ssid turtle320 --psk password1234 > /tmp/ap320.log 2>&1 &
 sleep 2
 echo "START_AP ok: $(sudo grep -ac 'START_AP ok' /tmp/ap320.log)   err: $(sudo grep -aiE 'invalid|failed|error' /tmp/ap320.log | head -1)"
 echo "AP chan: $(sudo iw dev wlan0 info 2>/dev/null | grep -iE 'channel|width' | tr '\n' ' ')"

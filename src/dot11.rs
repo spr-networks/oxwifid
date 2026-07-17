@@ -423,6 +423,22 @@ fn ext_ie(ext_id: u8, data: &[u8]) -> Vec<u8> {
     fragmented_element(255, &body)
 }
 
+/// Advertised TID-to-Link Mapping element (extension ID 109) with the same
+/// active-link set for every TID and both traffic directions.
+///
+/// This is the AP-advertised form implemented by hostapd and accepted by
+/// mac80211 during association: control=2 (both directions), presence=0xff
+/// (all eight TIDs), followed by eight little-endian 16-bit link bitmaps.
+pub fn tid_to_link_mapping_same_set(link_mask: u16) -> Vec<u8> {
+    let mut data = Vec::with_capacity(18);
+    data.push(2); // both downlink and uplink
+    data.push(0xff); // mappings for TIDs 0..7 are present
+    for _ in 0..8 {
+        data.extend_from_slice(&link_mask.to_le_bytes());
+    }
+    ext_ie(109, &data)
+}
+
 /// Emit an element (id `id`) whose body may exceed 255 octets, using 802.11
 /// element fragmentation: the first element carries length 255, each subsequent
 /// Fragment element (id 254) up to 255, and the sequence ends with a fragment of
@@ -468,6 +484,79 @@ pub enum PhyMode {
     Vht,
     He,
     Eht,
+}
+
+/// Capability-element payloads reported by the radio for one frequency band.
+///
+/// These are the bytes after the normal IE header (and after the extension ID
+/// for HE/EHT). Netlink mode uses them for both the outer response and every
+/// affiliated-link Per-STA Profile. The latter matters for MLO: hostapd builds a
+/// partner profile from that partner BSS, while a synthetic profile can omit
+/// driver-specific 160/320 MHz and EHT capability bits.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct PhyCapabilities {
+    pub ht: Option<Vec<u8>>,
+    pub vht: Option<Vec<u8>>,
+    pub he: Option<Vec<u8>>,
+    pub eht: Option<Vec<u8>>,
+}
+
+/// Replace one capability IE payload in an IE block.
+///
+/// `start` permits the same helper to patch a full management frame or a
+/// Per-STA Profile whose IE block follows fixed Capability/Status fields.
+pub fn replace_ie_payload(
+    bytes: &mut Vec<u8>,
+    mut start: usize,
+    id: u8,
+    ext_id: Option<u8>,
+    body: &[u8],
+) -> bool {
+    while start + 2 <= bytes.len() {
+        let len = bytes[start + 1] as usize;
+        let end = start + 2 + len;
+        if end > bytes.len() {
+            return false;
+        }
+        let matches = bytes[start] == id
+            && match ext_id {
+                Some(ext) => len >= 1 && bytes[start + 2] == ext,
+                None => true,
+            };
+        if matches {
+            let extra = usize::from(ext_id.is_some());
+            if body.len() + extra > u8::MAX as usize {
+                return false;
+            }
+            let mut replacement = Vec::with_capacity(2 + extra + body.len());
+            replacement.push(id);
+            replacement.push((extra + body.len()) as u8);
+            if let Some(ext) = ext_id {
+                replacement.push(ext);
+            }
+            replacement.extend_from_slice(body);
+            bytes.splice(start..end, replacement);
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// Apply the radio's band-specific HT/VHT/HE/EHT payloads to an IE block.
+pub fn apply_phy_capabilities(bytes: &mut Vec<u8>, start: usize, caps: &PhyCapabilities) {
+    if let Some(ht) = &caps.ht {
+        replace_ie_payload(bytes, start, 45, None, ht);
+    }
+    if let Some(vht) = &caps.vht {
+        replace_ie_payload(bytes, start, 191, None, vht);
+    }
+    if let Some(he) = &caps.he {
+        replace_ie_payload(bytes, start, 255, Some(35), he);
+    }
+    if let Some(eht) = &caps.eht {
+        replace_ie_payload(bytes, start, 255, Some(108), eht);
+    }
 }
 
 pub fn he_capabilities() -> Vec<u8> {
@@ -640,25 +729,52 @@ pub fn multi_link_ap_basic(
     mld_mac: &[u8; 6],
     link_id: u8,
     bss_change_count: u8,
+    max_simultaneous_links_minus_one: u8,
+    link_info: &[u8],
+) -> Vec<u8> {
+    multi_link_ap_basic_capabilities(
+        mld_mac,
+        link_id,
+        bss_change_count,
+        0,
+        u16::from(max_simultaneous_links_minus_one.min(0x0f)),
+        link_info,
+    )
+}
+
+/// AP-side Basic Multi-Link element using the EML and MLD capabilities exposed
+/// by the driver. hostapd obtains these from the per-interface-type
+/// `GET_WIPHY` attributes and advertises them in every affiliated link.
+pub fn multi_link_ap_basic_capabilities(
+    mld_mac: &[u8; 6],
+    link_id: u8,
+    bss_change_count: u8,
+    eml_capability: u16,
+    mld_capability: u16,
     link_info: &[u8],
 ) -> Vec<u8> {
     let mut data = Vec::new();
     // Multi-Link Control (2 octets, LE): Type = 0 (Basic, bits 0-2). Presence
     // Bitmap occupies bits 4-15: presence bit0 (control bit4) = Link ID Info,
-    // bit1 (control bit5) = BSS Parameters Change Count, bit4 (control bit8)
-    // = MLD Capabilities. hostap/wpa_supplicant requires 0x0130 for an AP MLD
-    // Basic ML element carrying these common fields.
-    let presence: u16 = 0b1_0011; // Link ID Info + BSS Change Count + MLD Capabilities
-    let control: u16 = presence << 4;
+    // bit1 (control bit5) = BSS Parameters Change Count, bit3 (control bit7)
+    // = EML Capabilities, bit4 (control bit8) = MLD Capabilities. This is the
+    // 0x01b0 common-field shape hostapd emits for an AP MLD.
+    let control: u16 = 0x01b0;
     data.extend_from_slice(&control.to_le_bytes());
     // Common Info: Length (incl. itself) + MLD MAC + Link ID Info + BSS Change
-    // + MLD Capabilities.
-    data.push(1 + 6 + 1 + 1 + 2);
+    // + EML Capabilities + MLD Capabilities.
+    data.push(1 + 6 + 1 + 1 + 2 + 2);
     data.extend_from_slice(mld_mac);
-    data.push(link_id & 0x0f); // Link ID Info: Link ID in bits 0-3
-    data.push(bss_change_count); // BSS Parameters Change Count
-    data.extend_from_slice(&[0x00, 0x00]); // MLD Capabilities
-                                           // Link Info: Per-STA Profile subelements for the other affiliated links.
+    // Link ID Info: Link ID in bits 0-3.
+    data.push(link_id & 0x0f);
+    // BSS Parameters Change Count.
+    data.push(bss_change_count);
+    // EML Capabilities.
+    data.extend_from_slice(&eml_capability.to_le_bytes());
+    // MLD Capabilities and Operations. Bits 0-3 use N-1 encoding for the
+    // maximum number of simultaneously active links.
+    data.extend_from_slice(&mld_capability.to_le_bytes());
+    // Link Info: Per-STA Profile subelements for the other affiliated links.
     data.extend_from_slice(link_info);
     ext_ie(107, &data)
 }
@@ -691,6 +807,26 @@ pub fn parse_mld_mac(ies: &[u8]) -> Option<[u8; 6]> {
     None
 }
 
+/// Number of Link Info octets carried by the first fragment of a Basic
+/// Multi-Link element. This is primarily a beacon-template diagnostic: zero
+/// means the element has only Common Info and advertises no partner profiles.
+pub fn basic_mle_link_info_len(ies: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let len = ies[i + 1] as usize;
+        if i + 2 + len > ies.len() {
+            break;
+        }
+        if ies[i] == 255 && len >= 1 + 2 + 1 && ies[i + 2] == 107 {
+            let data = &ies[i + 3..i + 2 + len];
+            let common_len = data[2] as usize;
+            return Some(data.len().saturating_sub(2 + common_len));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
 /// Per-STA Profile subelement (subelement id 0) for the Link Info field of a
 /// Basic Multi-Link element: carries one affiliated link's Link ID, Complete
 /// Profile flag, MAC address, and (optionally) that link's inheritable element
@@ -698,13 +834,19 @@ pub fn parse_mld_mac(ies: &[u8]) -> Option<[u8; 6]> {
 /// the AP's other link(s) so a client can set up all links from one scan.
 pub fn per_sta_profile(link_id: u8, link_mac: &[u8; 6], inner: &[u8]) -> Vec<u8> {
     // STA Control (2 octets, LE): bits 0-3 Link ID, bit 4 Complete Profile,
-    // bit 5 MAC Address Present.
-    let sta_control: u16 = (link_id as u16 & 0x0f) | (1 << 4) | (1 << 5);
+    // bit 5 MAC Address Present, plus Beacon Interval, TSF Offset, and DTIM
+    // Info. hostapd includes all four AP-link timing fields in beacon profiles.
+    let sta_control: u16 =
+        (link_id as u16 & 0x0f) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
     let mut body = Vec::new();
     body.extend_from_slice(&sta_control.to_le_bytes());
-    // STA Info: Length (incl. itself) + MAC Address.
-    body.push(1 + 6);
+    // STA Info: Length (incl. itself) + MAC Address + Beacon Interval + TSF
+    // Offset + DTIM Count/Period. RustAP uses a 100-TU beacon and DTIM period 2.
+    body.push(1 + 6 + 2 + 8 + 2);
     body.extend_from_slice(link_mac);
+    body.extend_from_slice(&BEACON_INTERVAL_TU.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes());
+    body.extend_from_slice(&[0, 2]);
     // STA Profile: the link's link-specific (inheritable) element bytes.
     body.extend_from_slice(inner);
     // Per-STA Profile subelement (id 0), fragmented (id 254 fragments) when the
@@ -731,16 +873,73 @@ pub fn ap_mld_profile_inner(
     let mut v = Vec::new();
     v.extend_from_slice(&ap_capability(channel, band6));
     let tail = security_tail(security);
-    v.extend_from_slice(&resp_ies(
-        ssid, channel, country, width, band6, wmm, phy, &tail, punct,
-    ));
+    let ies = resp_ies(ssid, channel, country, width, band6, wmm, phy, &tail, punct);
+    append_mld_profile_ies(&mut v, &ies);
     v
 }
 
+fn append_mld_profile_ies(v: &mut Vec<u8>, ies: &[u8]) {
+    // IEEE 802.11be inheritance rules forbid SSID in a transmitted AP's
+    // Per-STA Profile. hostapd's is_restricted_eid_in_sta_profile() also drops
+    // TIM, BSS Max Idle, Multiple BSSID, RNR, and Neighbor Report; resp_ies()
+    // does not contain those beacon-only elements, so SSID is the only one to
+    // remove here.
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let len = ies[i + 1] as usize;
+        if i + 2 + len > ies.len() {
+            break;
+        }
+        if ies[i] != 0 {
+            v.extend_from_slice(&ies[i..i + 2 + len]);
+        }
+        i += 2 + len;
+    }
+}
+
+/// STA Profile body for a partner link in an AP's (Re)Association Response.
+///
+/// Unlike a beacon/probe-response profile, an association-response profile has
+/// a Status Code immediately after Capability Information. A zero status tells
+/// the non-AP MLD that this requested partner link was accepted. Omitting these
+/// two octets makes the first IE header look like a non-zero rejection status.
+#[allow(clippy::too_many_arguments)]
+pub fn ap_mld_assoc_profile_inner(
+    ssid: &[u8],
+    channel: u8,
+    country: &[u8; 2],
+    width: u16,
+    band6: bool,
+    wmm: bool,
+    phy: PhyMode,
+    punct: u16,
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&ap_capability(channel, band6));
+    v.extend_from_slice(&STATUS_SUCCESS.to_le_bytes());
+    // Match a normal Association Response: RSN parameters were negotiated in
+    // the request and are inherited from the association link, so they are not
+    // repeated in this successful partner-link response profile.
+    let ies = resp_ies(ssid, channel, country, width, band6, wmm, phy, &[], punct);
+    append_mld_profile_ies(&mut v, &ies);
+    v
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MldLinkProfile {
+    pub link_id: u8,
+    pub mac: [u8; 6],
+    /// Link-specific Capability Information field. It follows STA Info in an
+    /// association-request Per-STA Profile.
+    pub capability: Option<u16>,
+    /// Link-specific IEs after Capability Information. Missing IEs inherit from
+    /// the outer association request.
+    pub ies: Vec<u8>,
+}
+
 /// Parse Per-STA Profile subelements from a Basic Multi-Link element in a
-/// station's association request. Returns `(link_id, link_mac)` for each profile
-/// that carries a link MAC address.
-pub fn parse_mld_link_macs(ies: &[u8]) -> Vec<(u8, [u8; 6])> {
+/// station's association request.
+pub fn parse_mld_link_profiles(ies: &[u8]) -> Vec<MldLinkProfile> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 2 <= ies.len() {
@@ -766,12 +965,27 @@ pub fn parse_mld_link_macs(ies: &[u8]) -> Vec<(u8, [u8; 6])> {
                             // STA Control(2) + STA Info Length(1) minimum
                             let sta_control = u16::from_le_bytes([sub[0], sub[1]]);
                             let link_id = (sta_control & 0x0f) as u8;
+                            let complete_profile = sta_control & (1 << 4) != 0;
                             let mac_present = sta_control & (1 << 5) != 0;
                             let sta_info_len = sub[2] as usize;
-                            if mac_present && sta_info_len >= 7 && sub.len() >= 3 + 6 {
+                            if complete_profile
+                                && mac_present
+                                && sta_info_len >= 7
+                                && 2 + sta_info_len <= sub.len()
+                            {
                                 let mut mac = [0u8; 6];
                                 mac.copy_from_slice(&sub[3..9]);
-                                out.push((link_id, mac));
+                                let profile = &sub[2 + sta_info_len..];
+                                let capability = (profile.len() >= 2)
+                                    .then(|| u16::from_le_bytes([profile[0], profile[1]]));
+                                let profile_ies =
+                                    profile.get(2..).map(<[u8]>::to_vec).unwrap_or_default();
+                                out.push(MldLinkProfile {
+                                    link_id,
+                                    mac,
+                                    capability,
+                                    ies: profile_ies,
+                                });
                             }
                         }
                         p += 2 + slen;
@@ -782,6 +996,81 @@ pub fn parse_mld_link_macs(ies: &[u8]) -> Vec<(u8, [u8; 6])> {
         i += 2 + len;
     }
     out
+}
+
+/// Backwards-compatible address-only view used by AP-side validation.
+pub fn parse_mld_link_macs(ies: &[u8]) -> Vec<(u8, [u8; 6])> {
+    parse_mld_link_profiles(ies)
+        .into_iter()
+        .map(|profile| (profile.link_id, profile.mac))
+        .collect()
+}
+
+/// Extract the optional EML and MLD Capabilities fields from a Basic MLE
+/// Common Info field.
+fn parse_mld_common_capabilities(ies: &[u8]) -> Option<(Option<u16>, Option<u16>)> {
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let len = ies[i + 1] as usize;
+        if i + 2 + len > ies.len() {
+            break;
+        }
+        if ies[i] == 255 && len >= 1 + 2 + 1 + 6 && ies[i + 2] == 107 {
+            let body = &ies[i + 3..i + 2 + len];
+            let control = u16::from_le_bytes([body[0], body[1]]);
+            if control & 0x07 != 0 {
+                return None;
+            }
+            let common_len = body[2] as usize;
+            if common_len < 7 || 2 + common_len > body.len() {
+                return None;
+            }
+            let mut pos = 3 + 6;
+            if control & 0x0010 != 0 {
+                pos += 1;
+            }
+            if control & 0x0020 != 0 {
+                pos += 1;
+            }
+            if control & 0x0040 != 0 {
+                pos += 2;
+            }
+            let common_end = 2 + common_len;
+            let eml = if control & 0x0080 != 0 {
+                if pos + 2 > common_end {
+                    return None;
+                }
+                let value = u16::from_le_bytes([body[pos], body[pos + 1]]);
+                pos += 2;
+                Some(value)
+            } else {
+                None
+            };
+            let mld = if control & 0x0100 != 0 {
+                if pos + 2 > common_end {
+                    return None;
+                }
+                Some(u16::from_le_bytes([body[pos], body[pos + 1]]))
+            } else {
+                None
+            };
+            return Some((eml, mld));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// Extract the EML Capabilities field from a Basic MLE Common Info field.
+pub fn parse_mld_eml_capability(ies: &[u8]) -> Option<u16> {
+    parse_mld_common_capabilities(ies).and_then(|(eml, _)| eml)
+}
+
+/// Extract the MLD Capabilities and Operations field from a Basic MLE Common
+/// Info field. Bits 0-3 encode the maximum number of simultaneous links minus
+/// one, which distinguishes a partner link from one usable concurrently.
+pub fn parse_mld_capability(ies: &[u8]) -> Option<u16> {
+    parse_mld_common_capabilities(ies).and_then(|(_, mld)| mld)
 }
 
 /// EHT Capabilities element (ext ID 108) — minimal MAC/PHY capabilities so a
@@ -827,14 +1116,87 @@ pub fn reduced_neighbor_report(neighbor_bssid: &[u8; 6], op_class: u8, channel: 
     ie(201, &d)
 }
 
+/// IEEE CRC-32 used for the 6 GHz Short SSID field.
+///
+/// This is the same CRC (initial value and final complement included) that
+/// hostapd exposes as `ieee80211_crc32()`.
+pub fn short_ssid(ssid: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in ssid {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320u32 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+/// Reduced Neighbor Report for an affiliated AP of the same MLD.
+///
+/// MLO discovery uses the 16-byte TBTT Information form: the normal 13-byte
+/// neighbor data followed by MLD ID, Link ID and the full BSS Parameters Change
+/// Count. `mld_id` is zero for matching a transmitted BSSID profile (the normal
+/// non-MBSSID case).
+#[allow(clippy::too_many_arguments)]
+pub fn mld_reduced_neighbor_report(
+    neighbor_bssid: &[u8; 6],
+    ssid: &[u8],
+    op_class: u8,
+    channel: u8,
+    mld_id: u8,
+    link_id: u8,
+    bss_change_count: u8,
+) -> Vec<u8> {
+    mld_reduced_neighbor_report_with_disabled(
+        neighbor_bssid,
+        ssid,
+        op_class,
+        channel,
+        mld_id,
+        link_id,
+        bss_change_count,
+        false,
+    )
+}
+
+/// MLD Reduced Neighbor Report with the Link Disabled bit available for an
+/// affiliated link excluded by the currently advertised TID-to-link mapping.
+#[allow(clippy::too_many_arguments)]
+pub fn mld_reduced_neighbor_report_with_disabled(
+    neighbor_bssid: &[u8; 6],
+    ssid: &[u8],
+    op_class: u8,
+    channel: u8,
+    mld_id: u8,
+    link_id: u8,
+    bss_change_count: u8,
+    disabled: bool,
+) -> Vec<u8> {
+    // TBTT Information Header: type 0, count 0 (one entry), 16-byte MLD form.
+    let mut d = vec![0x00, 16, op_class, channel, 0xff];
+    d.extend_from_slice(neighbor_bssid);
+    d.extend_from_slice(&short_ssid(ssid).to_le_bytes());
+    // Same SSID + co-located. The partner is an affiliated BSS of this MLD.
+    d.push((1 << 1) | (1 << 6));
+    d.push(127); // hostapd's RNR_20_MHZ_PSD_MAX_TXPOWER (unknown/max encoding)
+    d.push(mld_id);
+    d.push((link_id & 0x0f) | ((bss_change_count & 0x0f) << 4));
+    let mut param2 = (bss_change_count >> 4) & 0x0f;
+    if disabled {
+        param2 |= 0x20;
+    }
+    d.push(param2);
+    ie(201, &d)
+}
+
 /// Supported Operating Classes for a 6 GHz channel, width-aware.
 fn supported_operating_classes_6ghz(channel: u8, width: u16) -> Vec<u8> {
     ie(59, &[operating_class(channel, width, true), 0])
 }
 
-/// Beacon/probe/assoc IE block for a 6 GHz channel. 6 GHz is HE-only: no
-/// DSSS/HT/VHT, OFDM rates only, plus the HE Capabilities, HE Operation (with
-/// the 6 GHz Operation Information) and HE 6 GHz Band Capabilities elements.
+/// Beacon/probe/assoc IE block for a 6 GHz channel. 6 GHz has no legacy
+/// DSSS/HT/VHT elements: HE is mandatory, and EHT is added when `phy` selects
+/// 802.11be. Channel width does not determine the PHY generation.
 #[allow(clippy::too_many_arguments)]
 pub fn make_beacon_ies_6ghz(
     ssid: &[u8],
@@ -842,6 +1204,7 @@ pub fn make_beacon_ies_6ghz(
     country: &[u8; 2],
     width: u16,
     wmm: bool,
+    phy: PhyMode,
     rsn: &[u8],
     tim: Option<&[u8]>,
     punct: u16,
@@ -859,8 +1222,9 @@ pub fn make_beacon_ies_6ghz(
     v.extend_from_slice(&mu_edca_parameter());
     v.extend_from_slice(&spatial_reuse_parameter());
     v.extend_from_slice(&he_6ghz_band_capabilities());
-    // 802.11be: advertise EHT for 320 MHz (and 160) on 6 GHz.
-    if width >= 160 {
+    // 802.11be: EHT is valid at every supported channel width. Width controls
+    // the EHT MCS/NSS maps and operation geometry, not whether EHT is present.
+    if phy >= PhyMode::Eht {
         v.extend_from_slice(&eht_capabilities(width));
         v.extend_from_slice(&eht_operation(channel, width, true, punct));
     }
@@ -1045,7 +1409,7 @@ pub fn build_beacon(
     v
 }
 
-/// Build a 6 GHz (HE-only) beacon. 6 GHz mandates WPA3, so `tail_ies` is the
+/// Build a 6 GHz HE/EHT beacon. 6 GHz mandates WPA3, so `tail_ies` is the
 /// SAE/OWE RSN(+RSNXE). The capability field omits the "Privacy" short-slot
 /// bits that are 2.4/5 GHz specific.
 #[allow(clippy::too_many_arguments)]
@@ -1058,6 +1422,7 @@ pub fn build_beacon_6ghz(
     country: &[u8; 2],
     width: u16,
     wmm: bool,
+    phy: PhyMode,
     punct: u16,
 ) -> Vec<u8> {
     let bcast = [0xffu8; 6];
@@ -1072,6 +1437,7 @@ pub fn build_beacon_6ghz(
         country,
         width,
         wmm,
+        phy,
         tail_ies,
         Some(&tim),
         punct,
@@ -1208,7 +1574,7 @@ fn resp_ies(
     // No TIM in probe/assoc responses; RSN lands canonically (before the HT/HE
     // block), not appended after the vendor-specific WMM element.
     if band6 {
-        make_beacon_ies_6ghz(ssid, channel, country, width, wmm, rsn, None, punct)
+        make_beacon_ies_6ghz(ssid, channel, country, width, wmm, phy, rsn, None, punct)
     } else {
         make_beacon_ies(ssid, channel, country, width, wmm, phy, rsn, None, punct)
     }
@@ -2351,10 +2717,11 @@ pub fn build_eapol_m3(
     frame
 }
 
-/// EAPOL message 3 for an MLD station. The encrypted key data follows the AP
-/// MLD form used by hostapd: no top-level RSNE/plain GTK/plain IGTK; instead it
-/// carries OCI (if enabled), AP MLD MAC KDE, MLO Link KDE, and per-link MLO group
-/// key KDEs for this affiliated link.
+/// EAPOL message 3 for an MLD station with one affiliated link.
+///
+/// Kept as a convenience wrapper for tests and single-link MLD peers. Real
+/// multi-link associations use [`build_eapol_m3_mld_links`] so every negotiated
+/// link receives its MLO Link and group-key KDEs, matching hostapd.
 #[allow(clippy::too_many_arguments)]
 pub fn build_eapol_m3_mld(
     bssid: &[u8; 6],
@@ -2374,18 +2741,66 @@ pub fn build_eapol_m3_mld(
     sc: u16,
     mic: KeyMic,
 ) -> Vec<u8> {
+    build_eapol_m3_mld_links(
+        bssid,
+        sta,
+        anonce,
+        kck,
+        kek,
+        ap_mld_mac,
+        &[(link_id, *link_mac, link_rsne)],
+        gtk_key_id,
+        gtk,
+        igtk,
+        bigtk,
+        oci,
+        sc,
+        mic,
+    )
+}
+
+/// EAPOL message 3 for an MLD station. The encrypted key data follows hostapd's
+/// AP-MLD layout: AP MLD MAC, an MLO Link KDE for every negotiated link, then
+/// MLO GTK/IGTK/BIGTK KDEs for every such link. Supplying only the association
+/// link leaves partner links without their group-key context and can keep an
+/// EMLSR client pinned to that association link.
+#[allow(clippy::too_many_arguments)]
+pub fn build_eapol_m3_mld_links(
+    bssid: &[u8; 6],
+    sta: &[u8; 6],
+    anonce: &[u8; 32],
+    kck: &[u8],
+    kek: &[u8],
+    ap_mld_mac: &[u8; 6],
+    links: &[(u8, [u8; 6], &[u8])],
+    gtk_key_id: u8,
+    gtk: &[u8],
+    igtk: Option<(u16, [u8; 6], [u8; 16])>,
+    bigtk: Option<(u16, [u8; 6], [u8; 16])>,
+    oci: Option<(u8, u8)>,
+    sc: u16,
+    mic: KeyMic,
+) -> Vec<u8> {
     let mut plain = Vec::new();
     if let Some((oc, ch)) = oci {
         plain.extend_from_slice(&oci_kde(oc, ch));
     }
     plain.extend_from_slice(&mac_addr_kde(ap_mld_mac));
-    plain.extend_from_slice(&mlo_link_kde(link_id, link_mac, link_rsne));
-    plain.extend_from_slice(&mlo_gtk_kde(link_id, gtk_key_id, gtk));
+    for (link_id, link_mac, link_rsne) in links {
+        plain.extend_from_slice(&mlo_link_kde(*link_id, link_mac, link_rsne));
+    }
+    for (link_id, _, _) in links {
+        plain.extend_from_slice(&mlo_gtk_kde(*link_id, gtk_key_id, gtk));
+    }
     if let Some((key_id, ipn, ik)) = igtk {
-        plain.extend_from_slice(&mlo_igtk_kde(link_id, key_id, &ipn, &ik));
+        for (link_id, _, _) in links {
+            plain.extend_from_slice(&mlo_igtk_kde(*link_id, key_id, &ipn, &ik));
+        }
     }
     if let Some((key_id, ipn, bk)) = bigtk {
-        plain.extend_from_slice(&mlo_bigtk_kde(link_id, key_id, &ipn, &bk));
+        for (link_id, _, _) in links {
+            plain.extend_from_slice(&mlo_bigtk_kde(*link_id, key_id, &ipn, &bk));
+        }
     }
     let keydata = crypto::aes_wrap(kek, &crypto::pad_key_data(plain));
 
@@ -2744,6 +3159,57 @@ pub fn build_group_key_msg1(
         key_ack: true,
         install: false,
         key_type: false, // group key
+        key_descriptor_type_version: mic.version(),
+    };
+    let zero_nonce = [0u8; 32];
+    let body0 = build_eapol_key_body(ki, 16, replay, &zero_nonce, &[0u8; 16], &keydata);
+    let mic = mic.compute(kck, &eapol_wrap(&body0));
+    let body = build_eapol_key_body(ki, 16, replay, &zero_nonce, &mic, &keydata);
+    let mut frame = eapol_data_header(bssid, sta, sc);
+    frame.extend_from_slice(&eapol_wrap(&body));
+    frame
+}
+
+/// Group Key Handshake message 1 for an MLD station. Hostapd uses the MLO
+/// group-key KDEs for every negotiated link during a rekey; legacy GTK/IGTK
+/// KDEs are not valid substitutes for an MLD peer.
+#[allow(clippy::too_many_arguments)]
+pub fn build_group_key_msg1_mld(
+    bssid: &[u8; 6],
+    sta: &[u8; 6],
+    kck: &[u8],
+    kek: &[u8],
+    link_ids: &[u8],
+    gtk_key_id: u8,
+    gtk: &[u8],
+    igtk: Option<(u16, [u8; 6], [u8; 16])>,
+    bigtk: Option<(u16, [u8; 6], [u8; 16])>,
+    replay: u64,
+    sc: u16,
+    mic: KeyMic,
+) -> Vec<u8> {
+    let mut plain = Vec::new();
+    for link_id in link_ids {
+        plain.extend_from_slice(&mlo_gtk_kde(*link_id, gtk_key_id, gtk));
+    }
+    if let Some((key_id, ipn, ik)) = igtk {
+        for link_id in link_ids {
+            plain.extend_from_slice(&mlo_igtk_kde(*link_id, key_id, &ipn, &ik));
+        }
+    }
+    if let Some((key_id, ipn, bk)) = bigtk {
+        for link_id in link_ids {
+            plain.extend_from_slice(&mlo_bigtk_kde(*link_id, key_id, &ipn, &bk));
+        }
+    }
+    let keydata = crypto::aes_wrap(kek, &crypto::pad_key_data(plain));
+    let ki = KeyInfo {
+        encrypted_key_data: true,
+        secure: true,
+        has_key_mic: true,
+        key_ack: true,
+        install: false,
+        key_type: false,
         key_descriptor_type_version: mic.version(),
     };
     let zero_nonce = [0u8; 32];
