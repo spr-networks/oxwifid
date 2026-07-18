@@ -18,6 +18,7 @@ AP_BIN = sys.argv[1] if len(sys.argv) > 1 else "target/debug/barely-ap"
 AP_MAC = "02:00:00:00:00:00"
 STA_MAC = "02:00:00:00:ab:cd"
 TIMEOUT = 20.0
+CONFIG = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tests", "interop-config.json")
 
 env = dict(os.environ)
 env["BARELY_PING"] = "1"
@@ -25,7 +26,7 @@ env["AP_MAC"] = AP_MAC
 env["STA_MAC"] = STA_MAC
 
 ap = subprocess.Popen(
-    [AP_BIN, "--mode", "stdio", "--mac", AP_MAC, "--ssid", "turtlenet", "--psk", "password1234"],
+    [AP_BIN, "--config", CONFIG, "--mode", "stdio", "--mac", AP_MAC, "--ssid", "turtlenet"],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
 )
 client = subprocess.Popen(

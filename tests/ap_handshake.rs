@@ -36,7 +36,14 @@ fn send_m4(ap: &mut Ap, v: &Value) {
     let kck: [u8; 16] = from_hex(v["crypto"]["kck"].as_str().unwrap())
         .try_into()
         .unwrap();
-    let m4 = dot11::build_eapol_m4(&ap_mac, &sta, &kck, 0, dot11::KeyMic::select(false, false));
+    let m4 = dot11::build_eapol_m4(
+        &ap_mac,
+        &sta,
+        &kck,
+        2,
+        0,
+        dot11::KeyMic::select(false, false),
+    );
     let mut framed = dot11::RADIOTAP_TX.to_vec();
     framed.extend_from_slice(&m4);
     ap.handle_incoming(&framed);

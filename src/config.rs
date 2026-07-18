@@ -9,7 +9,7 @@
 //! ```json
 //! {
 //!   "ssid": "turtlenet",
-//!   "passphrase": "password1234",
+//!   "psk_file": "/run/secrets/wifi-credentials",
 //!   "key_mgmt": "sae",
 //!   "band": 5,
 //!   "channel": 36,
@@ -22,6 +22,7 @@
 use crate::ap::{Ap, MldLink};
 use crate::util::{mac_to_bytes, try_mac_to_bytes};
 use serde_json::Value;
+use zeroize::{Zeroize, Zeroizing};
 
 /// How stations authenticate to the AP.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -156,11 +157,25 @@ pub struct MldLinkConfig {
     pub band: Option<Band>,
 }
 
+impl Drop for Config {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+    }
+}
+
+impl Drop for BssConfig {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+    }
+}
+
 impl Default for Config {
     fn default() -> Config {
         Config {
             ssid: "turtlenet".to_string(),
-            passphrase: "password1234".to_string(),
+            // No production credential default: PSK/SAE configurations must
+            // supply `passphrase` or an authoritative `psk_file`.
+            passphrase: String::new(),
             key_mgmt: KeyMgmt::Psk,
             country: *b"US",
             mac: mac_to_bytes("02:00:00:00:00:00"),
@@ -194,18 +209,47 @@ impl Default for Config {
     }
 }
 
+fn zeroize_json_credentials(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "passphrase" | "wpa_passphrase" | "sae_password" | "psk"
+                ) {
+                    if let Value::String(secret) = value {
+                        secret.zeroize();
+                    }
+                }
+                zeroize_json_credentials(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                zeroize_json_credentials(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Config {
     /// Parse a JSON config document, starting from the defaults and overriding
     /// each present key. Unknown keys and type mismatches are hard errors so a
     /// typo never silently leaves the AP misconfigured.
     pub fn from_json(text: &str) -> Result<Config, String> {
-        let value: Value = serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
-        let obj = value.as_object().ok_or("config must be a JSON object")?;
-        let mut cfg = Config::default();
-        for (key, val) in obj {
-            cfg.set(key, val)?;
-        }
-        Ok(cfg)
+        let mut value: Value =
+            serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+        let result = (|| {
+            let obj = value.as_object().ok_or("config must be a JSON object")?;
+            let mut cfg = Config::default();
+            for (key, val) in obj {
+                cfg.set(key, val)?;
+            }
+            Ok(cfg)
+        })();
+        zeroize_json_credentials(&mut value);
+        result
     }
 
     /// Apply a single `key`/`value` setting. Used by the file parser and by the
@@ -214,6 +258,7 @@ impl Config {
         match key {
             "ssid" => self.ssid = as_str(key, val)?.to_string(),
             "passphrase" | "wpa_passphrase" | "sae_password" | "psk" => {
+                self.passphrase.zeroize();
                 self.passphrase = as_str(key, val)?.to_string()
             }
             "key_mgmt" | "security" => self.key_mgmt = parse_key_mgmt(as_str(key, val)?)?,
@@ -292,7 +337,8 @@ impl Config {
                 let arr = val
                     .as_array()
                     .ok_or_else(|| format!("{key} must be an array"))?;
-                let (default_pass, default_km) = (self.passphrase.clone(), self.key_mgmt);
+                let default_pass = Zeroizing::new(self.passphrase.clone());
+                let default_km = self.key_mgmt;
                 for item in arr {
                     self.bss.push(parse_bss(item, &default_pass, default_km)?);
                 }
@@ -308,10 +354,13 @@ impl Config {
     /// actually deliver.
     pub fn validate(&self) -> Result<(), String> {
         // WPA2-PSK / WPA3-SAE passphrases are 8..=63 characters; OWE has none.
-        if self.key_mgmt != KeyMgmt::Owe {
+        if self.key_mgmt != KeyMgmt::Owe && !(self.passphrase.is_empty() && self.psk_file.is_some())
+        {
             let n = self.passphrase.len();
             if !(8..=63).contains(&n) {
-                return Err(format!("passphrase must be 8..=63 characters (got {n})"));
+                return Err(format!(
+                    "PSK/SAE requires passphrase (8..=63 characters) or psk_file (got {n})"
+                ));
             }
         }
         // 6 GHz is Wi-Fi 6E/7 only and mandates WPA3 (SAE) or OWE — WPA2-PSK is
@@ -471,7 +520,11 @@ impl Config {
 
     /// Construct and fully configure an [`Ap`] from this configuration.
     pub fn build_ap(&self) -> Ap {
-        let mut ap = Ap::new(&self.ssid, &self.passphrase, self.mac, self.channel);
+        let mut ap = if self.passphrase.is_empty() {
+            Ap::new_without_credential(&self.ssid, self.mac, self.channel)
+        } else {
+            Ap::new(&self.ssid, &self.passphrase, self.mac, self.channel)
+        };
         ap.set_country(self.country);
         ap.set_width(self.width);
         ap.punct = self.punct_bitmap;
@@ -529,7 +582,12 @@ impl Config {
             // JSON passphrase.
             ap.set_psk_file(&[]);
             match parse_psk_file(path) {
-                Ok(entries) => ap.set_psk_file(&entries),
+                Ok(mut entries) => {
+                    ap.set_psk_file(&entries);
+                    for (_, password) in &mut entries {
+                        password.zeroize();
+                    }
+                }
                 Err(e) => eprintln!("barely-ap: psk_file {path:?}: {e}"),
             }
         }
@@ -562,7 +620,11 @@ impl Config {
     /// Build an [`Ap`] for an additional BSS: the primary's radio parameters
     /// (channel, width, country, band) with the BSS's own SSID/BSSID/security.
     pub fn build_bss_ap(&self, bss: &BssConfig) -> Ap {
-        let mut ap = Ap::new(&bss.ssid, &bss.passphrase, bss.mac, self.channel);
+        let mut ap = if bss.passphrase.is_empty() {
+            Ap::new_without_credential(&bss.ssid, bss.mac, self.channel)
+        } else {
+            Ap::new(&bss.ssid, &bss.passphrase, bss.mac, self.channel)
+        };
         ap.set_country(self.country);
         ap.set_width(self.width);
         ap.set_phy(self.phy);
@@ -615,6 +677,7 @@ fn parse_bss(item: &Value, default_pass: &str, default_km: KeyMgmt) -> Result<Bs
         match k.as_str() {
             "ssid" => b.ssid = as_str(k, v)?.to_string(),
             "passphrase" | "wpa_passphrase" | "sae_password" | "psk" => {
+                b.passphrase.zeroize();
                 b.passphrase = as_str(k, v)?.to_string()
             }
             "key_mgmt" | "security" => b.key_mgmt = parse_key_mgmt(as_str(k, v)?)?,
@@ -670,6 +733,16 @@ fn parse_mld_link(item: &Value, _default_width: u16) -> Result<MldLinkConfig, St
 /// One credential-file entry: `(MAC filter, passphrase)`, `None` MAC = wildcard.
 pub type PskEntry = (Option<[u8; 6]>, String);
 
+struct PskEntryGuard(Vec<PskEntry>);
+
+impl Drop for PskEntryGuard {
+    fn drop(&mut self) {
+        for (_, password) in &mut self.0 {
+            password.zeroize();
+        }
+    }
+}
+
 /// Parse either credential format generated by SPR:
 ///
 /// - WPA: `MAC passphrase` (`00:00:00:00:00:00` is wildcard)
@@ -677,8 +750,8 @@ pub type PskEntry = (Option<[u8; 6]>, String);
 ///
 /// Both wildcard spellings are accepted in either form and returned as `None`.
 pub fn parse_psk_file(path: &str) -> Result<Vec<PskEntry>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
+    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| e.to_string())?);
+    let mut out = PskEntryGuard(Vec::new());
     for (line_no, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -715,9 +788,9 @@ pub fn parse_psk_file(path: &str) -> Result<Vec<PskEntry>, String> {
                     .ok_or_else(|| format!("line {}: invalid MAC {mac_tok:?}", line_no + 1))?,
             )
         };
-        out.push((mac, pass.to_string()));
+        out.0.push((mac, pass.to_string()));
     }
-    Ok(out)
+    Ok(std::mem::take(&mut out.0))
 }
 
 pub fn parse_country(s: &str) -> Result<[u8; 2], String> {
@@ -882,14 +955,17 @@ mod tests {
 
     #[test]
     fn mld_default_links_reject_invalid_link_sets() {
-        let no_mld = Config::from_json(r#"{"mld_default_links":[0]}"#).expect("config parses");
+        let no_mld = Config::from_json(r#"{"passphrase":"password1234","mld_default_links":[0]}"#)
+            .expect("config parses");
         assert_eq!(
             no_mld.validate().unwrap_err(),
             "mld_default_links requires mld=true"
         );
 
-        let empty = Config::from_json(r#"{"mld":true,"mode":"netlink","mld_default_links":[]}"#)
-            .expect("config parses");
+        let empty = Config::from_json(
+            r#"{"passphrase":"password1234","mld":true,"mode":"netlink","mld_default_links":[]}"#,
+        )
+        .expect("config parses");
         assert_eq!(
             empty.validate().unwrap_err(),
             "mld_default_links must contain at least one Link ID"
@@ -1055,10 +1131,8 @@ mod tests {
         // 802.11be (EHT) requires PMF: a non-MFPR mode (WPA2-PSK / SAE-transition)
         // is upgraded to WPA3-SAE, so the AP advertises an MFPR|MFPC RSN that a
         // spec-compliant Wi-Fi 7 client will accept.
-        let mut c = Config {
-            phy: PhyMode::Eht,
-            ..Config::default()
-        };
+        let mut c = Config::default();
+        c.phy = PhyMode::Eht;
         assert_eq!(c.key_mgmt, KeyMgmt::Psk);
         assert_eq!(
             c.effective_key_mgmt(),
@@ -1082,11 +1156,9 @@ mod tests {
 
         // Non-EHT PHYs keep WPA2-PSK (PMF is not mandated below 11be).
         for phy in [PhyMode::Ht, PhyMode::Vht, PhyMode::He] {
-            let c = Config {
-                phy,
-                key_mgmt: KeyMgmt::Psk,
-                ..Config::default()
-            };
+            let mut c = Config::default();
+            c.phy = phy;
+            c.key_mgmt = KeyMgmt::Psk;
             assert_eq!(
                 c.effective_key_mgmt(),
                 KeyMgmt::Psk,
@@ -1223,12 +1295,12 @@ mod tests {
             .unwrap()
             .validate()
             .is_err());
-        assert!(
-            Config::from_json(r#"{"band":6,"channel":37,"key_mgmt":"sae","phy":"be"}"#)
-                .unwrap()
-                .validate()
-                .is_ok()
-        );
+        assert!(Config::from_json(
+            r#"{"band":6,"channel":37,"key_mgmt":"sae","phy":"be","passphrase":"password1234"}"#,
+        )
+        .unwrap()
+        .validate()
+        .is_ok());
         assert!(
             Config::from_json(r#"{"band":6,"channel":36,"key_mgmt":"sae","phy":"be"}"#)
                 .unwrap()
@@ -1271,7 +1343,9 @@ mod tests {
     #[test]
     fn validate_rejects_weak_passphrase_and_bad_transport() {
         let mut c = Config::default();
-        assert!(c.validate().is_ok()); // default "password1234"
+        assert!(c.validate().is_err()); // no default production credential
+        c.passphrase = "password1234".to_string();
+        assert!(c.validate().is_ok());
         c.passphrase = "short".to_string();
         assert!(c.validate().is_err()); // < 8
         c.passphrase = "".to_string();
@@ -1288,12 +1362,10 @@ mod tests {
         c.key_mgmt = KeyMgmt::Sae;
         assert!(c.validate().is_ok()); // 6 GHz + SAE is fine
                                        // OWE needs no passphrase
-        let o = Config {
-            key_mgmt: KeyMgmt::Owe,
-            passphrase: String::new(),
-            mode: "iface".to_string(),
-            ..Config::default()
-        };
+        let mut o = Config::default();
+        o.key_mgmt = KeyMgmt::Owe;
+        o.passphrase = String::new();
+        o.mode = "iface".to_string();
         assert!(o.validate().is_ok());
     }
 

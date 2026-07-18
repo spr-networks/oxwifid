@@ -1,4 +1,5 @@
 #!/bin/bash
+RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
 # scenA.sh <wpa2|wpa3|owe> <chan> : Rust barely-cli station -> real hostapd AP
 SEC=${1:-wpa2}; CHAN=${2:-1}
 FREQ=2412; HWMODE=g; EXTRA=""
@@ -38,7 +39,7 @@ sudo iw phy $PHYB interface add mon1 type monitor
 sudo ip link set mon1 up
 sleep 3
 for attempt in 1 2 3; do
-  sudo timeout 12 /tmp/barely-cli --mode iface --iface mon1 --channel $CHAN --mac 02:00:00:00:01:00 --gw-mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234 $CLIFLAG > /tmp/cli.log 2>&1
+  sudo timeout 12 /tmp/barely-cli --config "$RUSTAP_CONFIG" --mode iface --iface mon1 --channel $CHAN --mac 02:00:00:00:01:00 --gw-mac 02:00:00:00:00:00 --ssid turtlenet $CLIFLAG > /tmp/cli.log 2>&1
   grep -aq AUTHENTICATED /tmp/cli.log && break
 done
 echo "[$SEC ch$CHAN] cli:     $(grep -aoE 'AUTHENTICATED|PING_REPLY_OK' /tmp/cli.log | tr '\n' ' ')"

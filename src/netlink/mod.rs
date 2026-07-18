@@ -46,6 +46,10 @@ pub const NL80211_CMD_SET_STATION: u8 = 18;
 pub const NL80211_CMD_NEW_STATION: u8 = 19;
 pub const NL80211_CMD_DEL_STATION: u8 = 20;
 pub const NL80211_CMD_SET_BSS: u8 = 25;
+pub const NL80211_CMD_GET_SCAN: u8 = 32;
+pub const NL80211_CMD_TRIGGER_SCAN: u8 = 33;
+pub const NL80211_CMD_NEW_SCAN_RESULTS: u8 = 34;
+pub const NL80211_CMD_SCAN_ABORTED: u8 = 35;
 pub const NL80211_CMD_REGISTER_FRAME: u8 = 58;
 pub const NL80211_CMD_FRAME: u8 = 59;
 pub const NL80211_CMD_FRAME_TX_STATUS: u8 = 60;
@@ -112,6 +116,18 @@ pub const NL80211_ATTR_BSS_SHORT_PREAMBLE: u16 = 29;
 pub const NL80211_ATTR_BSS_BASIC_RATES: u16 = 36;
 pub const NL80211_ATTR_AP_ISOLATE: u16 = 96;
 pub const NL80211_ATTR_BSS_HT_OPMODE: u16 = 109;
+pub const NL80211_ATTR_SCAN_FREQUENCIES: u16 = 44;
+pub const NL80211_ATTR_SCAN_SSIDS: u16 = 45;
+pub const NL80211_ATTR_BSS: u16 = 47;
+
+// NL80211_ATTR_BSS nested scan-result attributes.
+pub const NL80211_BSS_BSSID: u16 = 1;
+pub const NL80211_BSS_FREQUENCY: u16 = 2;
+pub const NL80211_BSS_INFORMATION_ELEMENTS: u16 = 6;
+pub const NL80211_BSS_SIGNAL_MBM: u16 = 7;
+pub const NL80211_BSS_BEACON_IES: u16 = 11;
+pub const NL80211_BSS_MLO_LINK_ID: u16 = 21;
+pub const NL80211_BSS_MLD_ADDR: u16 = 22;
 
 // NL80211_ATTR_STA_INFO nested attributes used by hostapd's STA control reply.
 pub const NL80211_STA_INFO_SIGNAL: u16 = 7;
@@ -372,4 +388,7 @@ mod tests {
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{run_offload_ap, run_offload_aps, NetlinkLink};
+pub use linux::{
+    run_offload_ap, run_offload_aps, scan_interface, set_interface_frequency, NetlinkLink,
+    ScanResult,
+};

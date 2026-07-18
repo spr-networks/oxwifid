@@ -22,6 +22,7 @@ use p256::{
     Scalar as P256Scalar,
 };
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -51,11 +52,14 @@ fn hkdf_expand(prk: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
     let mut t: Vec<u8> = Vec::new();
     let mut counter: u8 = 1;
     while out.len() < out_len {
-        let block = hmac_sha256(prk, &[&t, info, &[counter]]);
+        let mut block = hmac_sha256(prk, &[&t, info, &[counter]]);
+        t.zeroize();
         t = block.to_vec();
         out.extend_from_slice(&t);
+        block.zeroize();
         counter += 1;
     }
+    t.zeroize();
     out.truncate(out_len);
     out
 }
@@ -67,9 +71,10 @@ fn sha256_prf(key: &[u8], label: &[u8], context: &[u8], out_len: usize) -> Vec<u
     let bits_le = bits.to_le_bytes();
     let mut counter: u16 = 1;
     while out.len() < out_len {
-        let block = hmac_sha256(key, &[&counter.to_le_bytes(), label, context, &bits_le]);
+        let mut block = hmac_sha256(key, &[&counter.to_le_bytes(), label, context, &bits_le]);
         let take = (out_len - out.len()).min(32);
         out.extend_from_slice(&block[..take]);
+        block.zeroize();
         counter += 1;
     }
     out
@@ -223,7 +228,9 @@ fn sswu_from_okm(okm: &[u8]) -> Point {
     uniform.copy_from_slice(okm);
     let element =
         <<NistP256 as MapToCurve>::FieldElement as Reduce<Array<u8, U48>>>::reduce(&uniform);
-    point_from_p256(NistP256::map_to_curve(element))
+    let point = point_from_p256(NistP256::map_to_curve(element));
+    uniform.zeroize();
+    point
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +248,7 @@ fn max_min_addr<'a>(a1: &'a [u8; 6], a2: &'a [u8; 6]) -> ([u8; 6], [u8; 6]) {
 /// Derive the H2E PT (password token) for group 19.
 pub fn derive_pt(c: &Curve, ssid: &[u8], password: &[u8], identifier: Option<&[u8]>) -> Point {
     // pwd-seed = HKDF-Extract(ssid, password [|| identifier])
-    let pwd_seed = match identifier {
+    let mut pwd_seed = match identifier {
         Some(id) => hkdf_extract(ssid, &[password, id]),
         None => hkdf_extract(ssid, &[password]),
     };
@@ -249,11 +256,14 @@ pub fn derive_pt(c: &Curve, ssid: &[u8], password: &[u8], identifier: Option<&[u
     // len = olen(p) + ceil(olen(p)/2) = 32 + 16
     let pwd_value_len = PRIME_LEN + PRIME_LEN.div_ceil(2);
 
-    let pv1 = hkdf_expand(&pwd_seed, b"SAE Hash to Element u1 P1", pwd_value_len);
+    let mut pv1 = hkdf_expand(&pwd_seed, b"SAE Hash to Element u1 P1", pwd_value_len);
     let p1 = sswu_from_okm(&pv1);
+    pv1.zeroize();
 
-    let pv2 = hkdf_expand(&pwd_seed, b"SAE Hash to Element u2 P2", pwd_value_len);
+    let mut pv2 = hkdf_expand(&pwd_seed, b"SAE Hash to Element u2 P2", pwd_value_len);
     let p2 = sswu_from_okm(&pv2);
+    pv2.zeroize();
+    pwd_seed.zeroize();
 
     c.add(&p1, &p2)
 }
@@ -283,9 +293,9 @@ pub fn derive_pwe_hunting_pecking(
     let mut found: Option<Point> = None;
     for counter in 1u8..=ITERATIONS {
         // pwd-seed = HMAC-SHA256(MAX||MIN, password || counter)
-        let pwd_seed = hmac_sha256(&salt, &[password, &[counter]]);
+        let mut pwd_seed = hmac_sha256(&salt, &[password, &[counter]]);
         // pwd-value = KDF-256(pwd-seed, "SAE Hunting and Pecking", p)
-        let pwd_value = sha256_prf(
+        let mut pwd_value = sha256_prf(
             &pwd_seed,
             b"SAE Hunting and Pecking",
             &prime_bytes,
@@ -295,7 +305,7 @@ pub fn derive_pwe_hunting_pecking(
         // Always ask RustCrypto to decompress a candidate point (using a fixed
         // in-range dummy X when x >= p), so every iteration executes the same
         // constant-time P-256 square-root/validation path.
-        let candidate_x = if x < c.p {
+        let mut candidate_x = if x < c.p {
             scalar_pad(&x, PRIME_LEN)
         } else {
             scalar_pad(&BigUint::one(), PRIME_LEN)
@@ -308,6 +318,10 @@ pub fn derive_pwe_hunting_pecking(
         if is_pwe && found.is_none() {
             found = candidate;
         }
+        compressed.zeroize();
+        candidate_x.zeroize();
+        pwd_value.zeroize();
+        pwd_seed.zeroize();
     }
     found
 }
@@ -340,7 +354,7 @@ pub enum SaeError {
 pub struct Sae {
     pub curve: Curve,
     pub pwe: Point,
-    rand: BigUint,
+    rand: SecretScalar,
     pub commit_scalar: BigUint,
     pub commit_element: Point,
     peer_scalar: Option<BigUint>,
@@ -358,19 +372,55 @@ pub struct Sae {
     send_confirm: u16,
 }
 
-fn rand_scalar(n: &BigUint) -> BigUint {
-    // Rejection-sample uniformly in [2, n-1]. RustCrypto performs the scalar
-    // range check; unlike `% n`, this introduces no modulo bias.
-    loop {
-        let mut buf = [0u8; 32];
-        getrandom::getrandom(&mut buf).expect("OS RNG");
-        let bytes = FieldBytes::from(buf);
-        if let Some(scalar) = Option::<P256Scalar>::from(P256Scalar::from_repr(bytes)) {
-            let value = scalar_from_p256(&scalar);
-            if value > BigUint::one() && value < *n {
-                return value;
+impl Drop for Sae {
+    fn drop(&mut self) {
+        self.kck.zeroize();
+        self.pmk.zeroize();
+    }
+}
+
+/// A private P-256 scalar stored in a fixed-size zeroizing buffer rather than
+/// `BigUint` (whose heap limbs are not cleared on drop).
+pub struct SecretScalar([u8; 32]);
+
+impl SecretScalar {
+    fn zero() -> Self {
+        Self([0u8; 32])
+    }
+
+    fn random() -> Self {
+        // Rejection-sample uniformly in [2, n-1]. RustCrypto performs the range
+        // check; unlike `% n`, this introduces no modulo bias.
+        loop {
+            let mut bytes = [0u8; 32];
+            getrandom::getrandom(&mut bytes).expect("OS RNG");
+            let not_zero_or_one = bytes[..31].iter().any(|byte| *byte != 0) || bytes[31] > 1;
+            if not_zero_or_one
+                && Option::<P256Scalar>::from(P256Scalar::from_repr(FieldBytes::from(bytes)))
+                    .is_some()
+            {
+                return Self(bytes);
             }
+            bytes.zeroize();
         }
+    }
+
+    fn from_biguint(value: &BigUint, modulus: &BigUint) -> Self {
+        let bytes: [u8; 32] = scalar_pad(&(value % modulus), PRIME_LEN)
+            .try_into()
+            .expect("P-256 scalar length");
+        Self(bytes)
+    }
+
+    fn scalar(&self) -> P256Scalar {
+        Option::<P256Scalar>::from(P256Scalar::from_repr(FieldBytes::from(self.0)))
+            .expect("validated private scalar")
+    }
+}
+
+impl Drop for SecretScalar {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -389,7 +439,7 @@ impl Sae {
         Sae {
             curve,
             pwe,
-            rand: BigUint::zero(),
+            rand: SecretScalar::zero(),
             commit_scalar: BigUint::zero(),
             commit_element: Point::Infinity,
             peer_scalar: None,
@@ -407,14 +457,20 @@ impl Sae {
     /// Generate the commit scalar and element. With `fixed` set (tests), use the
     /// given rand/mask instead of fresh randomness.
     pub fn prepare_commit(&mut self, fixed: Option<(BigUint, BigUint)>) {
-        let (rand, mask) =
-            fixed.unwrap_or_else(|| (rand_scalar(&self.curve.n), rand_scalar(&self.curve.n)));
-        self.rand = rand.clone();
-        let commit_scalar =
-            scalar_to_p256(&rand, &self.curve.n) + scalar_to_p256(&mask, &self.curve.n);
+        let (rand, mask) = match fixed {
+            Some((rand, mask)) => (
+                SecretScalar::from_biguint(&rand, &self.curve.n),
+                SecretScalar::from_biguint(&mask, &self.curve.n),
+            ),
+            None => (SecretScalar::random(), SecretScalar::random()),
+        };
+        let commit_scalar = rand.scalar() + mask.scalar();
+        self.rand = rand;
         self.commit_scalar = scalar_from_p256(&commit_scalar);
         // COMMIT-ELEMENT = inverse(mask * PWE) == -(mask * PWE)
-        let mp = self.curve.scalar_mul(&mask, &self.pwe);
+        let mp = point_from_p256(
+            point_to_p256(&self.pwe).expect("validated P-256 point") * mask.scalar(),
+        );
         self.commit_element = self.curve.negate(&mp);
     }
 
@@ -473,7 +529,7 @@ impl Sae {
                     return Err(SaeError::BadRejectedGroups);
                 }
                 let groups = &body[pos + 3..end];
-                if groups.is_empty() || groups.len() % 2 != 0 {
+                if groups.is_empty() || !groups.len().is_multiple_of(2) {
                     return Err(SaeError::BadRejectedGroups);
                 }
                 if groups
@@ -531,13 +587,16 @@ impl Sae {
         // K = rand * (peer_scalar*PWE + peer_element)
         let k1 = self.curve.scalar_mul(&peer_scalar, &self.pwe);
         let k2 = self.curve.add(&k1, &peer_element);
-        let big_k = self.curve.scalar_mul(&self.rand, &k2);
-        let k = match &big_k {
+        let big_k = point_from_p256(
+            point_to_p256(&k2).expect("validated P-256 point") * self.rand.scalar(),
+        );
+        let mut k = match &big_k {
             Point::Infinity => return Err(SaeError::BadElement),
             Point::Affine(x, _) => scalar_pad(x, PRIME_LEN),
         };
 
         self.derive_keys(&k, &peer_scalar);
+        k.zeroize();
         Ok(())
     }
 
@@ -567,7 +626,7 @@ impl Sae {
         } else {
             rejected_groups.as_slice()
         };
-        let keyseed = hkdf_extract(salt, &[k]);
+        let mut keyseed = hkdf_extract(salt, &[k]);
 
         // context = (commit_scalar + peer_scalar) mod n, left-padded to order_len
         let sum = scalar_from_p256(
@@ -577,10 +636,14 @@ impl Sae {
         let context = scalar_pad(&sum, PRIME_LEN);
 
         // KCK || PMK = KDF-Hash(keyseed, "SAE KCK and PMK", context), 32 + 32
-        let keys = sha256_prf(&keyseed, b"SAE KCK and PMK", &context, 64);
+        let mut keys = sha256_prf(&keyseed, b"SAE KCK and PMK", &context, 64);
+        self.kck.zeroize();
+        self.pmk.zeroize();
         self.kck = keys[..32].to_vec();
         self.pmk = keys[32..64].to_vec();
         self.pmkid = context[..16].to_vec();
+        keys.zeroize();
+        keyseed.zeroize();
     }
 
     fn cn_confirm(
@@ -649,7 +712,7 @@ impl Sae {
         Some(Sae {
             curve,
             pwe,
-            rand: BigUint::zero(),
+            rand: SecretScalar::zero(),
             commit_scalar: BigUint::zero(),
             commit_element: Point::Infinity,
             peer_scalar: None,
@@ -674,7 +737,7 @@ impl Sae {
         Sae {
             curve: Curve::p256(),
             pwe,
-            rand: BigUint::zero(),
+            rand: SecretScalar::zero(),
             commit_scalar: BigUint::zero(),
             commit_element: Point::Infinity,
             peer_scalar: None,
@@ -710,10 +773,10 @@ pub fn generator() -> Point {
 /// Generate an OWE Diffie-Hellman key pair: private scalar and public key as the
 /// bare X-coordinate (`prime_len` bytes). OWE (and hostapd) exchange only X; the
 /// receiver recovers a Y, and the ECDH shared X is independent of Y's parity.
-pub fn owe_keypair() -> (BigUint, Vec<u8>) {
-    let curve = Curve::p256();
-    let priv_k = rand_scalar(&curve.n);
-    let pubk = curve.scalar_mul(&priv_k, &generator());
+pub fn owe_keypair() -> (SecretScalar, Vec<u8>) {
+    let priv_k = SecretScalar::random();
+    let pubk =
+        point_from_p256(point_to_p256(&generator()).expect("P-256 generator") * priv_k.scalar());
     let x = match pubk {
         Point::Affine(x, _) => scalar_pad(&x, PRIME_LEN),
         Point::Infinity => unreachable!("k*G is finite for k in [1,n)"),
@@ -733,7 +796,7 @@ fn point_from_x(curve: &Curve, x_bytes: &[u8]) -> Option<Point> {
 /// public keys as exchanged (bare X-coordinates); `peer_pub_bytes` is the
 /// *other* party's X. Both sides compute the same result.
 pub fn owe_derive(
-    priv_k: &BigUint,
+    priv_k: &SecretScalar,
     peer_pub_bytes: &[u8],
     sta_pub: &[u8],
     ap_pub: &[u8],
@@ -741,8 +804,9 @@ pub fn owe_derive(
 ) -> Option<([u8; 32], [u8; 16])> {
     let curve = Curve::p256();
     let peer_pub = point_from_x(&curve, peer_pub_bytes)?;
-    let shared = curve.scalar_mul(priv_k, &peer_pub);
-    let z = match shared {
+    let shared =
+        point_from_p256(point_to_p256(&peer_pub).expect("validated P-256 point") * priv_k.scalar());
+    let mut z = match shared {
         Point::Affine(x, _) => scalar_pad(&x, PRIME_LEN),
         Point::Infinity => return None,
     };
@@ -751,9 +815,9 @@ pub fn owe_derive(
     salt.extend_from_slice(sta_pub);
     salt.extend_from_slice(ap_pub);
     salt.extend_from_slice(&group.to_le_bytes());
-    let prk = hkdf_extract(&salt, &[&z]);
+    let mut prk = hkdf_extract(&salt, &[&z]);
     // PMK = HKDF-Expand(prk, "OWE Key Generation", 32)
-    let pmk_v = hkdf_expand(&prk, b"OWE Key Generation", 32);
+    let mut pmk_v = hkdf_expand(&prk, b"OWE Key Generation", 32);
     // PMKID = Truncate-128(SHA-256(C | A))
     let mut hasher = sha2::Sha256::new();
     use sha2::Digest;
@@ -764,6 +828,9 @@ pub fn owe_derive(
     pmk.copy_from_slice(&pmk_v);
     let mut pmkid = [0u8; 16];
     pmkid.copy_from_slice(&digest[..16]);
+    z.zeroize();
+    prk.zeroize();
+    pmk_v.zeroize();
     Some((pmk, pmkid))
 }
 

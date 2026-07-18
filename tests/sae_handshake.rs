@@ -155,9 +155,31 @@ fn mld_assoc_req(sta: [u8; 6], sta_mld: [u8; 6], profiles: &[(u8, [u8; 6])]) -> 
     let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
     let mut link_info = Vec::new();
     for (link_id, link_mac) in profiles {
-        link_info.extend_from_slice(&dot11::per_sta_profile(*link_id, link_mac, &[]));
+        // A complete Per-STA Profile must contain the two-byte Capability
+        // Information field before any nested IEs.
+        link_info.extend_from_slice(&dot11::per_sta_profile(*link_id, link_mac, &[0x30, 0x04]));
     }
     let mut frame = dot11::build_assoc_req(&ap_link0, &sta, b"turtlenet", 0x20);
+    frame.extend_from_slice(&dot11::multi_link_ap_basic(&sta_mld, 0, 0, 1, &link_info));
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.extend_from_slice(&frame);
+    framed
+}
+
+fn mld_assoc_req_pmkid(
+    sta: [u8; 6],
+    sta_mld: [u8; 6],
+    profiles: &[(u8, [u8; 6])],
+    pmkid: &[u8; 16],
+) -> Vec<u8> {
+    let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
+    let mut link_info = Vec::new();
+    for (link_id, link_mac) in profiles {
+        // A complete Per-STA Profile must contain the two-byte Capability
+        // Information field before any nested IEs.
+        link_info.extend_from_slice(&dot11::per_sta_profile(*link_id, link_mac, &[0x30, 0x04]));
+    }
+    let mut frame = dot11::build_assoc_req_pmkid(&ap_link0, &sta, b"turtlenet", pmkid, 0x20);
     frame.extend_from_slice(&dot11::multi_link_ap_basic(&sta_mld, 0, 0, 1, &link_info));
     let mut framed = dot11::RADIOTAP_TX.to_vec();
     framed.extend_from_slice(&frame);
@@ -417,10 +439,11 @@ fn mld_sae_uses_identity_learned_from_prior_pmksa_assoc_attempt() {
     // the AP the stable MLD identity but cannot succeed because its PMKID is no
     // longer cached after an AP restart.
     open_auth(&mut ap, sta_air);
-    let stale = ap.handle_incoming(&mld_assoc_req(
+    let stale = ap.handle_incoming(&mld_assoc_req_pmkid(
         sta_air,
         sta_mld,
         &[(1, mac_to_bytes("02:00:00:00:01:01"))],
+        &[0x5a; 16],
     ));
     assert!(!stale.frames.is_empty());
     assert_eq!(ap.station_mld_mac(&sta_air), Some(sta_mld));

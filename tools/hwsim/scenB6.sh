@@ -1,4 +1,5 @@
 #!/bin/bash
+RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
 sudo pkill -f /tmp/barely 2>/dev/null; sudo pkill -f wpa_supplicant 2>/dev/null
 sudo rmmod hwsim6g 2>/dev/null; sudo iw reg set US 2>/dev/null
 sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hwsim radios=2; sleep 3; sudo iw reg set US; sleep 2
@@ -12,7 +13,7 @@ sudo iw dev ibss0 ibss join barelyack 6135 fixed-freq 02:CA:FE:00:00:00 2>&1 | h
 sudo iw phy $PHYA interface add mon0 type monitor; sudo ip link set mon0 up
 echo "ibss0 state: $(iw dev ibss0 info 2>/dev/null | awk '/type/{print $2}') / $(iw dev ibss0 link 2>/dev/null | head -1)"
 sleep 2
-sudo /tmp/barely-ap --mode iface --iface mon0 --channel 37 --band 6 --mac 02:00:00:00:00:00 --ssid turtle6 --psk password1234 --ip 10.10.10.1 > /tmp/ap6.log 2>&1 &
+sudo /tmp/barely-ap --config "$RUSTAP_CONFIG" --mode iface --iface mon0 --channel 37 --band 6 --mac 02:00:00:00:00:00 --ssid turtle6 --ip 10.10.10.1 > /tmp/ap6.log 2>&1 &
 sleep 2
 cat > /tmp/supp6.conf <<CFG
 ctrl_interface=/run/wpa_b

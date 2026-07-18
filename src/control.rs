@@ -494,13 +494,17 @@ mod server {
                     "RELOAD_WPA_PSK" | "RELOAD" => match self.psk_file.as_deref() {
                         Some(path) => {
                             match crate::config::parse_psk_file(path.to_string_lossy().as_ref()) {
-                                Ok(entries) => {
+                                Ok(mut entries) => {
                                     ap.set_psk_file(&entries);
                                     eprintln!(
                                         "netlink AP: reloaded {} credential(s) from {}",
                                         entries.len(),
                                         path.display()
                                     );
+                                    use zeroize::Zeroize;
+                                    for (_, password) in &mut entries {
+                                        password.zeroize();
+                                    }
                                     "OK\n".to_string()
                                 }
                                 Err(e) => {

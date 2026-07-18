@@ -1,4 +1,5 @@
 #!/bin/bash
+RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
 # scenMulti.sh <wpa2|wpa3|owe> : Rust barely-ap with TWO real wpa_supplicant clients
 SEC=${1:-wpa2}; FREQ=2412
 sudo pkill -f hostapd 2>/dev/null; sudo pkill -f /tmp/barely 2>/dev/null; sudo pkill -f wpa_supplicant 2>/dev/null
@@ -20,7 +21,7 @@ case $SEC in
   wpa3) APFLAG='--sae'; SUPP=$'key_mgmt=SAE\n  psk="password1234"\n  ieee80211w=2';;
   owe)  APFLAG='--owe'; SUPP=$'key_mgmt=OWE\n  ieee80211w=2';;
 esac
-sudo /tmp/barely-ap --mode iface --iface mon0 --channel 1 --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234 --ip 10.10.10.1 $APFLAG > /tmp/ap.log 2>&1 &
+sudo /tmp/barely-ap --config "$RUSTAP_CONFIG" --mode iface --iface mon0 --channel 1 --mac 02:00:00:00:00:00 --ssid turtlenet --ip 10.10.10.1 $APFLAG > /tmp/ap.log 2>&1 &
 sleep 2
 cat > /tmp/supp.conf <<CFG
 ctrl_interface=/run/wpa_m

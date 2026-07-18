@@ -10,6 +10,7 @@ use aes::Aes128;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 type HmacSha1 = Hmac<Sha1>;
 type HmacSha256 = Hmac<Sha256>;
@@ -65,9 +66,10 @@ pub fn sha256_prf(key: &[u8], label: &[u8], context: &[u8], out_len: usize) -> V
         mac.update(label);
         mac.update(context);
         mac.update(&bits_le);
-        let block = mac.finalize().into_bytes();
+        let mut block = mac.finalize().into_bytes();
         let take = (out_len - out.len()).min(32);
         out.extend_from_slice(&block[..take]);
+        block.zeroize();
         counter += 1;
     }
     out
@@ -93,9 +95,10 @@ pub fn derive_ptk_sha256(
     ctx.extend_from_slice(mac_hi);
     ctx.extend_from_slice(n_lo);
     ctx.extend_from_slice(n_hi);
-    let bytes = sha256_prf(pmk, b"Pairwise key expansion", &ctx, 48);
+    let mut bytes = sha256_prf(pmk, b"Pairwise key expansion", &ctx, 48);
     let mut out = [0u8; 48];
     out.copy_from_slice(&bytes);
+    bytes.zeroize();
     out
 }
 
@@ -302,11 +305,14 @@ pub fn aes_wrap(kek: &[u8], plain: &[u8]) -> Vec<u8> {
             let mut inb = [0u8; 16];
             inb[..8].copy_from_slice(&a.to_be_bytes());
             inb[8..].copy_from_slice(&r[i - 1]);
-            let b = aes128_ecb_encrypt_block(kek, &inb);
+            let mut b = aes128_ecb_encrypt_block(kek, &inb);
             let mut hi = [0u8; 8];
             hi.copy_from_slice(&b[..8]);
             a = u64::from_be_bytes(hi) ^ (n as u64 * j + i as u64);
             r[i - 1].copy_from_slice(&b[8..]);
+            inb.zeroize();
+            b.zeroize();
+            hi.zeroize();
         }
     }
 
@@ -315,6 +321,7 @@ pub fn aes_wrap(kek: &[u8], plain: &[u8]) -> Vec<u8> {
     for blk in &r {
         out.extend_from_slice(blk);
     }
+    r.zeroize();
     out
 }
 
@@ -343,21 +350,26 @@ pub fn aes_unwrap(kek: &[u8], wrapped: &[u8]) -> Option<Vec<u8>> {
             let mut inb = [0u8; 16];
             inb[..8].copy_from_slice(&(a ^ (n as u64 * j + i as u64)).to_be_bytes());
             inb[8..].copy_from_slice(&r[i]);
-            let b = aes128_ecb_decrypt_block(kek, &inb);
+            let mut b = aes128_ecb_decrypt_block(kek, &inb);
             let mut hi = [0u8; 8];
             hi.copy_from_slice(&b[..8]);
             a = u64::from_be_bytes(hi);
             r[i].copy_from_slice(&b[8..]);
+            inb.zeroize();
+            b.zeroize();
+            hi.zeroize();
         }
     }
 
     if a != KEY_WRAP_IV {
+        r.zeroize();
         return None;
     }
     let mut out = Vec::with_capacity(8 * n);
     for blk in &r[1..] {
         out.extend_from_slice(blk);
     }
+    r.zeroize();
     Some(out)
 }
 
@@ -413,10 +425,13 @@ pub fn custom_prf512(
         buf.push(0x00);
         buf.extend_from_slice(&b);
         buf.push(i);
-        r.extend_from_slice(&hmac_sha1(key, &buf));
+        let mut block = hmac_sha1(key, &buf);
+        r.extend_from_slice(&block);
+        block.zeroize();
     }
 
     let mut out = [0u8; 64];
     out.copy_from_slice(&r[..64]);
+    r.zeroize();
     out
 }

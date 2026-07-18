@@ -2,6 +2,7 @@
 
 use barely_ap::ap::Ap;
 use barely_ap::client::Client;
+use barely_ap::dot11;
 use barely_ap::fakenet::FakeNet;
 use barely_ap::util::mac_to_bytes;
 
@@ -90,6 +91,59 @@ fn gtk_rekey_installs_new_key_on_station() {
     );
     assert_eq!(out.frames.len(), 1, "STA sends Group Key message 2");
     assert_eq!(sta.connected, 4, "STA stays associated across a rekey");
+}
+
+#[test]
+fn protected_group_key_handshake_stays_on_the_controlled_port() {
+    let (mut ap, _net, mut sta) = wpa3_up();
+    let sta_mac = sta.mac;
+    let tk = ap.station_tk(&sta_mac).expect("installed pairwise key");
+
+    // Real hostapd sends the post-association Group-Key EAPOL exchange inside
+    // CCMP-protected data. Re-wrap the Rust AP's canonical Message 1 that way.
+    let message_1 = ap.rekey_gtk().remove(0);
+    let eapol = dot11::strip_radiotap(&message_1)
+        .and_then(dot11::Dot11::parse)
+        .and_then(|frame| frame.eapol_frame().map(ToOwned::to_owned))
+        .expect("Group-Key Message 1 EAPOL");
+    let mut ethernet = Vec::with_capacity(14 + eapol.len());
+    ethernet.extend_from_slice(&sta_mac);
+    ethernet.extend_from_slice(&ap.mac);
+    ethernet.extend_from_slice(&dot11::ETHERTYPE_EAPOL.to_be_bytes());
+    ethernet.extend_from_slice(&eapol);
+    let protected_message_1 = ap
+        .deliver_to_station(&ethernet)
+        .pop()
+        .expect("CCMP-protected Group-Key Message 1");
+
+    let response = sta.handle_incoming(&protected_message_1);
+    assert!(
+        response.to_network.is_empty(),
+        "controlled-port EAPOL must not leak into the SPR TAP"
+    );
+    assert_eq!(response.frames.len(), 1, "station returns Message 2");
+    assert_eq!(sta.gtk(), ap.gtk(), "station installs the rotated GTK");
+
+    let response_frame = dot11::strip_radiotap(&response.frames[0])
+        .and_then(dot11::Dot11::parse)
+        .expect("protected response frame");
+    assert!(
+        response_frame.protected(),
+        "post-association Group-Key Message 2 must use the PTK"
+    );
+    let response_eth =
+        dot11::decrypt_ccmp(&response_frame, &tk, false).expect("valid response CCMP MIC");
+    assert_eq!(
+        response_eth.get(12..14),
+        Some(dot11::ETHERTYPE_EAPOL.to_be_bytes().as_slice())
+    );
+    let response_eapol = &response_eth[14..];
+    let response_body_len = u16::from_be_bytes([response_eapol[2], response_eapol[3]]) as usize;
+    let key = dot11::EapolKey::parse(&response_eapol[4..4 + response_body_len])
+        .expect("Group-Key Message 2");
+    assert!(!key.is_pairwise());
+    assert!(key.has_key_mic());
+    assert!(key.secure());
 }
 
 #[test]

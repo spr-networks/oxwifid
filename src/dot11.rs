@@ -6,6 +6,7 @@
 //! pwr=0x10, more-data=0x20, protected=0x40, order=0x80.
 
 use crate::crypto;
+use zeroize::Zeroize;
 
 /// The 8-byte radiotap header scapy emits for a bare `RadioTap()` (no fields).
 /// Used for the stdio framing path; raw-socket injection uses a band-aware
@@ -163,6 +164,12 @@ pub const RSN: [u8; 22] = [
     0x00, 0x0f, 0xac, 0x02, 0x00, 0x00,
 ];
 
+/// RSN information element for WPA-PSK-SHA256 (00-0F-AC:6) with CCMP.
+pub const RSN_PSK_SHA256: [u8; 22] = [
+    0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,
+    0x00, 0x0f, 0xac, 0x06, 0x00, 0x00,
+];
+
 /// RSN information element for WPA3-SAE: CCMP-128 pairwise/group, AKM = SAE
 /// (00-0F-AC:8), RSN capabilities with MFPR|MFPC set, and a Group Management
 /// Cipher Suite of BIP-CMAC-128 (00-0F-AC:6) for PMF.
@@ -216,6 +223,10 @@ pub const SUBTYPE_QOS_DATA: u8 = 0x08;
 
 /// Status code: association rejected temporarily (PMF SA Query comeback).
 pub const STATUS_ASSOC_REJECTED_TEMP: u16 = 30;
+/// Status code: association denied because an information element is malformed.
+pub const STATUS_INVALID_IE: u16 = 40;
+/// Status code: association denied because the requested AKM is unsupported.
+pub const STATUS_INVALID_AKMP: u16 = 43;
 /// Status code: unsupported authentication algorithm (802.11 status 13). Sent
 /// when a SAE-only AP receives an open-system Authentication request.
 pub const STATUS_UNSUPPORTED_AUTH_ALG: u16 = 13;
@@ -228,6 +239,10 @@ pub const STATUS_INVALID_PMKID: u16 = 53;
 /// association that fails the WPA3-SAE / OWE anti-downgrade check (e.g. an OWE
 /// request without the required Diffie-Hellman Parameter element).
 pub const STATUS_UNSPECIFIED_FAILURE: u16 = 1;
+/// SAE anti-clogging token required.
+pub const STATUS_ANTI_CLOGGING_TOKEN_REQ: u16 = 76;
+/// Requested finite cyclic group is not supported (OWE/SAE group negotiation).
+pub const STATUS_FINITE_CYCLIC_GROUP_NOT_SUPPORTED: u16 = 77;
 /// SA Query action category / actions (802.11w).
 pub const ACTION_CATEGORY_SA_QUERY: u8 = 8;
 pub const SA_QUERY_REQUEST: u8 = 0;
@@ -237,7 +252,7 @@ pub const FC_TODS: u8 = 0x01;
 pub const FC_FROMDS: u8 = 0x02;
 pub const FC_PROTECTED: u8 = 0x40;
 
-const ETHERTYPE_EAPOL: u16 = 0x888E;
+pub const ETHERTYPE_EAPOL: u16 = 0x888E;
 
 fn fc0(frame_type: u8, subtype: u8) -> u8 {
     (subtype << 4) | (frame_type << 2)
@@ -796,7 +811,17 @@ pub fn parse_mld_mac(ies: &[u8]) -> Option<[u8; 6]> {
             let body = &ies[i + 3..i + 2 + len];
             // body: Multi-Link Control(2) + Common Info Length(1) + MLD MAC(6)...
             let control_type = u16::from_le_bytes([body[0], body[1]]) & 0x07;
-            if control_type == 0 && body.len() >= 3 + 6 {
+            let common_len = body[2] as usize;
+            // Common Info Length includes its own octet, but not the two-octet
+            // Multi-Link Control. A Basic MLE always carries the six-octet MLD
+            // MAC. Do not promote bytes outside a truncated Common Info field
+            // into an authenticated MLD identity.
+            if control_type == 0
+                && common_len > 6
+                && 2usize
+                    .checked_add(common_len)
+                    .is_some_and(|end| end <= body.len())
+            {
                 let mut mld = [0u8; 6];
                 mld.copy_from_slice(&body[3..9]);
                 return Some(mld);
@@ -805,6 +830,31 @@ pub fn parse_mld_mac(ies: &[u8]) -> Option<[u8; 6]> {
         i += 2 + len;
     }
     None
+}
+
+/// Whether an IE block contains a Basic Multi-Link element, including one whose
+/// internal Common Info is malformed. This lets an AP distinguish a legacy
+/// single-link association (no MLE) from a malformed MLD association that must
+/// be rejected.
+pub fn has_basic_multi_link_element(ies: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let len = ies[i + 1] as usize;
+        let Some(end) = i.checked_add(2 + len) else {
+            return false;
+        };
+        if end > ies.len() {
+            return false;
+        }
+        if ies[i] == 255 && len > 2 && ies[i + 2] == 107 {
+            let control = u16::from_le_bytes([ies[i + 3], ies[i + 4]]);
+            if control & 0x07 == 0 {
+                return true;
+            }
+        }
+        i = end;
+    }
+    false
 }
 
 /// Number of Link Info octets carried by the first fragment of a Basic
@@ -817,7 +867,7 @@ pub fn basic_mle_link_info_len(ies: &[u8]) -> Option<usize> {
         if i + 2 + len > ies.len() {
             break;
         }
-        if ies[i] == 255 && len >= 1 + 2 + 1 && ies[i + 2] == 107 {
+        if ies[i] == 255 && len > 1 + 2 && ies[i + 2] == 107 {
             let data = &ies[i + 3..i + 2 + len];
             let common_len = data[2] as usize;
             return Some(data.len().saturating_sub(2 + common_len));
@@ -940,62 +990,118 @@ pub struct MldLinkProfile {
 /// Parse Per-STA Profile subelements from a Basic Multi-Link element in a
 /// station's association request.
 pub fn parse_mld_link_profiles(ies: &[u8]) -> Vec<MldLinkProfile> {
+    parse_mld_link_profiles_checked(ies).unwrap_or_default()
+}
+
+/// Strict form of [`parse_mld_link_profiles`]. `None` distinguishes a malformed
+/// Basic MLE from a valid element with no partner-link profiles, allowing the AP
+/// association path to fail closed instead of silently accepting a truncated
+/// or internally inconsistent Link Info field.
+pub fn parse_mld_link_profiles_checked(ies: &[u8]) -> Option<Vec<MldLinkProfile>> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 2 <= ies.len() {
         let len = ies[i + 1] as usize;
         if i + 2 + len > ies.len() {
-            break;
+            return None;
         }
         if ies[i] == 255 && len >= 1 + 2 + 1 + 6 && ies[i + 2] == 107 {
             let body = &ies[i + 3..i + 2 + len];
             let control = u16::from_le_bytes([body[0], body[1]]);
             if control & 0x07 == 0 && body.len() >= 3 {
                 let common_len = body[2] as usize;
-                if common_len >= 1 && common_len <= body.len().saturating_sub(2) {
+                if common_len > 6 && common_len <= body.len().saturating_sub(2) {
                     let mut p = 2 + common_len;
-                    while p + 2 <= body.len() {
+                    while p < body.len() {
+                        if p + 2 > body.len() {
+                            return None;
+                        }
                         let sid = body[p];
                         let slen = body[p + 1] as usize;
                         if p + 2 + slen > body.len() {
-                            break;
+                            return None;
                         }
                         let sub = &body[p + 2..p + 2 + slen];
-                        if sid == 0 && sub.len() >= 3 {
+                        if sid == 0 {
+                            if sub.len() < 3 {
+                                return None;
+                            }
                             // STA Control(2) + STA Info Length(1) minimum
                             let sta_control = u16::from_le_bytes([sub[0], sub[1]]);
                             let link_id = (sta_control & 0x0f) as u8;
                             let complete_profile = sta_control & (1 << 4) != 0;
                             let mac_present = sta_control & (1 << 5) != 0;
                             let sta_info_len = sub[2] as usize;
-                            if complete_profile
-                                && mac_present
-                                && sta_info_len >= 7
-                                && 2 + sta_info_len <= sub.len()
+                            if !complete_profile
+                                || !mac_present
+                                || sta_info_len < 7
+                                || 2 + sta_info_len > sub.len()
                             {
-                                let mut mac = [0u8; 6];
-                                mac.copy_from_slice(&sub[3..9]);
-                                let profile = &sub[2 + sta_info_len..];
-                                let capability = (profile.len() >= 2)
-                                    .then(|| u16::from_le_bytes([profile[0], profile[1]]));
-                                let profile_ies =
-                                    profile.get(2..).map(<[u8]>::to_vec).unwrap_or_default();
-                                out.push(MldLinkProfile {
-                                    link_id,
-                                    mac,
-                                    capability,
-                                    ies: profile_ies,
-                                });
+                                return None;
                             }
+                            let mut mac = [0u8; 6];
+                            mac.copy_from_slice(&sub[3..9]);
+                            let profile = &sub[2 + sta_info_len..];
+                            if profile.len() < 2 {
+                                return None;
+                            }
+                            let capability = Some(u16::from_le_bytes([profile[0], profile[1]]));
+                            let profile_ies = profile[2..].to_vec();
+                            if !validate_mld_profile_ies(&profile_ies) {
+                                return None;
+                            }
+                            out.push(MldLinkProfile {
+                                link_id,
+                                mac,
+                                capability,
+                                ies: profile_ies,
+                            });
                         }
                         p += 2 + slen;
                     }
+                    return Some(out);
                 }
+                return None;
             }
         }
         i += 2 + len;
     }
-    out
+    None
+}
+
+/// Validate the IE stream inside an MLD Per-STA Profile, including the internal
+/// two-list shape of the Non-Inheritance extension element. A generic IE length
+/// walk alone is insufficient: `ff 02 38 00` is externally well-framed but is
+/// missing the Extension Element ID list length and hostapd rejects it.
+fn validate_mld_profile_ies(ies: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos < ies.len() {
+        if ies.len() - pos < 2 {
+            return false;
+        }
+        let len = ies[pos + 1] as usize;
+        let Some(end) = pos.checked_add(2 + len) else {
+            return false;
+        };
+        if end > ies.len() {
+            return false;
+        }
+        if ies[pos] == 255 && len >= 1 && ies[pos + 2] == 56 {
+            let payload = &ies[pos + 3..end];
+            let Some(&element_count) = payload.first() else {
+                return false;
+            };
+            let extension_count_pos = 1 + element_count as usize;
+            let Some(&extension_count) = payload.get(extension_count_pos) else {
+                return false;
+            };
+            if extension_count_pos + 1 + extension_count as usize != payload.len() {
+                return false;
+            }
+        }
+        pos = end;
+    }
+    true
 }
 
 /// Backwards-compatible address-only view used by AP-side validation.
@@ -1004,6 +1110,16 @@ pub fn parse_mld_link_macs(ies: &[u8]) -> Vec<(u8, [u8; 6])> {
         .into_iter()
         .map(|profile| (profile.link_id, profile.mac))
         .collect()
+}
+
+/// Strict address-only view used by AP-side association validation.
+pub fn parse_mld_link_macs_checked(ies: &[u8]) -> Option<Vec<(u8, [u8; 6])>> {
+    Some(
+        parse_mld_link_profiles_checked(ies)?
+            .into_iter()
+            .map(|profile| (profile.link_id, profile.mac))
+            .collect(),
+    )
 }
 
 /// Extract the optional EML and MLD Capabilities fields from a Basic MLE
@@ -1739,6 +1855,17 @@ pub fn build_assoc_req(bssid: &[u8; 6], sta: &[u8; 6], ssid: &[u8], sc: u16) -> 
     v
 }
 
+/// Association request selecting WPA-PSK-SHA256 rather than legacy PSK.
+pub fn build_assoc_req_psk_sha256(bssid: &[u8; 6], sta: &[u8; 6], ssid: &[u8], sc: u16) -> Vec<u8> {
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, FC_TODS, bssid, sta, bssid, sc);
+    v.extend_from_slice(&CAP_3101);
+    v.extend_from_slice(&STA_LISTEN_INTERVAL.to_le_bytes());
+    v.extend_from_slice(&ie(0, ssid));
+    v.extend_from_slice(&ie(1, &[0x0c]));
+    v.extend_from_slice(&RSN_PSK_SHA256);
+    v
+}
+
 /// Association request for WPA3-SAE: advertises the SAE AKM (00-0F-AC:8),
 /// MFPR|MFPC, the BIP group-management cipher, and the RSNXE H2E capability.
 /// (A WPA2-PSK RSN here would be rejected by an SAE AP with "Invalid AKMP".)
@@ -1950,6 +2077,7 @@ pub fn build_assoc_req_pmkid(
     v.extend_from_slice(&ie(0, ssid));
     v.extend_from_slice(&ie(1, &[0x0c]));
     v.extend_from_slice(&rsn_with_pmkid(pmkid));
+    v.extend_from_slice(&RSNXE_H2E);
     v
 }
 
@@ -1968,6 +2096,215 @@ pub fn find_ie(ies: &[u8], id: u8) -> Option<&[u8]> {
         i += 2 + len;
     }
     None
+}
+
+/// A malformed or ambiguous information-element stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IeParseError;
+
+/// Strictly find one information element. Unlike [`find_ie`], this rejects a
+/// truncated IE stream and duplicate instances of the requested element.
+pub fn find_ie_strict(ies: &[u8], id: u8) -> Result<Option<&[u8]>, IeParseError> {
+    let mut found = None;
+    let mut i = 0;
+    while i < ies.len() {
+        if i + 2 > ies.len() {
+            return Err(IeParseError);
+        }
+        let len = ies[i + 1] as usize;
+        let end = i.checked_add(2 + len).ok_or(IeParseError)?;
+        if end > ies.len() {
+            return Err(IeParseError);
+        }
+        if ies[i] == id {
+            if found.is_some() {
+                return Err(IeParseError);
+            }
+            found = Some(&ies[i + 2..end]);
+        }
+        i = end;
+    }
+    Ok(found)
+}
+
+/// Remove the `0xdd 00...` padding added before AES Key Wrap. A real
+/// zero-length vendor IE is not useful in EAPOL Key Data, while this exact
+/// suffix is the padding form required by 802.11.
+pub fn trim_key_data_padding(data: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i + 2 <= data.len() {
+        let len = data[i + 1] as usize;
+        let Some(end) = i.checked_add(2 + len) else {
+            return data;
+        };
+        if end > data.len() {
+            return data;
+        }
+        if data[i] == 0xdd
+            && len == 0
+            && data
+                .get(i + 2..)
+                .is_some_and(|tail| tail.iter().all(|b| *b == 0))
+        {
+            return &data[..i];
+        }
+        i = end;
+    }
+    data
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RsnInfo {
+    group: [u8; 4],
+    pairwise: Vec<[u8; 4]>,
+    akms: Vec<[u8; 4]>,
+    capabilities: Option<u16>,
+    group_mgmt: Option<[u8; 4]>,
+}
+
+fn parse_rsn(rsn: &[u8]) -> Option<RsnInfo> {
+    let mut off = 0usize;
+    let take_u16 = |data: &[u8], off: &mut usize| -> Option<u16> {
+        let bytes = data.get(*off..*off + 2)?;
+        *off += 2;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let take_suite = |data: &[u8], off: &mut usize| -> Option<[u8; 4]> {
+        let suite: [u8; 4] = data.get(*off..*off + 4)?.try_into().ok()?;
+        *off += 4;
+        Some(suite)
+    };
+
+    if take_u16(rsn, &mut off)? != 1 {
+        return None;
+    }
+    let group = take_suite(rsn, &mut off)?;
+    let pairwise_count = take_u16(rsn, &mut off)? as usize;
+    if pairwise_count == 0 {
+        return None;
+    }
+    let mut pairwise = Vec::with_capacity(pairwise_count.min(8));
+    for _ in 0..pairwise_count {
+        pairwise.push(take_suite(rsn, &mut off)?);
+    }
+    let akm_count = take_u16(rsn, &mut off)? as usize;
+    if akm_count == 0 {
+        return None;
+    }
+    let mut akms = Vec::with_capacity(akm_count.min(8));
+    for _ in 0..akm_count {
+        akms.push(take_suite(rsn, &mut off)?);
+    }
+
+    // RSN Capabilities and everything after it are optional. Once an optional
+    // field starts, though, it must be complete and the final length exact.
+    let capabilities = if off == rsn.len() {
+        None
+    } else {
+        Some(take_u16(rsn, &mut off)?)
+    };
+    let mut group_mgmt = None;
+    if off < rsn.len() {
+        let pmkid_count = take_u16(rsn, &mut off)? as usize;
+        for _ in 0..pmkid_count {
+            let _: [u8; 16] = rsn.get(off..off + 16)?.try_into().ok()?;
+            off += 16;
+        }
+        if off < rsn.len() {
+            group_mgmt = Some(take_suite(rsn, &mut off)?);
+        }
+    }
+    if off != rsn.len() {
+        return None;
+    }
+    Some(RsnInfo {
+        group,
+        pairwise,
+        akms,
+        capabilities,
+        group_mgmt,
+    })
+}
+
+fn rsn_suite(suite_type: u8) -> [u8; 4] {
+    [0x00, 0x0f, 0xac, suite_type]
+}
+
+/// Validate the mandatory RSN negotiation in an association request for the
+/// security mode advertised by this BSS. PMKIDs remain optional and are checked
+/// separately against the cache.
+pub fn validate_assoc_rsn(rsn: &[u8], mode: SecurityMode) -> Result<(), u16> {
+    // hostapd reports a syntactically complete Version-only RSNE as "invalid
+    // AKMP" (43), while empty/truncated versions are invalid IEs (40).
+    if rsn == [1, 0] {
+        return Err(STATUS_INVALID_AKMP);
+    }
+    let info = parse_rsn(rsn).ok_or(STATUS_INVALID_IE)?;
+    if info.group != rsn_suite(4) || !info.pairwise.contains(&rsn_suite(4)) {
+        return Err(STATUS_INVALID_IE);
+    }
+    let has_psk = info.akms.contains(&rsn_suite(2));
+    let has_sae = info.akms.contains(&rsn_suite(8));
+    let has_owe = info.akms.contains(&rsn_suite(18));
+    let supported = match mode {
+        SecurityMode::Wpa2 => has_psk,
+        SecurityMode::Wpa3Sae => has_sae,
+        SecurityMode::Transition => has_psk || has_sae,
+        SecurityMode::Owe => has_owe,
+    };
+    if !supported {
+        return Err(STATUS_INVALID_AKMP);
+    }
+
+    // SAE and OWE require management-frame protection. In transition mode this
+    // applies when the station selects SAE; legacy PSK associations may omit
+    // RSN Capabilities entirely, matching hostapd.
+    if matches!(mode, SecurityMode::Wpa3Sae | SecurityMode::Owe)
+        || (mode == SecurityMode::Transition && has_sae && !has_psk)
+    {
+        let caps = info.capabilities.ok_or(STATUS_INVALID_IE)?;
+        if caps & 0x00c0 != 0x00c0 {
+            return Err(STATUS_INVALID_IE);
+        }
+    }
+    Ok(())
+}
+
+/// Validate a scanned BSS/association RSN for the WPA-PSK-SHA256 AKM.
+pub fn validate_psk_sha256_rsn(rsn: &[u8]) -> Result<(), u16> {
+    let info = parse_rsn(rsn).ok_or(STATUS_INVALID_IE)?;
+    if info.group != rsn_suite(4)
+        || !info.pairwise.contains(&rsn_suite(4))
+        || !info.akms.contains(&rsn_suite(6))
+    {
+        return Err(STATUS_INVALID_AKMP);
+    }
+    Ok(())
+}
+
+/// Whether an RSN Extension element body advertises SAE Hash-to-Element.
+///
+/// RSNXE is extensible: capability bit 5 is meaningful even when later octets
+/// are present. Requiring the exact canonical one-octet body rejects the long
+/// RSNXE vectors hostapd intentionally accepts.
+pub fn rsnxe_has_sae_h2e(rsnxe: &[u8]) -> bool {
+    rsnxe
+        .first()
+        .is_some_and(|capabilities| capabilities & 0x20 != 0)
+}
+
+/// Compare the negotiated RSN parameters carried in association and EAPOL M2.
+/// PMKID lists are deliberately excluded: a PMKSA association includes the
+/// selected PMKID while M2 normally omits it.
+pub fn rsn_negotiation_matches(association: &[u8], message_2: &[u8]) -> bool {
+    let (Some(a), Some(m2)) = (parse_rsn(association), parse_rsn(message_2)) else {
+        return false;
+    };
+    a.group == m2.group
+        && a.pairwise == m2.pairwise
+        && a.akms == m2.akms
+        && a.capabilities == m2.capabilities
+        && a.group_mgmt == m2.group_mgmt
 }
 
 /// Extract a PMKID from an RSN element body (after id/len), if present.
@@ -2014,6 +2351,15 @@ pub fn rsn_has_akm(rsn_body: &[u8], suite_type: u8) -> bool {
     })
 }
 
+/// Whether an RSN element advertises management-frame protection capability.
+/// SAE clients may join a transition BSS whose beacon is MFPC but not MFPR;
+/// the SAE association itself still requests mandatory PMF.
+pub fn rsn_has_mfpc(rsn_body: &[u8]) -> bool {
+    parse_rsn(rsn_body)
+        .and_then(|info| info.capabilities)
+        .is_some_and(|caps| caps & 0x0080 != 0)
+}
+
 /// EAPOL message 2 (STA -> AP): carries the SNONCE and the supplicant RSN, MIC'd
 /// with the freshly derived KCK.
 #[allow(clippy::too_many_arguments)]
@@ -2023,6 +2369,7 @@ pub fn build_eapol_m2(
     snonce: &[u8; 32],
     kck: &[u8],
     supp_rsn: &[u8],
+    replay_counter: u64,
     sc: u16,
     mic: KeyMic,
     oci: Option<(u8, u8)>,
@@ -2040,17 +2387,24 @@ pub fn build_eapol_m2(
     if let Some((oc, ch)) = oci {
         key_data.extend_from_slice(&oci_kde(oc, ch)); // OCV
     }
-    let body0 = build_eapol_key_body(ki, 0, 1, snonce, &[0u8; 16], &key_data);
+    let body0 = build_eapol_key_body(ki, 0, replay_counter, snonce, &[0u8; 16], &key_data);
     let mic = mic.compute(kck, &eapol_wrap(&body0));
-    let body = build_eapol_key_body(ki, 0, 1, snonce, &mic, &key_data);
+    let body = build_eapol_key_body(ki, 0, replay_counter, snonce, &mic, &key_data);
     let mut frame = eapol_data_header_tods(bssid, sta, sc);
     frame.extend_from_slice(&eapol_wrap(&body));
     frame
 }
 
 /// EAPOL message 4 (STA -> AP): the handshake ack, MIC'd with the KCK.
-pub fn build_eapol_m4(bssid: &[u8; 6], sta: &[u8; 6], kck: &[u8], sc: u16, mic: KeyMic) -> Vec<u8> {
-    build_eapol_m4_mld(bssid, sta, kck, sc, mic, None)
+pub fn build_eapol_m4(
+    bssid: &[u8; 6],
+    sta: &[u8; 6],
+    kck: &[u8],
+    replay_counter: u64,
+    sc: u16,
+    mic: KeyMic,
+) -> Vec<u8> {
+    build_eapol_m4_mld(bssid, sta, kck, replay_counter, sc, mic, None)
 }
 
 /// EAPOL message 4 with an optional STA MLD MAC address (802.11be).
@@ -2064,6 +2418,7 @@ pub fn build_eapol_m4_mld(
     bssid: &[u8; 6],
     sta: &[u8; 6],
     kck: &[u8],
+    replay_counter: u64,
     sc: u16,
     mic: KeyMic,
     mld_mac: Option<&[u8; 6]>,
@@ -2087,9 +2442,9 @@ pub fn build_eapol_m4_mld(
         }
         None => Vec::new(),
     };
-    let body0 = build_eapol_key_body(ki, 0, 2, &zero_nonce, &[0u8; 16], &key_data);
+    let body0 = build_eapol_key_body(ki, 0, replay_counter, &zero_nonce, &[0u8; 16], &key_data);
     let mic = mic.compute(kck, &eapol_wrap(&body0));
-    let body = build_eapol_key_body(ki, 0, 2, &zero_nonce, &mic, &key_data);
+    let body = build_eapol_key_body(ki, 0, replay_counter, &zero_nonce, &mic, &key_data);
     let mut frame = eapol_data_header_tods(bssid, sta, sc);
     frame.extend_from_slice(&eapol_wrap(&body));
     frame
@@ -2122,7 +2477,7 @@ impl KeyMic {
         }
     }
 
-    fn version(self) -> u8 {
+    pub(crate) fn version(self) -> u8 {
         match self {
             KeyMic::HmacSha1 => 2,
             KeyMic::AesCmacV3 => 3,
@@ -2149,10 +2504,11 @@ pub fn build_eapol_m1(
     bssid: &[u8; 6],
     sta: &[u8; 6],
     anonce: &[u8; 32],
+    replay_counter: u64,
     sc: u16,
     mic: KeyMic,
 ) -> Vec<u8> {
-    build_eapol_m1_with_key_data(bssid, sta, anonce, sc, mic, &[])
+    build_eapol_m1_with_key_data(bssid, sta, anonce, replay_counter, sc, mic, &[])
 }
 
 /// EAPOL message 1 for an MLD association: carries the AP MLD MAC Address KDE
@@ -2161,17 +2517,27 @@ pub fn build_eapol_m1_mld(
     bssid: &[u8; 6],
     sta: &[u8; 6],
     anonce: &[u8; 32],
+    replay_counter: u64,
     sc: u16,
     mic: KeyMic,
     ap_mld_mac: &[u8; 6],
 ) -> Vec<u8> {
-    build_eapol_m1_with_key_data(bssid, sta, anonce, sc, mic, &mac_addr_kde(ap_mld_mac))
+    build_eapol_m1_with_key_data(
+        bssid,
+        sta,
+        anonce,
+        replay_counter,
+        sc,
+        mic,
+        &mac_addr_kde(ap_mld_mac),
+    )
 }
 
 fn build_eapol_m1_with_key_data(
     bssid: &[u8; 6],
     sta: &[u8; 6],
     anonce: &[u8; 32],
+    replay_counter: u64,
     sc: u16,
     mic: KeyMic,
     key_data: &[u8],
@@ -2182,7 +2548,7 @@ fn build_eapol_m1_with_key_data(
         key_descriptor_type_version: mic.version(),
         ..Default::default()
     };
-    let body = build_eapol_key_body(ki, 16, 1, anonce, &[0u8; 16], key_data);
+    let body = build_eapol_key_body(ki, 16, replay_counter, anonce, &[0u8; 16], key_data);
     let mut frame = eapol_data_header(bssid, sta, sc);
     frame.extend_from_slice(&eapol_wrap(&body));
     frame
@@ -2673,6 +3039,7 @@ pub fn build_eapol_m3(
     igtk: Option<(u16, [u8; 6], [u8; 16])>,
     bigtk: Option<(u16, [u8; 6], [u8; 16])>,
     oci: Option<(u8, u8)>,
+    replay_counter: u64,
     sc: u16,
     mic: KeyMic,
 ) -> Vec<u8> {
@@ -2695,7 +3062,9 @@ pub fn build_eapol_m3(
             plain.iter().map(|x| format!("{x:02x}")).collect::<String>()
         );
     }
-    let keydata = crypto::aes_wrap(kek, &crypto::pad_key_data(plain));
+    let mut padded = crypto::pad_key_data(plain);
+    let keydata = crypto::aes_wrap(kek, &padded);
+    padded.zeroize();
 
     let ki = KeyInfo {
         encrypted_key_data: true,
@@ -2708,10 +3077,10 @@ pub fn build_eapol_m3(
     };
 
     // Build once with a zero MIC, compute the MIC over the EAPOL frame, rebuild.
-    let body0 = build_eapol_key_body(ki, 16, 2, anonce, &[0u8; 16], &keydata);
+    let body0 = build_eapol_key_body(ki, 16, replay_counter, anonce, &[0u8; 16], &keydata);
     let mic = mic.compute(kck, &eapol_wrap(&body0));
 
-    let body = build_eapol_key_body(ki, 16, 2, anonce, &mic, &keydata);
+    let body = build_eapol_key_body(ki, 16, replay_counter, anonce, &mic, &keydata);
     let mut frame = eapol_data_header(bssid, sta, sc);
     frame.extend_from_slice(&eapol_wrap(&body));
     frame
@@ -2738,6 +3107,7 @@ pub fn build_eapol_m3_mld(
     igtk: Option<(u16, [u8; 6], [u8; 16])>,
     bigtk: Option<(u16, [u8; 6], [u8; 16])>,
     oci: Option<(u8, u8)>,
+    replay_counter: u64,
     sc: u16,
     mic: KeyMic,
 ) -> Vec<u8> {
@@ -2754,6 +3124,7 @@ pub fn build_eapol_m3_mld(
         igtk,
         bigtk,
         oci,
+        replay_counter,
         sc,
         mic,
     )
@@ -2778,6 +3149,7 @@ pub fn build_eapol_m3_mld_links(
     igtk: Option<(u16, [u8; 6], [u8; 16])>,
     bigtk: Option<(u16, [u8; 6], [u8; 16])>,
     oci: Option<(u8, u8)>,
+    replay_counter: u64,
     sc: u16,
     mic: KeyMic,
 ) -> Vec<u8> {
@@ -2802,7 +3174,9 @@ pub fn build_eapol_m3_mld_links(
             plain.extend_from_slice(&mlo_bigtk_kde(*link_id, key_id, &ipn, &bk));
         }
     }
-    let keydata = crypto::aes_wrap(kek, &crypto::pad_key_data(plain));
+    let mut padded = crypto::pad_key_data(plain);
+    let keydata = crypto::aes_wrap(kek, &padded);
+    padded.zeroize();
 
     let ki = KeyInfo {
         encrypted_key_data: true,
@@ -2814,10 +3188,10 @@ pub fn build_eapol_m3_mld_links(
         key_descriptor_type_version: mic.version(),
     };
 
-    let body0 = build_eapol_key_body(ki, 16, 2, anonce, &[0u8; 16], &keydata);
+    let body0 = build_eapol_key_body(ki, 16, replay_counter, anonce, &[0u8; 16], &keydata);
     let mic = mic.compute(kck, &eapol_wrap(&body0));
 
-    let body = build_eapol_key_body(ki, 16, 2, anonce, &mic, &keydata);
+    let body = build_eapol_key_body(ki, 16, replay_counter, anonce, &mic, &keydata);
     let mut frame = eapol_data_header(bssid, sta, sc);
     frame.extend_from_slice(&eapol_wrap(&body));
     frame
@@ -3151,7 +3525,9 @@ pub fn build_group_key_msg1(
     if let Some((kid, ipn, ik)) = igtk {
         plain.extend_from_slice(&igtk_kde(kid, &ipn, &ik));
     }
-    let keydata = crypto::aes_wrap(kek, &crypto::pad_key_data(plain));
+    let mut padded = crypto::pad_key_data(plain);
+    let keydata = crypto::aes_wrap(kek, &padded);
+    padded.zeroize();
     let ki = KeyInfo {
         encrypted_key_data: true,
         secure: true,
@@ -3202,7 +3578,9 @@ pub fn build_group_key_msg1_mld(
             plain.extend_from_slice(&mlo_bigtk_kde(*link_id, key_id, &ipn, &bk));
         }
     }
-    let keydata = crypto::aes_wrap(kek, &crypto::pad_key_data(plain));
+    let mut padded = crypto::pad_key_data(plain);
+    let keydata = crypto::aes_wrap(kek, &padded);
+    padded.zeroize();
     let ki = KeyInfo {
         encrypted_key_data: true,
         secure: true,
@@ -3879,20 +4257,26 @@ impl Dot11 {
     /// The whole EAPOL frame (4-byte EAPOL header + body, after LLC/SNAP). This
     /// is what the MIC is computed over.
     pub fn eapol_frame(&self) -> Option<&[u8]> {
-        if self.is_eapol() {
-            Some(&self.body[8..])
-        } else {
-            None
+        if !self.is_eapol() || self.body.len() < 12 {
+            return None;
         }
+        let declared = u16::from_be_bytes([self.body[10], self.body[11]]) as usize;
+        let end = 12usize.checked_add(declared)?;
+        if end > self.body.len() {
+            return None;
+        }
+        // Ignore link-layer padding after the declared EAPOL payload. The MIC
+        // covers only the EAPOL header and its declared body.
+        Some(&self.body[8..end])
     }
 
     /// The EAPOL-Key body, after the 4-byte EAPOL header (== `EAPOL.payload.load`).
     pub fn eapol_key_body(&self) -> Option<&[u8]> {
-        if self.is_eapol() && self.body.len() >= 12 {
-            Some(&self.body[12..])
-        } else {
-            None
+        let eapol = self.eapol_frame()?;
+        if eapol.get(1) != Some(&3) {
+            return None;
         }
+        eapol.get(4..)
     }
 
     /// Reconstruct the integer PN from a CCMP-protected data frame body.
@@ -3951,6 +4335,7 @@ pub fn find_ssid(ies: &[u8]) -> Option<Vec<u8>> {
 #[derive(Debug, Clone)]
 pub struct EapolKey {
     pub key_info: u16,
+    pub key_length: u16,
     pub key_replay_counter: u64,
     pub key_nonce: [u8; 32],
     pub key_mic: [u8; 16],
@@ -3961,11 +4346,29 @@ pub struct EapolKey {
 
 impl EapolKey {
     /// Key Information flag accessors (see `KeyInfo::to_u16`).
+    pub fn descriptor_version(&self) -> u8 {
+        (self.key_info & 0x0007) as u8
+    }
     pub fn is_pairwise(&self) -> bool {
         (self.key_info >> 3) & 1 != 0
     }
+    pub fn install(&self) -> bool {
+        (self.key_info >> 6) & 1 != 0
+    }
     pub fn key_ack(&self) -> bool {
         (self.key_info >> 7) & 1 != 0
+    }
+    pub fn has_key_mic(&self) -> bool {
+        (self.key_info >> 8) & 1 != 0
+    }
+    pub fn secure(&self) -> bool {
+        (self.key_info >> 9) & 1 != 0
+    }
+    pub fn error(&self) -> bool {
+        (self.key_info >> 10) & 1 != 0
+    }
+    pub fn request(&self) -> bool {
+        (self.key_info >> 11) & 1 != 0
     }
     pub fn encrypted_key_data(&self) -> bool {
         (self.key_info >> 12) & 1 != 0
@@ -3977,7 +4380,14 @@ impl EapolKey {
         if body.len() < 95 {
             return None;
         }
+        // RSN Key Descriptor, plus the legacy 254 workaround accepted by
+        // hostapd. Other descriptor types must be dropped before they can be
+        // misclassified as a wrong-password M2.
+        if body[0] != 2 && body[0] != 254 {
+            return None;
+        }
         let key_info = u16::from_be_bytes([body[1], body[2]]);
+        let key_length = u16::from_be_bytes([body[3], body[4]]);
         let key_replay_counter = u64::from_be_bytes(body[5..13].try_into().ok()?);
         let mut key_nonce = [0u8; 32];
         key_nonce.copy_from_slice(&body[13..45]);
@@ -3985,13 +4395,14 @@ impl EapolKey {
         let mut key_mic = [0u8; 16];
         key_mic.copy_from_slice(&body[mic_offset..mic_offset + 16]);
         let key_data_len = u16::from_be_bytes([body[93], body[94]]) as usize;
-        let key_data = if body.len() >= 95 + key_data_len {
-            body[95..95 + key_data_len].to_vec()
-        } else {
-            body[95..].to_vec()
-        };
+        let end = 95usize.checked_add(key_data_len)?;
+        if end != body.len() {
+            return None;
+        }
+        let key_data = body[95..end].to_vec();
         Some(EapolKey {
             key_info,
+            key_length,
             key_replay_counter,
             key_nonce,
             key_mic,

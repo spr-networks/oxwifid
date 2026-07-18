@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 use crate::crypto;
 use crate::dot11;
@@ -37,15 +38,62 @@ const EAPOL_FIRST_TIMEOUT: Duration = Duration::from_millis(100);
 /// the initial message plus three retransmissions.
 const MAX_EAPOL_RETRIES: u8 = 3;
 
-/// How long an incomplete-4-way ANonce is held for a reconnecting station
-/// (see `Ap::pending_anonce`). Long enough to span a deauth + PMKSA reconnect,
-/// short enough that a genuinely new session much later gets a fresh ANonce.
+/// How long an unconsumed message-1 ANonce/replay pair is held for a reconnecting
+/// station. The pair is destroyed as soon as message 2 verifies, before either
+/// peer can install the PTK.
 const ANONCE_HOLD: Duration = Duration::from_secs(10);
 
 /// Cap on the PMKSA (fast-reconnect PMK) cache. hostapd bounds + expires these;
 /// we cap the size so the cache can't grow without bound over a long uptime with
 /// many distinct clients. An evicted client simply re-runs the full SAE/auth.
 const PMKSA_CACHE_MAX: usize = 256;
+/// IEEE 802.11's default PMKSA lifetime (12 hours).
+const PMKSA_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
+/// Require an SAE anti-clogging token once this many exchanges are incomplete.
+const SAE_ANTI_CLOGGING_THRESHOLD: usize = 5;
+/// Absolute cap even for peers that returned a valid anti-clogging token.
+const SAE_INCOMPLETE_MAX: usize = 64;
+/// Incomplete SAE state is short-lived and must not accumulate indefinitely.
+const SAE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Stateless anti-clogging tokens are intentionally short-lived so an attacker
+/// cannot harvest them ahead of time and bypass overload protection later.
+const SAE_TOKEN_LIFETIME: Duration = Duration::from_secs(10);
+
+struct PmksaEntry {
+    identity: [u8; 6],
+    pmk: [u8; 32],
+    sha256: bool,
+    expires_at: Instant,
+}
+
+impl Drop for PmksaEntry {
+    fn drop(&mut self) {
+        self.pmk.zeroize();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingHandshake {
+    anonce: [u8; 32],
+    replay_counter: u64,
+    created_at: Instant,
+}
+
+#[derive(Clone)]
+struct PtkCandidate {
+    m3_replay_counter: u64,
+    kck: [u8; 16],
+    kek: [u8; 16],
+    tk: [u8; 16],
+}
+
+impl Drop for PtkCandidate {
+    fn drop(&mut self) {
+        self.kck.zeroize();
+        self.kek.zeroize();
+        self.tk.zeroize();
+    }
+}
 
 pub struct Station {
     pub mac: [u8; 6],
@@ -67,6 +115,13 @@ pub struct Station {
     pub last_rx_mgmt_pn: u64,
     /// EAPOL-Key replay counter for downlink key messages (m1=1, m3=2, rekeys 3+).
     pub eapol_replay: u64,
+    /// Replay counter from the message 1 this 4-way is answering. It remains
+    /// valid while awaiting M4 so hostapd-compatible changed-SNonce M2 retries
+    /// can be evaluated without regressing to a new handshake.
+    m1_replay: u64,
+    /// PTKs derived from valid M2 retries in this one 4-way. They are not exposed
+    /// to the driver until one candidate's M4 verifies.
+    ptk_candidates: Vec<PtkCandidate>,
     pub last_auth: Option<Instant>,
     pub last_assoc: Option<Instant>,
     /// In-progress SAE exchange (WPA3); `None` for WPA2/PSK stations.
@@ -132,11 +187,6 @@ pub struct Station {
     /// The peer SAE commit payload we last answered — recognizes an identical
     /// retry vs. a genuinely fresh commit.
     pub sae_commit: Vec<u8>,
-    /// The last few ANonces we put into an m1 for this station. On a flaky
-    /// medium / retransmit race the STA's m2 can be keyed to an *earlier* m1's
-    /// ANonce than our latest, so the 4-way MIC is verified against every recent
-    /// ANonce, not just the current one.
-    pub recent_anonces: Vec<[u8; 32]>,
 }
 
 impl Station {
@@ -154,11 +204,12 @@ impl Station {
             client_mld_links: Vec::new(),
             sae_resp: Vec::new(),
             sae_commit: Vec::new(),
-            recent_anonces: Vec::new(),
             client_pn: 1, // CCMP PN starts at 1
             last_rx_pn: 0,
             last_rx_mgmt_pn: 0,
             eapol_replay: 0,
+            m1_replay: 0,
+            ptk_candidates: Vec::new(),
             last_auth: None,
             last_assoc: None,
             sae: None,
@@ -185,6 +236,25 @@ impl Station {
         let pn = self.client_pn;
         self.client_pn += 1;
         pn
+    }
+
+    fn set_pmk(&mut self, pmk: Option<[u8; 32]>) {
+        if let Some(old) = self.pmk.as_mut() {
+            old.zeroize();
+        }
+        self.pmk = pmk;
+    }
+}
+
+impl Drop for Station {
+    fn drop(&mut self) {
+        self.kck.zeroize();
+        self.kek.zeroize();
+        self.tk.zeroize();
+        self.gtk.zeroize();
+        if let Some(pmk) = self.pmk.as_mut() {
+            pmk.zeroize();
+        }
     }
 }
 
@@ -373,8 +443,9 @@ pub struct Ap {
     /// OWE (Opportunistic Wireless Encryption): open + DH key exchange.
     owe: bool,
     sa_query_id: u16,
-    /// PMKSA cache: PMKID -> (PMK, sha256) for fast reconnect (hostapd `okc`).
-    pmksa_cache: HashMap<[u8; 16], ([u8; 32], bool)>,
+    /// PMKSA cache keyed by PMKID and the authenticated station identity. For an
+    /// MLD this identity is the stable MLD MAC; otherwise it is the link MAC.
+    pmksa_cache: HashMap<([u8; 16], [u8; 6]), PmksaEntry>,
     /// ANonce held for a station whose *initial* 4-way has not yet completed,
     /// keyed by MAC so it survives the STA being torn down and rebuilt. A real
     /// client that can't finish the first handshake (e.g. our m1 was dropped)
@@ -382,11 +453,17 @@ pub struct Ap {
     /// keeps answering the m1 it *did* receive. Minting a fresh ANonce on each
     /// reconnect leaves us one ANonce ahead of the client forever (its Message 2
     /// keys to a stale ANonce and the MIC never verifies): a livelock seen on
-    /// ath12k. Reusing the same ANonce until the 4-way actually completes keeps
-    /// both sides in lock-step. Cleared on a verified m4 (so a post-association
-    /// reconnect derives a fresh PTK — KRACK-safe, since no PTK is installed
-    /// until then) and expired after `ANONCE_HOLD` to bound the map.
-    pending_anonce: HashMap<[u8; 6], ([u8; 32], Instant)>,
+    /// ath12k. Reusing the same ANonce and replay counter until message 2 verifies
+    /// keeps both sides in lock-step. The entry is consumed before message 3 is
+    /// sent (and therefore before a PTK can be installed), and expires after
+    /// `ANONCE_HOLD`.
+    pending_anonce: HashMap<[u8; 6], PendingHandshake>,
+    /// Process-wide monotonically increasing EAPOL replay counter. It starts at
+    /// a random non-zero value so frames from an earlier AP lifetime cannot be
+    /// valid in a new lifetime.
+    eapol_replay_counter: u64,
+    /// Secret for stateless SAE anti-clogging tokens.
+    sae_token_key: [u8; 32],
     stations: HashMap<[u8; 6], Station>,
     /// Deduplicated log of failed auth / decryption attempts, fingerprinted by
     /// client (intrusion detection).
@@ -421,6 +498,15 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     b
 }
 
+fn random_nonzero_u64() -> u64 {
+    loop {
+        let value = u64::from_be_bytes(random_bytes());
+        if value != 0 && value != u64::MAX {
+            return value;
+        }
+    }
+}
+
 /// Increment a 6-octet BIP IPN, which is a LITTLE-endian counter in the MME
 /// (octet 0 is least significant). Carries upward from octet 0, matching how
 /// `dot11::bip_ipn` decodes it.
@@ -439,12 +525,55 @@ fn prepend_radiotap(frame: Vec<u8>) -> Vec<u8> {
     f
 }
 
+fn expected_key_descriptor_version(sha256: bool, owe: bool) -> u16 {
+    if sha256 || owe {
+        0
+    } else {
+        2
+    }
+}
+
+fn key_info_matches(key_info: u16, expected: u16) -> bool {
+    // hostapd accepts the two reserved upper bits and encrypted M2/M4 Key Data.
+    // Compare every state-bearing bit while deliberately ignoring only those.
+    key_info & !(0xc000 | 0x1000) == expected
+}
+
+fn message_2_security_matches(assoc_ies: &[u8], key_data: &[u8]) -> bool {
+    let Ok(Some(assoc_rsn)) = dot11::find_ie_strict(assoc_ies, 48) else {
+        return false;
+    };
+    let Ok(Some(m2_rsn)) = dot11::find_ie_strict(key_data, 48) else {
+        return false;
+    };
+    if !dot11::rsn_negotiation_matches(assoc_rsn, m2_rsn) {
+        return false;
+    }
+    let Ok(assoc_rsnxe) = dot11::find_ie_strict(assoc_ies, 0xf4) else {
+        return false;
+    };
+    let Ok(m2_rsnxe) = dot11::find_ie_strict(key_data, 0xf4) else {
+        return false;
+    };
+    assoc_rsnxe == m2_rsnxe
+}
+
 impl Ap {
     pub fn new(ssid: &str, psk: &str, mac: [u8; 6], channel: u8) -> Ap {
-        let pmk = crypto::pbkdf2_pmk(psk, ssid);
-        let gtk_full = random_bytes::<32>();
+        let mut ap = Self::new_without_credential(ssid, mac, channel);
+        ap.pmk = crypto::pbkdf2_pmk(psk, ssid);
+        ap.password = psk.as_bytes().to_vec();
+        ap
+    }
+
+    /// Construct an AP with no fallback credential. Configuration-file callers
+    /// use this when credentials come exclusively from `psk_file` or the BSS is
+    /// OWE; authentication remains fail-closed until credentials are installed.
+    pub fn new_without_credential(ssid: &str, mac: [u8; 6], channel: u8) -> Ap {
+        let mut gtk_full = random_bytes::<32>();
         let mut gtk = [0u8; 16];
         gtk.copy_from_slice(&gtk_full[..16]);
+        gtk_full.zeroize();
         Ap {
             mac,
             ssid: ssid.as_bytes().to_vec(),
@@ -462,11 +591,11 @@ impl Ap {
             mld_driver_capability: None,
             mld_link_phy_capabilities: HashMap::new(),
             phy_mode: dot11::PhyMode::Vht,
-            pmk,
+            pmk: [0u8; 32],
             psk_candidates: Vec::new(),
             credential_passwords: Vec::new(),
             credential_file_authoritative: false,
-            password: psk.as_bytes().to_vec(),
+            password: Vec::new(),
             sae_enabled: false,
             transition: false,
             boottime: Instant::now(),
@@ -494,6 +623,8 @@ impl Ap {
             sa_query_id: 0,
             pmksa_cache: HashMap::new(),
             pending_anonce: HashMap::new(),
+            eapol_replay_counter: random_nonzero_u64(),
+            sae_token_key: random_bytes(),
             failures: crate::failures::FailureLog::default(),
             events: Vec::new(),
             group_rekey_secs: 600,
@@ -556,6 +687,8 @@ impl Ap {
     pub fn set_test_fixtures(&mut self, gtk: [u8; 16], anonce: [u8; 32]) {
         self.gtk = gtk;
         self.test_anonce = Some(anonce);
+        // Golden frame vectors use replay counters 1 and 2.
+        self.eapol_replay_counter = 0;
     }
 
     fn next_sc(&mut self) -> u16 {
@@ -566,6 +699,14 @@ impl Ap {
     fn next_aid(&mut self) -> u16 {
         self.aid = (self.aid + 1) % 2008;
         self.aid
+    }
+
+    fn next_eapol_replay(&mut self) -> u64 {
+        self.eapol_replay_counter = self.eapol_replay_counter.wrapping_add(1);
+        if self.eapol_replay_counter == 0 {
+            self.eapol_replay_counter = 1;
+        }
+        self.eapol_replay_counter
     }
 
     fn next_group_pn(&mut self) -> u64 {
@@ -783,6 +924,16 @@ impl Ap {
     }
 
     fn reject_assoc(&mut self, sta: &[u8; 6], reassoc: bool, out: &mut Outgoing) {
+        self.reject_assoc_status(sta, reassoc, dot11::STATUS_UNSPECIFIED_FAILURE, out);
+    }
+
+    fn reject_assoc_status(
+        &mut self,
+        sta: &[u8; 6],
+        reassoc: bool,
+        status: u16,
+        out: &mut Outgoing,
+    ) {
         let sub = if reassoc {
             0x03
         } else {
@@ -790,11 +941,7 @@ impl Ap {
         };
         let sc = self.next_sc();
         out.tx(dot11::build_assoc_resp_reject(
-            &self.mac,
-            sta,
-            dot11::STATUS_UNSPECIFIED_FAILURE,
-            sub,
-            sc,
+            &self.mac, sta, status, sub, sc,
         ));
     }
 
@@ -836,7 +983,7 @@ impl Ap {
         peer_addrs.insert(*client_mld);
 
         let mut links = Vec::new();
-        for (link_id, link_mac) in dot11::parse_mld_link_macs(assoc_ies) {
+        for (link_id, link_mac) in dot11::parse_mld_link_macs_checked(assoc_ies)? {
             if !configured.contains(&link_id)
                 || link_id == self.link_id
                 || !Self::is_valid_peer_mac(&link_mac)
@@ -960,6 +1107,17 @@ impl Ap {
     /// into a PMK against this AP's SSID. Once called, this file is authoritative:
     /// the BSS passphrase is no longer an authentication fallback.
     pub fn set_psk_file(&mut self, entries: &[(Option<[u8; 6]>, String)]) {
+        // Reload is a revocation boundary: cached SAE PMKs were authenticated
+        // under the old credential database and must not survive replacement.
+        self.pmksa_cache.clear();
+        for (_, pmk) in &mut self.psk_candidates {
+            pmk.zeroize();
+        }
+        for (_, password) in &mut self.credential_passwords {
+            password.zeroize();
+        }
+        self.psk_candidates.clear();
+        self.credential_passwords.clear();
         self.credential_file_authoritative = true;
         let ssid = String::from_utf8_lossy(&self.ssid).to_string();
         self.psk_candidates = entries
@@ -970,6 +1128,10 @@ impl Ap {
             .iter()
             .map(|(m, pass)| (*m, pass.as_bytes().to_vec()))
             .collect();
+        // The file is authoritative, so the JSON passphrase is no longer a
+        // fallback and should not remain resident.
+        self.pmk.zeroize();
+        self.password.zeroize();
     }
 
     /// Select an SAE credential using hostapd's non-AP MLD identity rules. An
@@ -1374,11 +1536,11 @@ impl Ap {
             // ANonce we already sent it — never verifies, and every retry advances
             // us one ANonce ahead of the client: a permanent off-by-one livelock
             // (observed on ath12k, where the client always PMKSA-reconnects). While
-            // mid-handshake (we sent an m1 but the STA never finished associating)
-            // reuse the existing ANonce instead. Reuse is KRACK-safe here: no PTK
-            // is installed until a verified m4, so there is no key to reinstall.
-            // Only a station that had fully associated gets the full reset.
-            let mid_handshake = entry.anonce.is_some() && !entry.associated;
+            // mid-handshake (we sent m1 but have not accepted m2) reuse the
+            // existing ANonce/replay pair. Once m2 verifies, `eapol_ready` is
+            // cleared and the pending pair is consumed before m3 can install a
+            // PTK, so any later authentication gets a full reset.
+            let mid_handshake = entry.anonce.is_some() && entry.eapol_ready && !entry.awaiting_m4;
             if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
                 eprintln!(
                     "AP: AUTH-REQ sta={} retransmit={retransmit} mid_handshake={mid_handshake} anonce_set={} associated={} eapol_ready={}",
@@ -1398,9 +1560,12 @@ impl Ap {
                 entry.awaiting_m4 = false;
                 entry.associated = false;
                 entry.eapol_replay = 0;
-                entry.kck = [0; 16];
-                entry.kek = [0; 16];
-                entry.tk = [0; 16];
+                entry.m1_replay = 0;
+                entry.ptk_candidates.clear();
+                entry.kck.zeroize();
+                entry.kek.zeroize();
+                entry.tk.zeroize();
+                entry.gtk.zeroize();
                 entry.gtk = random_bytes::<16>();
                 entry.pending_eapol = None; // no stale m1/m3 to retransmit
                                             // Drop any psk_file PMK pinned by a previous 4-way so the
@@ -1408,9 +1573,9 @@ impl Ap {
                                             // re-onboarded device may use a different password now. (SAE uses
                                             // algorithm-3 auth and never reaches this open-auth reset; PMKSA
                                             // fast-reconnect re-sets `pmk` from the cache at association.)
-                entry.pmk = None;
+                entry.set_pmk(None);
             } else if !retransmit {
-                // Mid-handshake re-auth: keep the ANonce/PTK-in-progress state, just
+                // Mid-message-1 re-auth: keep the ANonce/replay state, just
                 // note the auth time so the backoff window tracks the latest attempt.
                 entry.last_auth = Some(now);
             }
@@ -1431,6 +1596,127 @@ impl Ap {
         let sc = self.next_sc();
         let auth = dot11::build_auth(&self.mac, &sta, sc);
         out.tx(auth);
+    }
+
+    fn sae_commit_token(payload: &[u8], h2e: bool) -> Option<(Vec<u8>, Option<[u8; 32]>)> {
+        const COMMIT_LEN: usize = 2 + 3 * 32;
+        if payload.len() < COMMIT_LEN {
+            return None;
+        }
+        if !h2e {
+            // Legacy SAE inserts the fixed-size token after the group ID and
+            // before scalar/element. With no token, the core commit is 98 bytes.
+            if payload.len() >= COMMIT_LEN + 32 {
+                let mut token = [0u8; 32];
+                token.copy_from_slice(&payload[2..34]);
+                let mut commit = Vec::with_capacity(payload.len() - 32);
+                commit.extend_from_slice(&payload[..2]);
+                commit.extend_from_slice(&payload[34..]);
+                return Some((commit, Some(token)));
+            }
+            return Some((payload.to_vec(), None));
+        }
+
+        // H2E carries the token in Extension IE 93 after scalar/element. Strip
+        // exactly one well-formed token container while retaining other IEs
+        // (Rejected Groups and MLO identity) in the canonical commit.
+        let mut commit = payload[..COMMIT_LEN].to_vec();
+        let mut token = None;
+        let mut pos = COMMIT_LEN;
+        while pos < payload.len() {
+            if payload.len() - pos < 2 {
+                return None;
+            }
+            let len = payload[pos + 1] as usize;
+            let end = pos
+                .checked_add(2 + len)
+                .filter(|end| *end <= payload.len())?;
+            if payload[pos] == 255 && len == 33 && payload[pos + 2] == 93 {
+                if token.is_some() {
+                    return None;
+                }
+                let mut value = [0u8; 32];
+                value.copy_from_slice(&payload[pos + 3..end]);
+                token = Some(value);
+            } else {
+                commit.extend_from_slice(&payload[pos..end]);
+            }
+            pos = end;
+        }
+        Some((commit, token))
+    }
+
+    fn sae_token_at(
+        &self,
+        sta: &[u8; 6],
+        h2e: bool,
+        commit: &[u8],
+        issued_at_secs: u64,
+    ) -> [u8; 32] {
+        let method = [u8::from(h2e)];
+        let issued = issued_at_secs.to_be_bytes();
+        let mut input =
+            Vec::with_capacity(19 + issued.len() + sta.len() + method.len() + commit.len());
+        input.extend_from_slice(b"rustap-sae-token-v1");
+        input.extend_from_slice(&issued);
+        input.extend_from_slice(sta);
+        input.extend_from_slice(&method);
+        input.extend_from_slice(commit);
+        let mut mac = crypto::hmac_sha256(&self.sae_token_key, &input);
+        let mut token = [0u8; 32];
+        token[..8].copy_from_slice(&issued);
+        token[8..].copy_from_slice(&mac[..24]);
+        mac.zeroize();
+        token
+    }
+
+    fn sae_token(&self, sta: &[u8; 6], h2e: bool, commit: &[u8]) -> [u8; 32] {
+        self.sae_token_at(sta, h2e, commit, self.boottime.elapsed().as_secs())
+    }
+
+    fn valid_sae_token(&self, sta: &[u8; 6], h2e: bool, commit: &[u8], token: &[u8; 32]) -> bool {
+        let issued_at_secs = u64::from_be_bytes(token[..8].try_into().expect("token timestamp"));
+        let now = self.boottime.elapsed().as_secs();
+        let Some(age) = now.checked_sub(issued_at_secs) else {
+            return false;
+        };
+        if age > SAE_TOKEN_LIFETIME.as_secs() {
+            return false;
+        }
+        let mut expected = self.sae_token_at(sta, h2e, commit, issued_at_secs);
+        let valid = crypto::constant_time_eq(&token[8..], &expected[8..]);
+        expected.zeroize();
+        valid
+    }
+
+    fn request_sae_token(&mut self, sta: &[u8; 6], h2e: bool, commit: &[u8], out: &mut Outgoing) {
+        let Some(group) = commit.get(..2) else {
+            return;
+        };
+        let token = self.sae_token(sta, h2e, commit);
+        let mut body = group.to_vec();
+        if h2e {
+            body.extend_from_slice(&[255, 33, 93]);
+        }
+        body.extend_from_slice(&token);
+        let sc = self.next_sc();
+        out.tx(dot11::build_sae_auth(
+            sta,
+            &self.mac,
+            &self.mac,
+            0,
+            sc,
+            1,
+            dot11::STATUS_ANTI_CLOGGING_TOKEN_REQ,
+            &body,
+        ));
+    }
+
+    fn incomplete_sae_count(&self) -> usize {
+        self.stations
+            .values()
+            .filter(|s| s.sae.is_some() && !s.sae_confirmed)
+            .count()
     }
 
     /// Drive the SAE (Dragonfly) exchange. Commit (seq 1) yields our commit +
@@ -1455,7 +1741,53 @@ impl Ap {
                 crate::util::bytes_to_mac(sta)
             );
         }
+        if seq == 1 && !matches!(status, dot11::STATUS_SUCCESS | dot11::STATUS_SAE_H2E) {
+            // SAE-PK (127) and other non-success commit status values are not
+            // legacy SAE. hostapd answers these unsupported commit methods with
+            // status 1 instead of feeding their payload into hunting-and-pecking.
+            let sc = self.next_sc();
+            out.tx(dot11::build_sae_auth(
+                sta,
+                &self.mac,
+                &self.mac,
+                0,
+                sc,
+                1,
+                dot11::STATUS_UNSPECIFIED_FAILURE,
+                &[],
+            ));
+            return;
+        }
         if seq == 1 {
+            let Some(group_bytes) = payload.get(..2) else {
+                self.record_failure(sta, crate::failures::FailureKind::Sae);
+                return;
+            };
+            let group = u16::from_le_bytes([group_bytes[0], group_bytes[1]]);
+            if group != crate::sae::SAE_GROUP_19 {
+                // SAE group negotiation depends on an explicit status 77:
+                // wpa_supplicant then advances to its next configured group.
+                // Silently dropping an unsupported commit leaves it retrying
+                // the same group until authentication times out.
+                let sc = self.next_sc();
+                out.tx(dot11::build_sae_auth(
+                    sta,
+                    &self.mac,
+                    &self.mac,
+                    0,
+                    sc,
+                    1,
+                    dot11::STATUS_FINITE_CYCLIC_GROUP_NOT_SUPPORTED,
+                    group_bytes,
+                ));
+                return;
+            }
+            let h2e = status == dot11::STATUS_SAE_H2E;
+            let Some((commit_payload, supplied_token)) = Self::sae_commit_token(payload, h2e)
+            else {
+                self.record_failure(sta, crate::failures::FailureKind::Sae);
+                return;
+            };
             // Idempotent retry: if the STA re-sends the identical commit while
             // SAE is still in progress, resend the cached commit+confirm instead
             // of resetting our scalar. A lost response on a flaky medium then
@@ -1464,7 +1796,7 @@ impl Ap {
                 if s.sae.is_some()
                     && !s.sae_confirmed
                     && !s.sae_resp.is_empty()
-                    && s.sae_commit == payload
+                    && s.sae_commit == commit_payload
                 {
                     for f in s.sae_resp.clone() {
                         out.tx(f);
@@ -1472,14 +1804,35 @@ impl Ap {
                     return;
                 }
             }
+            let incomplete = self.incomplete_sae_count();
+            let existing_exchange = self
+                .stations
+                .get(sta)
+                .map(|s| s.sae.is_some() && !s.sae_confirmed)
+                .unwrap_or(false);
+            if !existing_exchange && incomplete >= SAE_INCOMPLETE_MAX {
+                // Do no ECC work and allocate no state while the hard cap is
+                // full. Expiration in tick/prune_idle makes this self-healing.
+                self.request_sae_token(sta, h2e, &commit_payload, out);
+                return;
+            }
+            if incomplete >= SAE_ANTI_CLOGGING_THRESHOLD {
+                let valid = supplied_token
+                    .as_ref()
+                    .map(|token| self.valid_sae_token(sta, h2e, &commit_payload, token))
+                    .unwrap_or(false);
+                if !valid {
+                    self.request_sae_token(sta, h2e, &commit_payload, out);
+                    return;
+                }
+            }
             // Pick the PWE method the STA advertised: status 126 = Hash-to-Element
             // (the preferred, side-channel-free derivation), otherwise legacy
             // hunting-and-pecking (whose derivation is made constant-time in
             // `derive_pwe_hunting_pecking` so it has no Dragonblood timing leak).
-            let h2e = status == dot11::STATUS_SAE_H2E;
             let auth_mld = self
                 .mld
-                .then(|| Self::sae_auth_mld_mac(seq, payload))
+                .then(|| Self::sae_auth_mld_mac(seq, &commit_payload))
                 .flatten();
             // Apple can first try a cached-PMKSA MLO association and only then
             // fall back to full SAE. That association has already supplied and
@@ -1507,7 +1860,7 @@ impl Ap {
             // A hostapd-style credential file may bind a different SAE
             // password to each link-addressed station. Select and own it before
             // mutably borrowing the SAE/station state below.
-            let Some(password) = self
+            let Some(mut password) = self
                 .sae_password_for(&sae_sta, peer_mld.as_ref().map(|_| sta))
                 .map(<[u8]>::to_vec)
             else {
@@ -1546,10 +1899,14 @@ impl Ap {
             } else {
                 match crate::sae::Sae::new_hunting_pecking(&password, &sae_ap, &sae_sta) {
                     Some(s) => s,
-                    None => return,
+                    None => {
+                        password.zeroize();
+                        return;
+                    }
                 }
             };
-            if let Err(err) = sae.parse_peer_commit(payload) {
+            password.zeroize();
+            if let Err(err) = sae.parse_peer_commit(&commit_payload) {
                 eprintln!(
                     "AP: SAE commit parse failed from {}: {err:?}",
                     crate::util::bytes_to_mac(sta)
@@ -1632,7 +1989,8 @@ impl Ap {
                 .entry(*sta)
                 .or_insert_with(|| Station::new(*sta));
             entry.sae = Some(sae);
-            entry.pmk = Some(pmk);
+            entry.set_pmk(Some(pmk));
+            pmk.zeroize();
             entry.sae_confirmed = false;
             entry.sha256 = true; // WPA3-SAE uses SHA-256 key descriptors + PMF
             if let Some(mld) = peer_mld {
@@ -1641,7 +1999,8 @@ impl Ap {
             // Cache this response so an identical retried commit is answered
             // idempotently (see the guard above).
             entry.sae_resp = vec![commit.clone(), confirm.clone()];
-            entry.sae_commit = payload.to_vec();
+            entry.sae_commit = commit_payload;
+            entry.last_activity = Instant::now();
 
             out.tx(commit);
             out.tx(confirm);
@@ -1684,6 +2043,11 @@ impl Ap {
                 .get(sta)
                 .and_then(|s| s.sae.as_ref())
                 .map(|sae| (sae.pmkid.clone(), sae.pmk.clone()));
+            let identity = self
+                .stations
+                .get(sta)
+                .and_then(|s| s.client_mld_mac)
+                .unwrap_or(*sta);
             if let Some(s) = self.stations.get_mut(sta) {
                 s.sae_confirmed = true;
             }
@@ -1691,7 +2055,7 @@ impl Ap {
                 "AP: SAE confirm verified for {}",
                 crate::util::bytes_to_mac(sta),
             );
-            if let Some((pmkid, pmk)) = confirmed {
+            if let Some((pmkid, mut pmk)) = confirmed {
                 if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
                     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
                     eprintln!("AP: SAE confirmed pmkid={} pmk={}", hex(&pmkid), hex(&pmk));
@@ -1701,8 +2065,10 @@ impl Ap {
                     id.copy_from_slice(&pmkid);
                     let mut k = [0u8; 32];
                     k.copy_from_slice(&pmk);
-                    self.cache_pmksa(id, k, true);
+                    self.cache_pmksa(id, identity, k, true);
+                    k.zeroize();
                 }
+                pmk.zeroize();
             }
         }
     }
@@ -1725,105 +2091,10 @@ impl Ap {
         let sta = frame.addr2;
         let reassoc = frame.subtype() == dot11::SUBTYPE_REASSOC_REQ;
 
-        // Fingerprint the client from its association characteristics (for the
-        // failure log), and note whether it negotiated WMM (the IE block starts
-        // after the fixed fields: 4 bytes for Assoc, 10 for Reassoc).
-        let ap_wmm = self.wmm;
-        let ie_off = if reassoc { 10 } else { 4 };
-        let client_wmm = frame.body.len() > ie_off && dot11::has_wmm_ie(&frame.body[ie_off..]);
-        {
-            let s = self
-                .stations
-                .entry(sta)
-                .or_insert_with(|| Station::new(sta));
-            s.traits = crate::failures::client_traits(&frame.body);
-            s.wmm = ap_wmm && client_wmm;
-            if frame.body.len() >= 4 {
-                s.capability = u16::from_le_bytes([frame.body[0], frame.body[1]]);
-                s.listen_interval = u16::from_le_bytes([frame.body[2], frame.body[3]]);
-            }
-            // Remember the station's capability IEs (HT/VHT/HE/rates) so the
-            // netlink station setup can hand them to the driver for rate control.
-            s.assoc_ies = frame.body.get(ie_off..).unwrap_or(&[]).to_vec();
-        }
-        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
-            let ies = frame.body.get(ie_off..).unwrap_or(&[]);
-            let ml = dot11::parse_mld_mac(ies);
-            let rsn_hex: String = dot11::find_ie(ies, 48)
-                .map(|r| r.iter().map(|b| format!("{b:02x}")).collect())
-                .unwrap_or_default();
-            eprintln!(
-                "AP: DBG-ASSOC sta={} has_ml_element={} client_mld={:?} rsn={}",
-                crate::util::bytes_to_mac(&sta),
-                ml.is_some(),
-                ml.map(|m| crate::util::bytes_to_mac(&m)),
-                rsn_hex
-            );
-        }
-        // 802.11be MLD: if we are an AP MLD and the (Re)Assoc Request carries a
-        // Basic Multi-Link element, remember the station's MLD MAC — the 4-way
-        // PTK is then derived from the MLD addresses rather than the link ones.
-        if self.mld {
-            let assoc_ies = frame.body.get(ie_off..).unwrap_or(&[]);
-            if let Some(client_mld) = dot11::parse_mld_mac(assoc_ies) {
-                // Bind SAE identity to association identity: if SAE already
-                // established this STA's MLD MAC, a (Re)Assoc Request claiming a
-                // DIFFERENT MLD MAC is a spoofing/confusion attempt — reject it
-                // rather than silently overwriting the authenticated identity.
-                let sae_mld = self.stations.get(&sta).and_then(|s| s.client_mld_mac);
-                if sae_mld.map(|prev| prev != client_mld).unwrap_or(false) {
-                    self.reject_assoc(&sta, reassoc, out);
-                    return;
-                }
-                // Fail closed on malformed or colliding MLD link profiles.
-                // Otherwise a password-holding STA could claim another station's
-                // affiliated link MAC and have it added + authorized in nl80211.
-                let Some(links) = self.validate_mld_assoc_links(&sta, &client_mld, assoc_ies)
-                else {
-                    self.reject_assoc(&sta, reassoc, out);
-                    return;
-                };
-                eprintln!(
-                    "AP: MLD association sta={} mld={} requested_links={}",
-                    crate::util::bytes_to_mac(&sta),
-                    crate::util::bytes_to_mac(&client_mld),
-                    links
-                        .iter()
-                        .map(|(link_id, mac)| format!(
-                            "{}:{}",
-                            link_id,
-                            crate::util::bytes_to_mac(mac)
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                let s = self
-                    .stations
-                    .entry(sta)
-                    .or_insert_with(|| Station::new(sta));
-                s.client_mld_mac = Some(client_mld);
-                s.client_mld_links = links;
-            }
-        }
-
-        // A station that began SAE must have a *verified* confirm before it may
-        // associate — otherwise the mutual authentication is incomplete and we'd
-        // derive a PTK from an unconfirmed PMK. (The anti-downgrade check that a
-        // WPA3-only AP doesn't fall back to the PSK 4-way lives in `handle_eapol`,
-        // so PMKSA fast-reconnect — which skips SAE with a cached PMK — still works.)
-        if let Some(s) = self.stations.get(&sta) {
-            if s.sae.is_some() && !s.sae_confirmed {
-                eprintln!(
-                    "AP: association from {} deferred because SAE confirm is not complete",
-                    crate::util::bytes_to_mac(&sta),
-                );
-                return;
-            }
-        }
-
-        // PMF SA Query: a (re)association request from a STA we already have a
-        // PMF association with must NOT tear down the existing session (it may be
-        // spoofed). Reject with status 30 and SA-Query the existing STA instead.
+        // PMF SA Query takes precedence over parsing a repeated association
+        // request: the frame may be spoofed and intentionally malformed. Do not
+        // let it overwrite station state or turn the required status-30 comeback
+        // into a negotiation error.
         let (pmf_assoc, tk) = self
             .stations
             .get(&sta)
@@ -1843,6 +2114,123 @@ impl Ap {
             return;
         }
 
+        let ie_off = if reassoc { 10 } else { 4 };
+        let Some(assoc_ies) = frame.body.get(ie_off..) else {
+            self.reject_assoc_status(&sta, reassoc, dot11::STATUS_INVALID_IE, out);
+            return;
+        };
+        let assoc_rsn = match dot11::find_ie_strict(assoc_ies, 48) {
+            Ok(Some(rsn)) => rsn,
+            _ => {
+                self.reject_assoc_status(&sta, reassoc, dot11::STATUS_INVALID_IE, out);
+                return;
+            }
+        };
+        if let Err(status) = dot11::validate_assoc_rsn(assoc_rsn, self.security_mode()) {
+            self.reject_assoc_status(&sta, reassoc, status, out);
+            return;
+        }
+        let requests_sae = dot11::rsn_has_akm(assoc_rsn, 8);
+        if requests_sae {
+            match dot11::find_ie_strict(assoc_ies, 0xf4) {
+                Ok(Some(rsnxe)) if dot11::rsnxe_has_sae_h2e(rsnxe) => {}
+                _ => {
+                    self.reject_assoc_status(&sta, reassoc, dot11::STATUS_INVALID_IE, out);
+                    return;
+                }
+            }
+        }
+        let mld_assoc = if self.mld {
+            let client_mld = dot11::parse_mld_mac(assoc_ies);
+            if dot11::has_basic_multi_link_element(assoc_ies) && client_mld.is_none() {
+                self.reject_assoc_status(&sta, reassoc, dot11::STATUS_INVALID_IE, out);
+                return;
+            }
+            if let Some(client_mld) = client_mld {
+                let sae_mld = self.stations.get(&sta).and_then(|s| s.client_mld_mac);
+                if sae_mld.map(|prev| prev != client_mld).unwrap_or(false) {
+                    self.reject_assoc(&sta, reassoc, out);
+                    return;
+                }
+                let Some(links) = self.validate_mld_assoc_links(&sta, &client_mld, assoc_ies)
+                else {
+                    self.reject_assoc(&sta, reassoc, out);
+                    return;
+                };
+                Some((client_mld, links))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Fingerprint the client from its association characteristics (for the
+        // failure log), and note whether it negotiated WMM (the IE block starts
+        // after the fixed fields: 4 bytes for Assoc, 10 for Reassoc).
+        let ap_wmm = self.wmm;
+        let client_wmm = frame.body.len() > ie_off && dot11::has_wmm_ie(&frame.body[ie_off..]);
+        {
+            let s = self
+                .stations
+                .entry(sta)
+                .or_insert_with(|| Station::new(sta));
+            s.traits = crate::failures::client_traits(&frame.body);
+            s.wmm = ap_wmm && client_wmm;
+            if frame.body.len() >= 4 {
+                s.capability = u16::from_le_bytes([frame.body[0], frame.body[1]]);
+                s.listen_interval = u16::from_le_bytes([frame.body[2], frame.body[3]]);
+            }
+            // Remember the station's capability IEs (HT/VHT/HE/rates) so the
+            // netlink station setup can hand them to the driver for rate control.
+            s.assoc_ies = frame.body.get(ie_off..).unwrap_or(&[]).to_vec();
+            if let Some((client_mld, links)) = mld_assoc.as_ref() {
+                s.client_mld_mac = Some(*client_mld);
+                s.client_mld_links = links.clone();
+            }
+        }
+        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+            let ies = frame.body.get(ie_off..).unwrap_or(&[]);
+            let ml = dot11::parse_mld_mac(ies);
+            let rsn_hex: String = dot11::find_ie(ies, 48)
+                .map(|r| r.iter().map(|b| format!("{b:02x}")).collect())
+                .unwrap_or_default();
+            eprintln!(
+                "AP: DBG-ASSOC sta={} has_ml_element={} client_mld={:?} rsn={}",
+                crate::util::bytes_to_mac(&sta),
+                ml.is_some(),
+                ml.map(|m| crate::util::bytes_to_mac(&m)),
+                rsn_hex
+            );
+        }
+        if let Some((client_mld, links)) = mld_assoc {
+            eprintln!(
+                "AP: MLD association sta={} mld={} requested_links={}",
+                crate::util::bytes_to_mac(&sta),
+                crate::util::bytes_to_mac(&client_mld),
+                links
+                    .iter()
+                    .map(|(link_id, mac)| format!("{}:{}", link_id, crate::util::bytes_to_mac(mac)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+
+        // A station that began SAE must have a *verified* confirm before it may
+        // associate — otherwise the mutual authentication is incomplete and we'd
+        // derive a PTK from an unconfirmed PMK. (The anti-downgrade check that a
+        // WPA3-only AP doesn't fall back to the PSK 4-way lives in `handle_eapol`,
+        // so PMKSA fast-reconnect — which skips SAE with a cached PMK — still works.)
+        if let Some(s) = self.stations.get(&sta) {
+            if s.sae.is_some() && !s.sae_confirmed {
+                eprintln!(
+                    "AP: association from {} deferred because SAE confirm is not complete",
+                    crate::util::bytes_to_mac(&sta),
+                );
+                return;
+            }
+        }
+
         let now = Instant::now();
         {
             let entry = self
@@ -1859,18 +2247,19 @@ impl Ap {
 
         // PMKSA caching: if the (re)assoc request carries a PMKID we have cached,
         // skip a fresh SAE exchange and run the 4-way with the cached PMK.
-        let assoc_rsn = frame
-            .body
-            .get(ie_off..)
-            .and_then(|ies| dot11::find_ie(ies, 48));
-        let requested_pmkid = assoc_rsn.and_then(dot11::parse_rsn_pmkid);
-        let requests_sae = assoc_rsn
-            .map(|rsn| dot11::rsn_has_akm(rsn, 8))
-            .unwrap_or(false);
+        let requested_pmkid = dot11::parse_rsn_pmkid(assoc_rsn);
+        let pmksa_identity = self
+            .stations
+            .get(&sta)
+            .and_then(|s| s.client_mld_mac)
+            .unwrap_or(sta);
+        self.expire_pmksa();
         if let Some(pmkid) = requested_pmkid {
-            if let Some((pmk, sha256)) = self.pmksa_cache.get(&pmkid).copied() {
+            if let Some(entry) = self.pmksa_cache.get(&(pmkid, pmksa_identity)) {
+                let pmk = entry.pmk;
+                let sha256 = entry.sha256;
                 if let Some(s) = self.stations.get_mut(&sta) {
-                    s.pmk = Some(pmk);
+                    s.set_pmk(Some(pmk));
                     s.sha256 = sha256;
                 }
             }
@@ -1910,18 +2299,25 @@ impl Ap {
         let mut owe_dh_resp: Option<Vec<u8>> = None;
         if self.owe && frame.body.len() > 4 {
             if let Some((group, sta_pub)) = dot11::parse_dh_param(&frame.body[4..]) {
-                if group == 19 {
-                    let (ap_priv, ap_pub) = crate::sae::owe_keypair();
-                    if let Some((pmk, _pmkid)) =
-                        crate::sae::owe_derive(&ap_priv, &sta_pub, &sta_pub, &ap_pub, group)
-                    {
-                        if let Some(s) = self.stations.get_mut(&sta) {
-                            s.pmk = Some(pmk);
-                            s.sha256 = true;
-                            s.owe = true; // OWE uses the HMAC-SHA256 EAPOL MIC
-                        }
-                        owe_dh_resp = Some(dot11::build_dh_param_element(group, &ap_pub));
+                if group != 19 {
+                    self.reject_assoc_status(
+                        &sta,
+                        reassoc,
+                        dot11::STATUS_FINITE_CYCLIC_GROUP_NOT_SUPPORTED,
+                        out,
+                    );
+                    return;
+                }
+                let (ap_priv, ap_pub) = crate::sae::owe_keypair();
+                if let Some((pmk, _pmkid)) =
+                    crate::sae::owe_derive(&ap_priv, &sta_pub, &sta_pub, &ap_pub, group)
+                {
+                    if let Some(s) = self.stations.get_mut(&sta) {
+                        s.set_pmk(Some(pmk));
+                        s.sha256 = true;
+                        s.owe = true; // OWE uses the HMAC-SHA256 EAPOL MIC
                     }
+                    owe_dh_resp = Some(dot11::build_dh_param_element(group, &ap_pub));
                 }
             }
         }
@@ -2044,32 +2440,42 @@ impl Ap {
         // on a still-in-progress station, (2) the ANonce held for this MAC from a
         // torn-down-but-incomplete handshake (`pending_anonce`), else a fresh one.
         //
-        // Reuse is KRACK-safe: `pending_anonce` is cleared the instant a 4-way
-        // completes (verified m4), so no *post-association* reassociation ever
-        // reuses an ANonce whose PTK is installed — the replay/reinstall that
-        // fresh-per-reassoc guards against cannot happen before m4.
+        // Reuse is KRACK-safe because this ANonce/replay pair is consumed as soon
+        // as m2 verifies, before m3 can install a PTK at either peer.
         let now = Instant::now();
         self.pending_anonce
-            .retain(|_, (_, t)| now.duration_since(*t) < ANONCE_HOLD);
-        let anonce = self
+            .retain(|_, pending| now.duration_since(pending.created_at) < ANONCE_HOLD);
+        let existing_station = self
             .stations
             .get(&sta)
             .filter(|s| s.eapol_ready)
-            .and_then(|s| s.anonce)
-            .or_else(|| self.pending_anonce.get(&sta).map(|(a, _)| *a))
-            .or(self.test_anonce)
-            .unwrap_or_else(random_bytes::<32>);
-        self.pending_anonce.insert(sta, (anonce, now));
+            .and_then(|s| s.anonce.map(|anonce| (anonce, s.eapol_replay)));
+        let existing_pending = self
+            .pending_anonce
+            .get(&sta)
+            .map(|pending| (pending.anonce, pending.replay_counter));
+        let (anonce, m1_replay) = match existing_station.or(existing_pending) {
+            Some(pending) => pending,
+            None => (
+                self.test_anonce.unwrap_or_else(random_bytes::<32>),
+                self.next_eapol_replay(),
+            ),
+        };
+        self.pending_anonce.insert(
+            sta,
+            PendingHandshake {
+                anonce,
+                replay_counter: m1_replay,
+                created_at: now,
+            },
+        );
         {
             let entry = self.stations.get_mut(&sta).unwrap();
             entry.anonce = Some(anonce);
             entry.eapol_ready = true;
-            if !entry.recent_anonces.contains(&anonce) {
-                entry.recent_anonces.push(anonce);
-                if entry.recent_anonces.len() > 8 {
-                    entry.recent_anonces.remove(0);
-                }
-            }
+            entry.eapol_replay = m1_replay;
+            entry.m1_replay = m1_replay;
+            entry.ptk_candidates.clear();
         }
         let (sha256, owe) = self
             .stations
@@ -2088,6 +2494,7 @@ impl Ap {
                 &self.mac,
                 &sta,
                 &anonce,
+                m1_replay,
                 m1_sc,
                 dot11::KeyMic::select(sha256, owe),
                 &self.mld_mac,
@@ -2097,6 +2504,7 @@ impl Ap {
                 &self.mac,
                 &sta,
                 &anonce,
+                m1_replay,
                 m1_sc,
                 dot11::KeyMic::select(sha256, owe),
             )
@@ -2128,20 +2536,30 @@ impl Ap {
         if frame.addr1 != self.mac {
             return;
         }
-        let (anonce, ready, awaiting_m4, kck, sha256_m4, owe_m4, group_rekeying, eapol_replay) =
-            match self.stations.get(&sta) {
-                Some(s) => (
-                    s.anonce,
-                    s.eapol_ready,
-                    s.awaiting_m4,
-                    s.kck,
-                    s.sha256,
-                    s.owe,
-                    s.group_rekeying,
-                    s.eapol_replay,
-                ),
-                None => return,
-            };
+        let (
+            anonce,
+            ready,
+            awaiting_m4,
+            kck,
+            sha256_m4,
+            owe_m4,
+            group_rekeying,
+            eapol_replay,
+            m1_replay,
+        ) = match self.stations.get(&sta) {
+            Some(s) => (
+                s.anonce,
+                s.eapol_ready,
+                s.awaiting_m4,
+                s.kck,
+                s.sha256,
+                s.owe,
+                s.group_rekeying,
+                s.eapol_replay,
+                s.m1_replay,
+            ),
+            None => return,
+        };
 
         let Some(eapol_frame) = frame.eapol_frame() else {
             return;
@@ -2171,6 +2589,14 @@ impl Ap {
         // then clear its rekey state; once every station has ACKed, the BSS is
         // fully on the new GTK (hostapd's GKeyDoneStations reaching 0).
         if group_rekeying && ek.key_replay_counter == eapol_replay {
+            let version = expected_key_descriptor_version(sha256_m4, owe_m4);
+            if !key_info_matches(ek.key_info, 0x0300 | version)
+                || ek.key_length != 0
+                || ek.key_nonce != [0u8; 32]
+                || !ek.key_data.is_empty()
+            {
+                return;
+            }
             let mic_off = 4 + ek.mic_offset;
             if eapol_frame.len() < mic_off + 16 {
                 return;
@@ -2201,18 +2627,14 @@ impl Ap {
             return;
         }
 
-        // Message 4 (replay counter 2): the STA's final ACK. Verify its MIC with
-        // the installed KCK, then mark the station associated — only here is the
-        // 4-way actually complete, so the AP (and the kernel, in netlink mode)
-        // authorizes the station only after a verified m4.
-        if awaiting_m4 && ek.key_replay_counter == 2 {
-            if self.mld {
-                if let Some(expected) = self.stations.get(&sta).and_then(|s| s.client_mld_mac) {
-                    if dot11::parse_mac_addr_kde(&ek.key_data) != Some(expected) {
-                        return;
-                    }
-                }
-            }
+        // Message 4: accept the PTK candidate whose MIC verifies. hostapd keeps
+        // both the old and new PTK when a station retries M2 with a changed
+        // SNonce, so either subsequent M4 can finish the same 4-way.
+        let version = expected_key_descriptor_version(sha256_m4, owe_m4);
+        let is_m4 = key_info_matches(ek.key_info, 0x0308 | version)
+            && ek.key_length == 0
+            && ek.key_nonce == [0u8; 32];
+        if awaiting_m4 && is_m4 {
             let mic_off = 4 + ek.mic_offset;
             if eapol_frame.len() < mic_off + 16 {
                 return;
@@ -2221,10 +2643,67 @@ impl Ap {
             for b in to_check[mic_off..mic_off + 16].iter_mut() {
                 *b = 0;
             }
-            let computed = dot11::KeyMic::select(sha256_m4, owe_m4).compute(&kck, &to_check);
-            if crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
+            let candidates: Vec<PtkCandidate> = self
+                .stations
+                .get(&sta)
+                .map(|s| {
+                    s.ptk_candidates
+                        .iter()
+                        .filter(|candidate| candidate.m3_replay_counter == ek.key_replay_counter)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let expected_mld = self
+                .mld
+                .then(|| self.stations.get(&sta).and_then(|s| s.client_mld_mac))
+                .flatten();
+            let mut selected = None;
+            for candidate in candidates {
+                let mut computed =
+                    dot11::KeyMic::select(sha256_m4, owe_m4).compute(&candidate.kck, &to_check);
+                let mic_valid = crypto::constant_time_eq(&computed[..16], &ek.key_mic);
+                computed.zeroize();
+                if !mic_valid {
+                    continue;
+                }
+
+                // The encrypted-data bit promises RFC 3394 wrapped data. Even a
+                // valid MIC must not authorize the port if unwrap fails. For a
+                // non-MLD station, successfully unwrapped extra elements are
+                // allowed; an MLD station must additionally carry its MAC KDE.
+                let mut unwrapped = None;
+                let key_data = if ek.encrypted_key_data() {
+                    unwrapped = crypto::aes_unwrap(&candidate.kek, &ek.key_data);
+                    let Some(ref data) = unwrapped else {
+                        continue;
+                    };
+                    dot11::trim_key_data_padding(data)
+                } else {
+                    ek.key_data.as_slice()
+                };
+                let key_data_valid = expected_mld
+                    .map(|expected| dot11::parse_mac_addr_kde(key_data) == Some(expected))
+                    .unwrap_or(true);
+                if let Some(data) = unwrapped.as_mut() {
+                    data.zeroize();
+                }
+                if key_data_valid {
+                    selected = Some(candidate);
+                    break;
+                }
+            }
+
+            if let Some(candidate) = selected {
                 let mut event_mac = None;
                 if let Some(s) = self.stations.get_mut(&sta) {
+                    s.kck.zeroize();
+                    s.kek.zeroize();
+                    s.tk.zeroize();
+                    s.kck = candidate.kck;
+                    s.kek = candidate.kek;
+                    s.tk = candidate.tk;
+                    s.ptk_candidates.clear();
                     s.associated = true;
                     s.awaiting_m4 = false;
                     s.pending_eapol = None; // 4-way complete, nothing to retransmit
@@ -2241,11 +2720,16 @@ impl Ap {
         }
 
         // Message 2 must be expected and echo the replay counter from message 1.
-        if !ready {
+        // While awaiting M4, keep accepting valid M2 retries for this same M1;
+        // this is the hostapd retry1b/1c/1d behavior.
+        if !ready && !awaiting_m4 {
             return;
         }
         let Some(anonce) = anonce else { return };
-        if ek.key_replay_counter != 1 {
+        if ek.key_replay_counter != m1_replay {
+            return;
+        }
+        if !key_info_matches(ek.key_info, 0x0108 | version) || ek.key_length != 0 {
             return;
         }
 
@@ -2288,7 +2772,7 @@ impl Ap {
         // The single BSS passphrase is considered only when no authoritative
         // credential file is configured. The candidate whose PTK verifies
         // message 2's MIC is this station's password.
-        let candidates: Vec<[u8; 32]> = if let Some(p) = sta_pmk {
+        let mut candidates: Vec<[u8; 32]> = if let Some(p) = sta_pmk {
             vec![p]
         } else {
             let mut v: Vec<[u8; 32]> = Vec::new();
@@ -2322,21 +2806,6 @@ impl Ap {
                 candidates.first().map(|p| p[..8].iter().map(|x| format!("{x:02x}")).collect::<String>()).unwrap_or_default(),
             );
         }
-        // DIAGNOSTIC: try the MIC against every recent ANonce (current first,
-        // then older). If an OLDER one verifies, the STA's m2 was keyed to an m1
-        // ANonce we already replaced — proving the retransmit race — and the log
-        // tells us how far back. (This is a probe to find the logic bug, not the
-        // fix; the real fix keeps our stored ANonce in lock-step with the m1 the
-        // STA is answering.)
-        let recent = self
-            .stations
-            .get(&sta)
-            .map(|s| s.recent_anonces.clone())
-            .unwrap_or_default();
-        let mut anonce_list: Vec<[u8; 32]> = recent;
-        if !anonce_list.contains(&anonce) {
-            anonce_list.push(anonce);
-        }
         if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
             let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
             eprintln!("AP: m2 anonce={}", hex(&anonce));
@@ -2352,56 +2821,55 @@ impl Ap {
         let mut kek = [0u8; 16];
         let mut tk = [0u8; 16];
         let mut matched_pmk: Option<[u8; 32]> = None;
-        'outer: for pmk in &candidates {
-            for (idx, a) in anonce_list.iter().enumerate().rev() {
-                if sha256 {
-                    let ptk = crypto::derive_ptk_sha256(pmk, &amac, &smac, a, &snonce);
-                    kck.copy_from_slice(&ptk[..16]);
-                    kek.copy_from_slice(&ptk[16..32]);
-                    tk.copy_from_slice(&ptk[32..48]);
-                } else {
-                    let ptk = crypto::custom_prf512(pmk, &amac, &smac, a, &snonce);
-                    kck.copy_from_slice(&ptk[..16]);
-                    kek.copy_from_slice(&ptk[16..32]);
-                    tk.copy_from_slice(&ptk[32..48]);
-                }
-                let mut to_check = eapol_frame.to_vec();
-                for b in to_check[mic_off_in_eapol..mic_off_in_eapol + 16].iter_mut() {
-                    *b = 0;
-                }
-                let computed = dot11::KeyMic::select(sha256, owe).compute(&kck, &to_check);
-                if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
-                    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-                    eprintln!(
-                        "AP: m2 try idx={idx} kck={} computed_mic={}",
-                        hex(&kck),
-                        hex(&computed[..16])
-                    );
-                }
-                if crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
-                    matched_pmk = Some(*pmk);
-                    let is_current = idx + 1 == anonce_list.len();
-                    if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
-                        eprintln!(
-                            "AP: m2 MIC MATCHED anonce idx={idx}/{} is_current={is_current} {}",
-                            anonce_list.len(),
-                            if is_current {
-                                ""
-                            } else {
-                                "<-- STALE ANONCE: RETRANSMIT RACE"
-                            }
-                        );
-                    }
-                    break 'outer;
-                }
+        for pmk in &candidates {
+            if sha256 {
+                let mut ptk = crypto::derive_ptk_sha256(pmk, &amac, &smac, &anonce, &snonce);
+                kck.copy_from_slice(&ptk[..16]);
+                kek.copy_from_slice(&ptk[16..32]);
+                tk.copy_from_slice(&ptk[32..48]);
+                ptk.zeroize();
+            } else {
+                let mut ptk = crypto::custom_prf512(pmk, &amac, &smac, &anonce, &snonce);
+                kck.copy_from_slice(&ptk[..16]);
+                kek.copy_from_slice(&ptk[16..32]);
+                tk.copy_from_slice(&ptk[32..48]);
+                ptk.zeroize();
+            }
+            let mut to_check = eapol_frame.to_vec();
+            for b in to_check[mic_off_in_eapol..mic_off_in_eapol + 16].iter_mut() {
+                *b = 0;
+            }
+            let mut computed = dot11::KeyMic::select(sha256, owe).compute(&kck, &to_check);
+            if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+                let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                eprintln!(
+                    "AP: m2 try kck={} computed_mic={}",
+                    hex(&kck),
+                    hex(&computed[..16])
+                );
+            }
+            let mic_valid = crypto::constant_time_eq(&computed, &ek.key_mic);
+            computed.zeroize();
+            if mic_valid {
+                matched_pmk = Some(*pmk);
+                break;
             }
         }
         if matched_pmk.is_none() && std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
-            eprintln!("AP: m2 NO anonce matched (tried {})", anonce_list.len());
+            eprintln!("AP: m2 MIC did not match the pending handshake");
         }
-        let matched_pmk = match matched_pmk {
+        let mut matched_pmk = match matched_pmk {
             None => {
-                // no candidate verified -> wrong password: log, deauth, drop.
+                candidates.zeroize();
+                kck.zeroize();
+                kek.zeroize();
+                tk.zeroize();
+                // A bad first M2 means the configured password did not verify.
+                // Once at least one M2 has already verified, however, a bad
+                // retry must not destroy the valid pending candidate.
+                if awaiting_m4 {
+                    return;
+                }
                 self.record_failure(&sta, crate::failures::FailureKind::FourWayMic);
                 let deauth = dot11::build_deauth(&self.mac, &sta, 1);
                 out.tx(deauth);
@@ -2410,31 +2878,96 @@ impl Ap {
             }
             Some(p) => p,
         };
+        candidates.zeroize();
+
+        let mut m2_key_data = if ek.encrypted_key_data() {
+            match crypto::aes_unwrap(&kek, &ek.key_data) {
+                Some(data) => data,
+                None => {
+                    matched_pmk.zeroize();
+                    kck.zeroize();
+                    kek.zeroize();
+                    tk.zeroize();
+                    return;
+                }
+            }
+        } else {
+            ek.key_data.clone()
+        };
+        let unpadded_len = dot11::trim_key_data_padding(&m2_key_data).len();
+        m2_key_data.truncate(unpadded_len);
+        let assoc_ies = self
+            .stations
+            .get(&sta)
+            .map(|s| s.assoc_ies.as_slice())
+            .unwrap_or(&[]);
+        if !message_2_security_matches(assoc_ies, &m2_key_data) {
+            m2_key_data.zeroize();
+            matched_pmk.zeroize();
+            kck.zeroize();
+            kek.zeroize();
+            tk.zeroize();
+            return;
+        }
+
         // Pin the matched password to this station so m3 retransmits and GTK
         // rekeys reuse the same PMK.
         if let Some(s) = self.stations.get_mut(&sta) {
-            s.pmk = Some(matched_pmk);
+            s.set_pmk(Some(matched_pmk));
         }
+        matched_pmk.zeroize();
 
         // Operating Channel Validation: message 2's OCI must match our channel.
         if self.ocv {
-            match dot11::parse_oci_kde(&ek.key_data) {
+            match dot11::parse_oci_kde(&m2_key_data) {
                 Some((oc, ch))
                     if ch == self.channel
                         && dot11::oci_class_matches_band(oc, self.channel, self.band6) => {}
-                _ => return, // missing or mismatched OCI -> possible MITM, drop
+                _ => {
+                    m2_key_data.zeroize();
+                    kck.zeroize();
+                    kek.zeroize();
+                    tk.zeroize();
+                    return;
+                } // missing or mismatched OCI -> possible MITM, drop
             }
         }
+        m2_key_data.zeroize();
 
-        // good: install keys, send message 3
+        // The first valid M2 consumes the cross-reassociation M1 hold and gets a
+        // fresh M3 replay counter. Changed-SNonce retries remain inside this same
+        // 4-way and reuse that M3 counter, matching hostapd retry1c/1d.
+        if !awaiting_m4 {
+            self.pending_anonce.remove(&sta);
+        }
+        let m3_replay = if awaiting_m4 {
+            eapol_replay
+        } else {
+            self.next_eapol_replay()
+        };
+
+        // Retain a bounded set of valid PTK candidates until M4 selects one.
+        // Nothing is exposed to the driver until `associated` becomes true.
         {
             let s = self.stations.get_mut(&sta).unwrap();
-            s.kck = kck;
-            s.kek = kek;
-            s.tk = tk;
+            if !s
+                .ptk_candidates
+                .iter()
+                .any(|candidate| candidate.m3_replay_counter == m3_replay && candidate.kck == kck)
+            {
+                if s.ptk_candidates.len() >= 8 {
+                    s.ptk_candidates.remove(0);
+                }
+                s.ptk_candidates.push(PtkCandidate {
+                    m3_replay_counter: m3_replay,
+                    kck,
+                    kek,
+                    tk,
+                });
+            }
             s.eapol_ready = false;
             s.client_pn = 1;
-            s.eapol_replay = 2; // m1=1, m3=2; rekeys continue from here
+            s.eapol_replay = m3_replay;
         }
         // Deliver the IGTK KDE to PMF (WPA3-SAE) stations so they can validate
         // BIP-protected group-addressed management frames, and the BIGTK KDE when
@@ -2497,6 +3030,7 @@ impl Ap {
                 igtk,
                 bigtk,
                 oci,
+                m3_replay,
                 sc,
                 dot11::KeyMic::select(sha256, owe),
             )
@@ -2513,6 +3047,7 @@ impl Ap {
                 igtk,
                 bigtk,
                 oci,
+                m3_replay,
                 sc,
                 dot11::KeyMic::select(sha256, owe),
             )
@@ -2528,6 +3063,9 @@ impl Ap {
             s.eapol_retries = 0;
             s.eapol_acked = false;
         }
+        kck.zeroize();
+        kek.zeroize();
+        tk.zeroize();
         out.tx(m3);
         // 802.11v auto-steer: send an (unprotected, WPA2) BSS Transition
         // Management Request once associated. For PMF (WPA3/OWE) the request must
@@ -2850,6 +3388,10 @@ impl Ap {
             s.pending_eapol = None;
             s.eapol_ready = false;
             s.awaiting_m4 = false;
+            s.ptk_candidates.clear();
+            s.kck.zeroize();
+            s.kek.zeroize();
+            s.tk.zeroize();
             s.eapol_retries = 0;
             s.eapol_acked = false;
         }
@@ -2871,6 +3413,22 @@ impl Ap {
     pub fn tick(&mut self) -> Outgoing {
         let mut out = Outgoing::default();
         let now = Instant::now();
+        self.pending_anonce
+            .retain(|_, pending| now.duration_since(pending.created_at) < ANONCE_HOLD);
+        let stale_sae: Vec<[u8; 6]> = self
+            .stations
+            .iter()
+            .filter(|(_, s)| {
+                !s.associated
+                    && s.sae.is_some()
+                    && now.duration_since(s.last_activity) >= SAE_AUTH_TIMEOUT
+            })
+            .map(|(mac, _)| *mac)
+            .collect();
+        for mac in stale_sae {
+            self.disconnect(&mac, 15);
+        }
+        self.expire_pmksa();
 
         // Key lifecycle: a queued strict rekey (a station left) or the periodic
         // `wpa_group_rekey` interval triggers a Group Key Handshake. rekey_gtk()
@@ -2967,23 +3525,67 @@ impl Ap {
         }
     }
 
-    /// Log a failed authentication / decryption attempt, fingerprinted by the
-    /// client (its MAC plus the traits hash captured at association).
+    /// Test hook: age every incomplete SAE exchange past its authentication
+    /// timeout so the next maintenance tick removes it.
+    #[doc(hidden)]
+    pub fn test_expire_incomplete_sae(&mut self) {
+        let past = Instant::now() - SAE_AUTH_TIMEOUT - Duration::from_millis(1);
+        for station in self.stations.values_mut() {
+            if station.sae.is_some() && !station.sae_confirmed {
+                station.last_activity = past;
+            }
+        }
+    }
+
+    /// Test hook: advance the token epoch beyond its accepted lifetime.
+    #[doc(hidden)]
+    pub fn test_expire_sae_tokens(&mut self) {
+        self.boottime -= SAE_TOKEN_LIFETIME + Duration::from_secs(1);
+    }
+
     /// Insert a PMK into the PMKSA cache, evicting one entry when at capacity so
     /// the cache stays bounded ([`PMKSA_CACHE_MAX`]) instead of growing forever.
-    fn cache_pmksa(&mut self, id: [u8; 16], pmk: [u8; 32], sha256: bool) {
-        if self.pmksa_cache.len() >= PMKSA_CACHE_MAX && !self.pmksa_cache.contains_key(&id) {
+    fn cache_pmksa(&mut self, id: [u8; 16], identity: [u8; 6], pmk: [u8; 32], sha256: bool) {
+        self.expire_pmksa();
+        let key = (id, identity);
+        if self.pmksa_cache.len() >= PMKSA_CACHE_MAX && !self.pmksa_cache.contains_key(&key) {
             if let Some(victim) = self.pmksa_cache.keys().next().copied() {
                 self.pmksa_cache.remove(&victim);
             }
         }
-        self.pmksa_cache.insert(id, (pmk, sha256));
+        self.pmksa_cache.insert(
+            key,
+            PmksaEntry {
+                identity,
+                pmk,
+                sha256,
+                expires_at: Instant::now() + PMKSA_LIFETIME,
+            },
+        );
+    }
+
+    fn expire_pmksa(&mut self) {
+        let now = Instant::now();
+        self.pmksa_cache
+            .retain(|(_, identity), entry| *identity == entry.identity && entry.expires_at > now);
     }
 
     /// Test hook: insert a dummy PMKSA entry (exercises the cache bound).
     #[doc(hidden)]
     pub fn test_cache_pmksa(&mut self, id: [u8; 16]) {
-        self.cache_pmksa(id, [0u8; 32], true);
+        let mut identity = [0u8; 6];
+        identity.copy_from_slice(&id[..6]);
+        self.cache_pmksa(id, identity, [0u8; 32], true);
+    }
+
+    /// Test hook: expire every cached PMKSA entry.
+    #[doc(hidden)]
+    pub fn test_expire_pmksa(&mut self) {
+        let expired = Instant::now() - Duration::from_millis(1);
+        for entry in self.pmksa_cache.values_mut() {
+            entry.expires_at = expired;
+        }
+        self.expire_pmksa();
     }
 
     /// Number of cached PMKSA entries (for tests).
@@ -3212,6 +3814,19 @@ impl Ap {
     /// PMF stations), reason 4 (disassociated due to inactivity).
     pub fn prune_idle(&mut self, max_idle: Duration) -> Vec<Vec<u8>> {
         let now = Instant::now();
+        let stale_sae: Vec<[u8; 6]> = self
+            .stations
+            .iter()
+            .filter(|(_, s)| {
+                !s.associated
+                    && s.sae.is_some()
+                    && now.duration_since(s.last_activity) >= SAE_AUTH_TIMEOUT
+            })
+            .map(|(m, _)| *m)
+            .collect();
+        for sta in stale_sae {
+            self.disconnect(&sta, 15);
+        }
         let idle: Vec<[u8; 6]> = self
             .stations
             .iter()
@@ -3305,14 +3920,17 @@ impl Ap {
         if self.per_sta_vif {
             return self.rekey_gtk_per_sta();
         }
-        let gtk_full = random_bytes::<32>();
+        let mut gtk_full = random_bytes::<32>();
+        self.gtk.zeroize();
         self.gtk.copy_from_slice(&gtk_full[..16]);
+        gtk_full.zeroize();
         self.group_pn = 1;
         // Two-phase group rekey (hostapd): the rotated GTK/IGTK go in at the
         // OTHER key index (toggle 1<->2 for the GTK, 4<->5 for the IGTK), so the
         // new key is advertised + installed at a fresh index and the IPN may be
         // reset (a fresh key id gets a fresh IPN).
         self.gtk_key_id = if self.gtk_key_id == 1 { 2 } else { 1 };
+        self.igtk.zeroize();
         self.igtk = random_bytes::<16>();
         self.igtk_key_id = if self.igtk_key_id == 4 { 5 } else { 4 };
         self.igtk_ipn = [0; 6]; // fresh IGTK (new key id) gets a fresh IPN
@@ -3334,9 +3952,10 @@ impl Ap {
         let mut frames = Vec::new();
         for sta in stations {
             let mld_link_ids = self.station_mld_link_ids(&sta);
+            let replay = self.next_eapol_replay();
             let (kck, kek, sha256, owe, replay) = {
                 let s = self.stations.get_mut(&sta).unwrap();
-                s.eapol_replay += 1;
+                s.eapol_replay = replay;
                 (s.kck, s.kek, s.sha256, s.owe, s.eapol_replay)
             };
             let igtk_kde = if sha256 {
@@ -3405,6 +4024,7 @@ impl Ap {
         // only the value rotates per station (below), overwriting the old one at
         // the same index 1. The BSS-wide IGTK (management-frame BIP, genuinely one
         // key per radio) still rotates with its own 4<->5 index toggle.
+        self.igtk.zeroize();
         self.igtk = random_bytes::<16>();
         self.igtk_key_id = if self.igtk_key_id == 4 { 5 } else { 4 };
         self.igtk_ipn = [0; 6]; // fresh IGTK (new key id) gets a fresh IPN
@@ -3424,13 +4044,16 @@ impl Ap {
         let mut frames = Vec::new();
         for sta in stations {
             let mld_link_ids = self.station_mld_link_ids(&sta);
+            let replay = self.next_eapol_replay();
             let (kck, kek, sha256, owe, replay, gtk) = {
                 let s = self.stations.get_mut(&sta).unwrap();
                 // Rotate this station's own GTK *value*; it goes in at the shared
                 // (already-toggled) BSS-wide index.
-                let gtk_full = random_bytes::<32>();
+                let mut gtk_full = random_bytes::<32>();
+                s.gtk.zeroize();
                 s.gtk.copy_from_slice(&gtk_full[..16]);
-                s.eapol_replay += 1;
+                gtk_full.zeroize();
+                s.eapol_replay = replay;
                 (s.kck, s.kek, s.sha256, s.owe, s.eapol_replay, s.gtk)
             };
             let igtk_kde = if sha256 {
@@ -3498,5 +4121,25 @@ impl Ap {
         let mut f = dot11::RADIOTAP_TX.to_vec();
         f.extend_from_slice(&frame);
         f
+    }
+}
+
+impl Drop for Ap {
+    fn drop(&mut self) {
+        self.pmk.zeroize();
+        for (_, pmk) in &mut self.psk_candidates {
+            pmk.zeroize();
+        }
+        for (_, password) in &mut self.credential_passwords {
+            password.zeroize();
+        }
+        self.password.zeroize();
+        self.gtk.zeroize();
+        self.igtk.zeroize();
+        self.bigtk.zeroize();
+        self.sae_token_key.zeroize();
+        if let Some(anonce) = self.test_anonce.as_mut() {
+            anonce.zeroize();
+        }
     }
 }

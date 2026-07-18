@@ -1,4 +1,5 @@
 #!/bin/bash
+RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
 sudo pkill -f /tmp/barely 2>/dev/null; sudo pkill -f wpa_supplicant 2>/dev/null; sudo pkill tcpdump 2>/dev/null
 sudo iw reg set US 2>/dev/null
 sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hwsim radios=3; sleep 3; sudo rfkill unblock all
@@ -12,7 +13,7 @@ sudo iw phy $PHYA interface add mon0 type monitor; sudo ip link set mon0 up
 # capture monitor on phyC
 sudo iw dev wlan2 del; sudo iw phy $PHYC interface add mon2 type monitor; sudo ip link set mon2 up; sudo iw dev mon2 set channel 1
 sleep 2
-sudo /tmp/barely-ap --mode iface --iface mon0 --channel 1 --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234 --rnr > /tmp/ap.log 2>&1 &
+sudo /tmp/barely-ap --config "$RUSTAP_CONFIG" --mode iface --iface mon0 --channel 1 --mac 02:00:00:00:00:00 --ssid turtlenet --rnr > /tmp/ap.log 2>&1 &
 sleep 2
 sudo timeout 5 tcpdump -i mon2 -nn -c 3 -w /tmp/br.pcap 'type mgt subtype beacon and wlan host 02:00:00:00:00:00' 2>/dev/null
 echo "=== RNR element decoded by tshark ==="

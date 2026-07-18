@@ -1,4 +1,5 @@
 #!/bin/bash
+RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
 # 6 GHz Scenario A: Rust barely-cli (SAE) -> hostapd on 6 GHz channel 37 (6135 MHz)
 SEC=${1:-wpa3}; CH=37; FREQ=6135
 sudo pkill -f hostapd 2>/dev/null; sudo pkill -f /tmp/barely 2>/dev/null; sleep 1
@@ -38,7 +39,7 @@ sudo ip link set mon1 up
 sudo iw dev mon1 set freq $FREQ 2>&1 | head -1
 sleep 2
 echo -n "mon1 freq: "; iw dev mon1 info | awk "/channel/{print \$2,\$3}"
-sudo timeout 14 /tmp/barely-cli --mode iface --iface mon1 --channel $CH --mac 02:00:00:00:01:00 --gw-mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234 $CLIFLAG > /tmp/c6.log 2>&1
+sudo timeout 14 /tmp/barely-cli --config "$RUSTAP_CONFIG" --mode iface --iface mon1 --channel $CH --mac 02:00:00:00:01:00 --gw-mac 02:00:00:00:00:00 --ssid turtlenet $CLIFLAG > /tmp/c6.log 2>&1
 echo "[$SEC 6GHz] cli: $(grep -aoE 'AUTHENTICATED' /tmp/c6.log | tr '\n' ' ')"
 echo "[$SEC 6GHz] hostapd: $(sudo grep -aoE 'AP-STA-CONNECTED|EAPOL-4WAY-HS-COMPLETED' /tmp/h6.log | sort -u | tr '\n' ' ')"
 sudo pkill -f hostapd; sudo pkill -f /tmp/barely

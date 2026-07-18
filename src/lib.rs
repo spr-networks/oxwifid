@@ -15,6 +15,7 @@ pub mod raw_frames;
 pub mod sae;
 #[cfg(unix)]
 pub mod spr;
+pub mod uplink;
 pub mod util;
 
 /// Backwards-compatible alias for the transport/event-loop layer, which moved

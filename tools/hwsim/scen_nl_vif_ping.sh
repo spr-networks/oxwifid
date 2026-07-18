@@ -1,4 +1,5 @@
 #!/bin/bash
+RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
 cleanup(){ sudo pkill -9 -f /tmp/barely 2>/dev/null; sudo pkill -9 wpa_supplicant 2>/dev/null
   sudo iw phy $PHYB set netns 1 2>/dev/null; sudo ip netns del sta 2>/dev/null
   [ -n "$FWH" ] && sudo nft delete rule inet filter INPUT handle $FWH 2>/dev/null; }
@@ -7,7 +8,7 @@ sudo pkill -9 -f /tmp/barely 2>/dev/null; sudo pkill -9 wpa_supplicant 2>/dev/nu
 sudo iw reg set US 2>/dev/null
 sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hwsim radios=2; sleep 3
 sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set wlan0 up
-sudo /tmp/barely-ap --mode netlink --iface wlan0 --channel 1 --per-sta-vif --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234 > /tmp/apnl.log 2>&1 &
+sudo /tmp/barely-ap --config "$RUSTAP_CONFIG" --mode netlink --iface wlan0 --channel 1 --per-sta-vif --mac 02:00:00:00:00:00 --ssid turtlenet > /tmp/apnl.log 2>&1 &
 sleep 2
 sudo ip netns add sta; PHYB=phy$(iw dev wlan1 info | awk '/wiphy/{print $2}'); sudo iw phy $PHYB set netns name sta
 sudo ip netns exec sta ip link set lo up; sudo ip netns exec sta ip link set wlan1 up

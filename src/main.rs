@@ -1,7 +1,7 @@
 //! barely-ap: a minimal WPA2/CCMP 802.11 access point.
 //!
 //! Usage:
-//!   barely-ap [--ssid NAME] [--psk PASS] [--mac AA:BB:CC:DD:EE:FF]
+//!   barely-ap --config FILE.json [--ssid NAME] [--mac AA:BB:CC:DD:EE:FF]
 //!             [--channel N] [--ip 10.10.10.1] [--mode stdio|iface]
 //!             [--iface wlanN]
 //!
@@ -17,6 +17,7 @@ use barely_ap::config::{parse_ip, Config, KeyMgmt};
 use barely_ap::fakenet::FakeNet;
 use barely_ap::raw_frames::{self, ApNode, StdioLink};
 use barely_ap::util::mac_to_bytes;
+use zeroize::Zeroize;
 
 /// Build the configuration: start from defaults, load `--config FILE` (JSON) if
 /// given, then apply any CLI flags as overrides (so flags win over the file).
@@ -29,14 +30,19 @@ fn parse_args() -> Config {
     for i in 1..args.len() {
         if args[i] == "--config" {
             let path = next(i);
-            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            let mut text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
                 eprintln!("barely-ap: cannot read config {path:?}: {e}");
                 std::process::exit(1);
             });
-            cfg = Config::from_json(&text).unwrap_or_else(|e| {
-                eprintln!("barely-ap: {path}: {e}");
-                std::process::exit(1);
-            });
+            cfg = match Config::from_json(&text) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    text.zeroize();
+                    eprintln!("barely-ap: {path}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            text.zeroize();
         }
     }
 
@@ -46,7 +52,12 @@ fn parse_args() -> Config {
         match args[i].as_str() {
             "--config" => i += 1, // already handled
             "--ssid" => cfg.ssid = next(i),
-            "--psk" => cfg.passphrase = next(i),
+            "--psk" => {
+                eprintln!(
+                    "barely-ap: --psk was removed because process arguments expose secrets; put passphrase or psk_file in --config"
+                );
+                std::process::exit(2);
+            }
             "--mac" => cfg.mac = mac_to_bytes(&next(i)),
             "--channel" => cfg.channel = next(i).parse().unwrap_or(cfg.channel),
             "--width" => cfg.width = next(i).parse().unwrap_or(cfg.width),
@@ -83,7 +94,7 @@ fn parse_args() -> Config {
             "--rnr" => cfg.rnr = true,
             "--per-sta-vif" => cfg.per_sta_vif = true,
             "-h" | "--help" => {
-                eprintln!("barely-ap [--config FILE.json] [--ssid NAME] [--psk PASS] [--mac MAC]");
+                eprintln!("barely-ap --config FILE.json [--ssid NAME] [--mac MAC]");
                 eprintln!(
                     "          [--channel N] [--ip IP] [--mode stdio|iface|netlink] [--iface NAME]"
                 );
@@ -106,8 +117,12 @@ fn parse_args() -> Config {
 }
 
 fn main() {
-    let cfg = parse_args();
+    let mut cfg = parse_args();
     if let Err(e) = cfg.validate() {
+        cfg.passphrase.zeroize();
+        for bss in &mut cfg.bss {
+            bss.passphrase.zeroize();
+        }
         eprintln!("barely-ap: invalid configuration: {e}");
         std::process::exit(1);
     }
@@ -147,6 +162,10 @@ fn main() {
                 extra.len()
             );
         }
+        cfg.passphrase.zeroize();
+        for bss in &mut cfg.bss {
+            bss.passphrase.zeroize();
+        }
         run_netlink(
             ap,
             extra,
@@ -165,6 +184,7 @@ fn main() {
         net,
         beacon_interval,
     };
+    cfg.passphrase.zeroize();
     match cfg.mode.as_str() {
         "stdio" => {
             raw_frames::run(node, StdioLink::new());
@@ -195,6 +215,7 @@ fn run_iface(_node: ApNode, _iface: &str, _channel: u8, _band6: bool) {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn run_netlink(
     ap: Ap,
     extra: Vec<Ap>,
@@ -221,6 +242,7 @@ fn run_netlink(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 fn run_netlink(
     _ap: Ap,
     _extra: Vec<Ap>,

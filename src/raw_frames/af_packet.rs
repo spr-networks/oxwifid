@@ -63,6 +63,14 @@ impl IfaceLink {
             Ok(IfaceLink { fd, tx_radiotap })
         }
     }
+
+    fn update_channel(&mut self, channel: u8, band6: bool) {
+        self.tx_radiotap = if band6 {
+            dot11::build_radiotap_tx_6ghz(channel)
+        } else {
+            dot11::build_radiotap_tx(channel)
+        };
+    }
 }
 
 impl Link for IfaceLink {
@@ -105,6 +113,11 @@ impl Link for IfaceLink {
         unsafe {
             libc::send(self.fd, buf.as_ptr() as *const libc::c_void, buf.len(), 0);
         }
+    }
+
+    fn retune(&mut self, channel: u8, band6: bool) -> io::Result<()> {
+        self.update_channel(channel, band6);
+        Ok(())
     }
 }
 

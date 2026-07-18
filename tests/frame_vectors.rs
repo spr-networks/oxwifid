@@ -1021,6 +1021,7 @@ fn eapol_m1_matches() {
         &mac6("02:00:00:00:00:00"),
         &mac6(f["sta"].as_str().unwrap()),
         &anonce,
+        1,
         32,
         dot11::KeyMic::HmacSha1,
     );
@@ -1035,6 +1036,7 @@ fn eapol_m1_mld_carries_ap_mld_mac_kde() {
         &mac6("02:00:00:00:00:00"),
         &mac6("02:00:00:00:ab:cd"),
         &anonce,
+        1,
         32,
         dot11::KeyMic::AesCmac,
         &ap_mld,
@@ -1064,6 +1066,7 @@ fn eapol_m3_matches() {
         None,
         None,
         None,
+        2,
         48,
         dot11::KeyMic::HmacSha1,
     );
@@ -1102,6 +1105,7 @@ fn eapol_m3_mld_uses_mlo_group_kdes() {
         Some((4, [0; 6], igtk)),
         None,
         None,
+        2,
         48,
         dot11::KeyMic::HmacSha1,
     );

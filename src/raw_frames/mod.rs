@@ -15,14 +15,31 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::ap::Ap;
 use crate::client::Client;
 use crate::fakenet::FakeNet;
 
 pub mod af_packet;
+#[cfg(target_os = "linux")]
+pub mod tap;
 
 #[cfg(target_os = "linux")]
 pub use af_packet::IfaceLink;
+#[cfg(target_os = "linux")]
+pub use tap::TapDevice;
+
+#[cfg(target_os = "linux")]
+static CLIENT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+extern "C" fn request_client_shutdown(_signal: libc::c_int) {
+    // Atomic stores are async-signal-safe; all filesystem work stays in the
+    // normal event loop after this handler returns.
+    CLIENT_SHUTDOWN.store(true, Ordering::Relaxed);
+}
 
 /// A bidirectional link carrying radiotap-prefixed 802.11 frames.
 pub trait Link {
@@ -36,6 +53,14 @@ pub trait Link {
     /// `try_recv` return immediately every iteration and the loop busy-spins.
     fn is_closed(&self) -> bool {
         false
+    }
+    /// Retune a channel-aware transport after a fresh BSS scan. Portable/test
+    /// transports do not support this operation.
+    fn retune(&mut self, _channel: u8, _band6: bool) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "transport cannot retune",
+        ))
     }
 }
 
@@ -77,6 +102,220 @@ pub fn run<L: Link, N: Node>(mut node: N, mut link: L) {
         if link.is_closed() {
             break;
         }
+    }
+}
+
+/// Production station data loop: drive the Wi-Fi state machine and bridge its
+/// decrypted Ethernet side to a TAP interface. Addressing and routes remain
+/// owned by the host/SPR; this loop never runs DHCP or changes an IP route.
+#[cfg(target_os = "linux")]
+pub fn run_client_tap<L: Link>(
+    client: Client,
+    wifi: L,
+    tap: TapDevice,
+    state_file: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    run_client_tap_inner(client, wifi, tap, state_file, None)
+}
+
+/// TAP client loop with a native scan/reselection hook. The hook runs only
+/// while the client is disconnected, so a multi-channel scan cannot interrupt
+/// an authenticated data path or an in-progress four-way handshake.
+#[cfg(target_os = "linux")]
+pub fn run_client_tap_with_rescan<L, F>(
+    client: Client,
+    wifi: L,
+    tap: TapDevice,
+    state_file: Option<&std::path::Path>,
+    mut rescan: F,
+) -> std::io::Result<()>
+where
+    L: Link,
+    F: FnMut(&mut Client, &mut L) -> std::io::Result<()>,
+{
+    run_client_tap_inner(client, wifi, tap, state_file, Some(&mut rescan))
+}
+
+#[cfg(target_os = "linux")]
+fn run_client_tap_inner<L: Link>(
+    mut client: Client,
+    mut wifi: L,
+    mut tap: TapDevice,
+    state_file: Option<&std::path::Path>,
+    mut rescan: Option<&mut dyn FnMut(&mut Client, &mut L) -> std::io::Result<()>>,
+) -> std::io::Result<()> {
+    CLIENT_SHUTDOWN.store(false, Ordering::Relaxed);
+    clear_client_state(state_file);
+    // SAFETY: the handler only performs an atomic store and has C signal
+    // calling convention. This client loop owns TERM/INT handling for the
+    // remaining lifetime of the process.
+    unsafe {
+        let handler = request_client_shutdown as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+    // Keep both sides responsive under a saturated uplink. A short receive
+    // poll avoids adding 20 ms bursts to TAP traffic, while a bounded TAP batch
+    // prevents a continuously writable host stack from starving Wi-Fi RX,
+    // EAPOL group rekeys, and liveness maintenance.
+    let tick = Duration::from_millis(2);
+    const TAP_BATCH: usize = 64;
+    let mut announced = false;
+    let mut next_rescan = Instant::now() + Duration::from_secs(5);
+    loop {
+        if CLIENT_SHUTDOWN.load(Ordering::Relaxed) {
+            clear_client_state(state_file);
+            return Ok(());
+        }
+        if client.maintenance(Instant::now()) && announced {
+            announced = false;
+            clear_client_state(state_file);
+            eprintln!("DISCONNECTED timeout");
+            next_rescan = Instant::now();
+        }
+
+        if let Some(frame) = wifi.try_recv(tick) {
+            let was_connected = client.connected == 4;
+            let out = client.handle_incoming(&frame);
+            for transmit in out.frames {
+                wifi.send(&transmit);
+            }
+            for ethernet in out.to_network {
+                if std::env::var_os("RUSTAP_CLIENT_DEBUG").is_some() {
+                    eprintln!(
+                        "client TAP downlink len={} ethertype={:02x}{:02x} {}",
+                        ethernet.len(),
+                        ethernet.get(12).copied().unwrap_or_default(),
+                        ethernet.get(13).copied().unwrap_or_default(),
+                        ethernet_debug(&ethernet)
+                    );
+                }
+                tap.send(&ethernet)?;
+            }
+            if was_connected && client.connected != 4 {
+                announced = false;
+                clear_client_state(state_file);
+                eprintln!("DISCONNECTED");
+                next_rescan = Instant::now();
+            }
+        }
+
+        if client.connected == 0 && Instant::now() >= next_rescan {
+            if let Some(reselect) = rescan.as_deref_mut() {
+                match reselect(&mut client, &mut wifi) {
+                    Ok(()) => eprintln!("RESCAN selected a matching BSS"),
+                    Err(error) => eprintln!("RESCAN failed: {error}"),
+                }
+            }
+            next_rescan = Instant::now() + Duration::from_secs(10);
+        }
+
+        for _ in 0..TAP_BATCH {
+            let Some(ethernet) = tap.try_recv()? else {
+                break;
+            };
+            if std::env::var_os("RUSTAP_CLIENT_DEBUG").is_some() {
+                eprintln!(
+                    "client TAP uplink len={} ethertype={:02x}{:02x} connected={} {}",
+                    ethernet.len(),
+                    ethernet.get(12).copied().unwrap_or_default(),
+                    ethernet.get(13).copied().unwrap_or_default(),
+                    client.connected,
+                    ethernet_debug(&ethernet)
+                );
+            }
+            if let Some(frame) = client.encrypt_uplink(&ethernet) {
+                wifi.send(&frame);
+            }
+        }
+
+        if client.connected == 4 && !announced {
+            announced = true;
+            write_client_state(state_file)?;
+            eprintln!(
+                "AUTHENTICATED tap={} bssid={}",
+                tap.name(),
+                client
+                    .bssid()
+                    .map(|bssid| crate::util::bytes_to_mac(&bssid))
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+        if wifi.is_closed() {
+            clear_client_state(state_file);
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ethernet_debug(frame: &[u8]) -> String {
+    if frame.len() < 14 {
+        return "truncated".to_string();
+    }
+    let mac = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    };
+    let mut detail = format!("{} -> {}", mac(&frame[6..12]), mac(&frame[0..6]));
+    if frame[12..14] == [0x08, 0x06] && frame.len() >= 42 {
+        detail.push_str(&format!(
+            " arp-op={} {}.{}.{}.{} -> {}.{}.{}.{}",
+            u16::from_be_bytes([frame[20], frame[21]]),
+            frame[28],
+            frame[29],
+            frame[30],
+            frame[31],
+            frame[38],
+            frame[39],
+            frame[40],
+            frame[41]
+        ));
+    }
+    detail
+}
+
+#[cfg(target_os = "linux")]
+fn write_client_state(path: Option<&std::path::Path>) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let Some(path) = path else { return Ok(()) };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut nonce = [0u8; 8];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| std::io::Error::other(format!("OS RNG failed: {error}")))?;
+    let nonce = u64::from_ne_bytes(nonce);
+    let temporary = path.with_extension(format!("tmp.{}.{nonce:016x}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        // `create_new` is atomic and refuses to follow a pre-created symlink.
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    writeln!(file, "CONNECTED {timestamp}")?;
+    file.sync_all()?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clear_client_state(path: Option<&std::path::Path>) {
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -159,6 +398,11 @@ impl Node for ClientNode {
 
     fn on_tick(&mut self) -> Vec<Vec<u8>> {
         let mut frames = Vec::new();
+        if self.client.maintenance(Instant::now()) {
+            self.announced = false;
+            self.pinged = false;
+            eprintln!("DISCONNECTED timeout");
+        }
         if self.client.connected == 4 && !self.announced {
             eprintln!("AUTHENTICATED");
             self.announced = true;
@@ -179,7 +423,13 @@ impl Node for ClientNode {
     }
 
     fn on_frame(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
+        let was_connected = self.client.connected == 4;
         let out = self.client.handle_incoming(frame);
+        if was_connected && self.client.connected != 4 {
+            self.announced = false;
+            self.pinged = false;
+            eprintln!("DISCONNECTED");
+        }
         let mut frames = out.frames;
         for eth in &out.to_network {
             if is_icmp_echo_reply(eth) {

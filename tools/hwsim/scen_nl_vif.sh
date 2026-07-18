@@ -1,10 +1,11 @@
 #!/bin/bash
+RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
 sudo pkill -9 -f /tmp/barely 2>/dev/null; sudo pkill -9 wpa_supplicant 2>/dev/null
 for v in $(ip -o link show 2>/dev/null | awk -F': ' '/apvlan/{print $2}'); do sudo iw dev $v del 2>/dev/null; done
 sudo iw reg set US 2>/dev/null
 sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hwsim radios=3; sleep 3
 sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set wlan0 up
-sudo /tmp/barely-ap --mode netlink --iface wlan0 --channel 1 --per-sta-vif --mac 02:00:00:00:00:00 --ssid turtlenet --psk password1234 > /tmp/apnl.log 2>&1 &
+sudo /tmp/barely-ap --config "$RUSTAP_CONFIG" --mode netlink --iface wlan0 --channel 1 --per-sta-vif --mac 02:00:00:00:00:00 --ssid turtlenet > /tmp/apnl.log 2>&1 &
 sleep 2
 cat > /tmp/cli.conf <<CFG
 ctrl_interface=/run/wpa_n

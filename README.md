@@ -11,8 +11,9 @@ and the resulting AP has been driven end-to-end by the **unmodified reference
 Python station** (`client.py`) — completing a real handshake and a CCMP-encrypted
 ping round-trip.
 
-> Like the original, this is a demonstration of the CCMP/WPA2 building blocks.
-> It has **no protocol security hardening** and is not production software.
+> This remains experimental software. Its WPA state machines include replay,
+> cache-lifetime, anti-clogging, and key-erasure hardening, but it has not had
+> the independent review expected for production authentication software.
 
 ## Building
 
@@ -32,7 +33,7 @@ overrides:
 
 ```
 barely-ap --config barely-ap.json
-barely-ap [--config FILE.json] [--ssid NAME] [--psk PASS] [--mac AA:BB:CC:DD:EE:FF]
+barely-ap --config FILE.json [--ssid NAME] [--mac AA:BB:CC:DD:EE:FF]
           [--channel N] [--ip 10.10.10.1] [--mode stdio|iface|netlink] [--iface wlanN]
           [--band 2.4|5|6] [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--per-sta-vif]
 ```
@@ -42,6 +43,9 @@ The config file (see `barely-ap.example.json`) sets `ssid`, `passphrase`,
 `mac`, `ip`, explicit `band` (`2.4`, `5`, or `6`), and the feature toggles
 `ocv`, `btm`, `rnr`, `per_sta_vif`.
 Unknown keys and type mismatches are hard errors. See [`src/config.rs`](src/config.rs).
+Passwords are accepted only through the JSON `passphrase` or `psk_file`
+settings; command-line password arguments are deliberately rejected because
+process arguments are commonly visible to other users and diagnostic tools.
 
 For an 802.11be MLD, `mld_default_links: [1]` advertises that every QoS TID
 uses Link ID 1 in both directions. The array may contain multiple configured
@@ -66,6 +70,49 @@ A built-in fake network backend answers DHCP, ARP, and ICMP echo for the AP's
 subnet, so an associated client can get a lease (`10.10.10.2+`) and `ping`
 the gateway (`10.10.10.1`) with no external services.
 
+### SPR uplink client (Linux)
+
+`barely-cli` can expose its authenticated station data plane as a TAP netdev.
+It does not assign an address, run DHCP, or install a route. Instead it writes
+the same `CONNECTED <unix-epoch>` state file that SPR's `wifi_uplink` action
+script produces, and SPR's existing DHCP client owns the TAP interface:
+
+```bash
+barely-cli --spr-config /configs/wifi_uplink/wpa.json --spr-iface wlan0 \
+  --scan-iface wlan0-phy --mode iface --iface wlan0mon \
+  --tap wlan0 --state-file /state/wifi_uplink/status.wlan0
+```
+
+The logical `--spr-iface` selects the entry in SPR's existing `wpa.json`.
+`--scan-iface` is its managed physical VIF and `--iface` is a monitor VIF on the
+same PHY. If SPR needs the TAP to retain the logical name (normally `wlan0`),
+the startup wrapper can rename the physical VIF to `wlan0-phy` first. The
+supervisor must create the monitor VIF and retain the managed sibling for ACKs;
+barely-ap brings the scan VIF up and tunes the monitor after selection.
+`--tap` creates and brings up only the Ethernet netdev. Credentials are read
+directly from SPR JSON; command-line passwords are rejected.
+
+The production loop validates SSID/BSSID/RSN/AKM/PMF before authenticating,
+supports WPA2-PSK, WPA-PSK-SHA256, WPA3-SAE, and OWE, and handles protected
+hostapd group rekeys. Native nl80211 scanning matches every enabled SPR network,
+honors optional BSSID pins and highest `Priority`, uses directed probes for
+manually entered/hidden SSIDs, and chooses the strongest compatible BSS within
+that priority. While disconnected it rescans and retunes every ten seconds, so
+an AP channel change does not strand the uplink.
+
+The same scanner can feed SPR's scan UI as JSON without `iw | jc`:
+
+```bash
+barely-cli --scan --scan-iface wlan0-phy
+# Optional directed probe:
+barely-cli --scan --scan-iface wlan0-phy --scan-ssid hidden-network
+```
+
+Each result includes `ssid`, `bssid`, `frequency`, `channel`, `band` (`2.4`,
+`5`, or `6`), signal, AKMs, and MLO link metadata when the driver supplies it.
+Scanning and association never assign an IP, run DHCP, or modify a route; SPR
+continues to act only after the authenticated `CONNECTED` state file appears.
+
 ## Architecture
 
 | Module        | Responsibility                                                        |
@@ -74,7 +121,7 @@ the gateway (`10.10.10.1`) with no external services.
 | `sae`         | WPA3-SAE (Dragonfly) with Hash-to-Element, ECC group 19 (P-256)       |
 | `dot11`       | 802.11 frame build/parse: beacon, probe/auth/assoc, EAPOL, SAE, CCMP   |
 | `ap`          | The AP state machine: probe/auth/assoc, 4-way handshake, encrypt/decrypt |
-| `client`      | A matching minimal station (the `barely-cli` binary), for interop tests |
+| `client`      | WPA2/WPA3/OWE station state machine used by `barely-cli` and the SPR TAP uplink |
 | `fakenet`     | Minimal DHCP / ARP / ICMP responder for the AP subnet                 |
 | `raw_frames`  | `Link`/`Node` event loop + raw-frame transports (stdio, AF_PACKET monitor) |
 | `netlink`     | nl80211 (generic netlink) transport: radio setup + mgmt frame I/O (Linux) |
@@ -137,12 +184,12 @@ Run them by hand with the generic bridge:
 cargo build
 # Rust client <-> Rust AP
 python3 tools/bridge.py --need AUTHENTICATED --need PING_REPLY_OK \
-  --a "target/debug/barely-ap  --mode stdio --mac 02:00:00:00:00:00" \
-  --b "target/debug/barely-cli --ping       --mac 02:00:00:00:ab:cd"
+  --a "target/debug/barely-ap  --config tests/interop-config.json --mode stdio --mac 02:00:00:00:00:00" \
+  --b "target/debug/barely-cli --config tests/interop-config.json --ping --mac 02:00:00:00:ab:cd"
 # Rust client <-> reference Python AP
 python3 tools/bridge.py --need AUTHENTICATED --need PING_REPLY_OK --env AP_MAC=02:00:00:00:00:00 \
   --a "python3 tools/run_ap.py" \
-  --b "target/debug/barely-cli --ping --mac 02:00:00:00:ab:cd"
+  --b "target/debug/barely-cli --config tests/interop-config.json --ping --mac 02:00:00:00:ab:cd"
 ```
 
 Regenerate the golden vectors after changing the reference:
@@ -160,12 +207,13 @@ python3 tools/bridge_test.py target/debug/barely-ap   # prints INTEROP_OK
 
 ## WPA3-SAE (real-world)
 
-The AP and client support **WPA3-Personal (SAE)**, enabled with `--sae`:
+The AP and client support **WPA3-Personal (SAE)**, enabled with `--sae`.
+The password in this test-only example is read from the config file:
 
 ```bash
-barely-ap  --mode stdio --sae --ssid turtlenet --psk password1234
-barely-cli --mode stdio --sae --ping            # Hash-to-Element
-barely-cli --mode stdio --sae-hnp --ping        # legacy hunting-and-pecking
+barely-ap  --config tests/interop-config.json --mode stdio --sae --ssid turtlenet
+barely-cli --config tests/interop-config.json --mode stdio --sae --ping      # Hash-to-Element
+barely-cli --config tests/interop-config.json --mode stdio --sae-hnp --ping  # legacy hunting-and-pecking
 ```
 
 Built to be accepted by a real WPA3 station:
