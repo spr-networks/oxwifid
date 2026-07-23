@@ -11,7 +11,7 @@ use std::os::unix::io::RawFd;
 use std::time::Duration;
 
 use super::Link;
-use crate::dot11;
+use crate::frames as dot11;
 
 pub struct IfaceLink {
     fd: RawFd,

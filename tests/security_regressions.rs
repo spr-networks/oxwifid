@@ -1,4 +1,4 @@
-//! Regression tests for security failures found during the hostapd comparison.
+//! Regression tests for security failures found during the reference AP comparison.
 
 use barely_ap::ap::{Ap, MldLink};
 use barely_ap::client::Client;
@@ -365,7 +365,7 @@ fn sae_anti_clogging_requires_a_valid_token_and_expires_incomplete_state() {
 }
 
 #[test]
-fn hostapd_assoc_rsn_validation_rejects_malformed_and_wrong_akm() {
+fn reference_ap_assoc_rsn_validation_rejects_malformed_and_wrong_akm() {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
 
     for (suffix, malformed, expected_status) in [
@@ -395,7 +395,7 @@ fn hostapd_assoc_rsn_validation_rejects_malformed_and_wrong_akm() {
 }
 
 #[test]
-fn hostapd_wpa2_assoc_without_optional_rsn_capabilities_still_works() {
+fn reference_ap_wpa2_assoc_without_optional_rsn_capabilities_still_works() {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     let sta = mac_to_bytes("02:00:00:00:02:05");
     let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
@@ -411,7 +411,19 @@ fn hostapd_wpa2_assoc_without_optional_rsn_capabilities_still_works() {
 }
 
 #[test]
-fn hostapd_truncated_basic_mle_is_rejected() {
+fn identical_rsnxe_repeats_are_unambiguous_but_conflicts_are_rejected() {
+    let repeated = [0xf4, 1, 0x20, 0xf4, 1, 0x20];
+    assert_eq!(
+        dot11::find_ie_consistent(&repeated, 0xf4),
+        Ok(Some(&[0x20][..]))
+    );
+
+    let conflicting = [0xf4, 1, 0x20, 0xf4, 1, 0x00];
+    assert!(dot11::find_ie_consistent(&conflicting, 0xf4).is_err());
+}
+
+#[test]
+fn reference_ap_truncated_basic_mle_is_rejected() {
     let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
     let ap_link1 = mac_to_bytes("02:00:00:00:10:02");
     let ap_mld = mac_to_bytes("02:00:00:00:10:00");
@@ -570,7 +582,7 @@ fn encrypted_m2_and_reserved_key_info_bits_remain_compatible() {
     assert_eq!(
         ap.handle_incoming(&framed(encrypted_m2)).frames.len(),
         1,
-        "hostapd-compatible encrypted M2 with reserved bits must produce M3"
+        "reference AP-compatible encrypted M2 with reserved bits must produce M3"
     );
 }
 
@@ -592,7 +604,7 @@ fn sae_commit_with_status(status: u16) -> Vec<u8> {
 }
 
 #[test]
-fn hostapd_sae_unknown_commit_status_is_not_legacy_sae() {
+fn reference_ap_sae_unknown_commit_status_is_not_legacy_sae() {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     for status in [1, 127] {
         let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
@@ -616,7 +628,7 @@ fn hostapd_sae_unknown_commit_status_is_not_legacy_sae() {
 }
 
 #[test]
-fn hostapd_sae_unsupported_group_uses_status_77() {
+fn reference_ap_sae_unsupported_group_uses_status_77() {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     let sta = mac_to_bytes("02:00:00:00:ab:cd");
     let mut sae = Sae::new_h2e(b"turtlenet", b"password1234", None, &ap_mac, &sta);
@@ -678,7 +690,7 @@ fn capture_sae_assoc() -> (Ap, Vec<u8>) {
 }
 
 #[test]
-fn hostapd_sae_long_rsnxe_is_extensible() {
+fn reference_ap_sae_long_rsnxe_is_extensible() {
     let (mut ap, mut assoc) = capture_sae_assoc();
     let stripped_len = dot11::strip_radiotap(&assoc).unwrap().len();
     let radiotap_len = assoc.len() - stripped_len;
@@ -701,7 +713,7 @@ fn hostapd_sae_long_rsnxe_is_extensible() {
 }
 
 #[test]
-fn hostapd_owe_unsupported_group_uses_status_77() {
+fn reference_ap_owe_unsupported_group_uses_status_77() {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     let sta = mac_to_bytes("02:00:00:00:ab:cd");
     let (_private, public) = barely_ap::sae::owe_keypair();
@@ -745,7 +757,7 @@ fn mld_ap_for_malformed_profile() -> Ap {
 }
 
 #[test]
-fn hostapd_mld_truncated_nested_profile_is_rejected_before_state_install() {
+fn reference_ap_mld_truncated_nested_profile_is_rejected_before_state_install() {
     let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
     let sta_link0 = mac_to_bytes("02:00:00:00:20:01");
     let sta_mld = mac_to_bytes("02:00:00:00:20:00");
@@ -830,7 +842,7 @@ fn send_m4(ap: &mut Ap, kck: &[u8]) {
 }
 
 #[test]
-fn hostapd_changed_snonce_m2_retry_keeps_both_ptk_candidates() {
+fn reference_ap_changed_snonce_m2_retry_keeps_both_ptk_candidates() {
     let snonce1: [u8; 32] = from_hex(vectors()["crypto"]["snonce"].as_str().unwrap())
         .try_into()
         .unwrap();
@@ -849,7 +861,7 @@ fn hostapd_changed_snonce_m2_retry_keeps_both_ptk_candidates() {
 }
 
 #[test]
-fn hostapd_encrypted_m4_requires_valid_aes_wrapped_key_data() {
+fn reference_ap_encrypted_m4_requires_valid_aes_wrapped_key_data() {
     let snonce: [u8; 32] = from_hex(vectors()["crypto"]["snonce"].as_str().unwrap())
         .try_into()
         .unwrap();

@@ -1,4 +1,4 @@
-//! Tests for the second batch of standard hostapd features: 802.11v BTM,
+//! Tests for the second batch of standard reference AP features: 802.11v BTM,
 //! 802.11k Neighbor Report, 802.11h CSA, and Multiple BSSID.
 
 use barely_ap::ap::Ap;

@@ -1,4 +1,4 @@
-//! Cryptographic primitives ported from `ccmp.py`.
+//! Cryptographic primitives shared by the authentication protocols.
 //!
 //! These mirror the reference Python *exactly* (including its hand-rolled
 //! CCM* construction) so that the wire output is byte-for-byte identical and a
@@ -6,7 +6,9 @@
 
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
-use aes::Aes128;
+use aes::{Aes128, Aes256};
+use aes_gcm::aead::AeadInPlace;
+use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::Sha256;
@@ -20,6 +22,16 @@ pub fn aes128_ecb_encrypt_block(key: &[u8], block: &[u8; 16]) -> [u8; 16] {
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut b = *GenericArray::from_slice(block);
     cipher.encrypt_block(&mut b);
+    b.into()
+}
+
+fn aes_ecb_encrypt_block(key: &[u8], block: &[u8; 16]) -> [u8; 16] {
+    let mut b = *GenericArray::from_slice(block);
+    match key.len() {
+        16 => Aes128::new(GenericArray::from_slice(key)).encrypt_block(&mut b),
+        32 => Aes256::new(GenericArray::from_slice(key)).encrypt_block(&mut b),
+        _ => panic!("AES data-protection key must be 16 or 32 bytes"),
+    }
     b.into()
 }
 
@@ -84,6 +96,29 @@ pub fn derive_ptk_sha256(
     anonce: &[u8; 32],
     snonce: &[u8; 32],
 ) -> [u8; 48] {
+    let mut bytes = derive_ptk_sha256_len(pmk, aa, spa, anonce, snonce, 48);
+    let mut out = [0u8; 48];
+    out.copy_from_slice(&bytes);
+    bytes.zeroize();
+    out
+}
+
+/// Derive a SHA-256 PTK of an explicit length.
+///
+/// CCMP/GCMP-128 use 48 bytes (KCK16 || KEK16 || TK16); CCMP/GCMP-256
+/// use 64 bytes (KCK16 || KEK16 || TK32).
+pub fn derive_ptk_sha256_len(
+    pmk: &[u8],
+    aa: &[u8; 6],
+    spa: &[u8; 6],
+    anonce: &[u8; 32],
+    snonce: &[u8; 32],
+    out_len: usize,
+) -> Vec<u8> {
+    assert!(
+        matches!(out_len, 48 | 64),
+        "supported SHA-256 PTK lengths are 48 and 64 bytes"
+    );
     let (mac_lo, mac_hi) = if aa <= spa { (aa, spa) } else { (spa, aa) };
     let (n_lo, n_hi): (&[u8], &[u8]) = if anonce <= snonce {
         (anonce, snonce)
@@ -95,11 +130,7 @@ pub fn derive_ptk_sha256(
     ctx.extend_from_slice(mac_hi);
     ctx.extend_from_slice(n_lo);
     ctx.extend_from_slice(n_hi);
-    let mut bytes = sha256_prf(pmk, b"Pairwise key expansion", &ctx, 48);
-    let mut out = [0u8; 48];
-    out.copy_from_slice(&bytes);
-    bytes.zeroize();
-    out
+    sha256_prf(pmk, b"Pairwise key expansion", &ctx, out_len)
 }
 
 /// AES-128-CMAC (RFC 4493), returning the full 16-byte tag. BIP-CMAC-128 uses
@@ -184,7 +215,7 @@ pub fn pbkdf2_pmk(psk: &str, ssid: &str) -> [u8; 32] {
 
 fn ctr_keystream_block(key: &[u8], a0: &[u8; 16], j: u128) -> [u8; 16] {
     let c = u128::from_be_bytes(*a0).wrapping_add(j);
-    aes128_ecb_encrypt_block(key, &c.to_be_bytes())
+    aes_ecb_encrypt_block(key, &c.to_be_bytes())
 }
 
 fn a0_block(nonce: &[u8; 13]) -> [u8; 16] {
@@ -249,11 +280,11 @@ pub fn cbc_mac(
         for i in 0..16 {
             inb[i] = chunk[i] ^ prev[i];
         }
-        prev = aes128_ecb_encrypt_block(key, &inb);
+        prev = aes_ecb_encrypt_block(key, &inb);
     }
 
     // T = first M bytes of (S_0 xor CBC-MAC), where S_0 = E(A_0)
-    let s0 = aes128_ecb_encrypt_block(key, &a0_block(nonce));
+    let s0 = aes_ecb_encrypt_block(key, &a0_block(nonce));
     (0..mac_len).map(|i| s0[i] ^ prev[i]).collect()
 }
 
@@ -264,7 +295,17 @@ pub fn run_ccmp_encrypt(
     aad: &[u8],
     plaintext: &[u8],
 ) -> (Vec<u8>, Vec<u8>) {
-    let tag = cbc_mac(key, plaintext, aad, nonce, 8);
+    run_ccmp_encrypt_with_tag(key, nonce, aad, plaintext, 8)
+}
+
+pub fn run_ccmp_encrypt_with_tag(
+    key: &[u8],
+    nonce: &[u8; 13],
+    aad: &[u8],
+    plaintext: &[u8],
+    tag_len: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let tag = cbc_mac(key, plaintext, aad, nonce, tag_len);
     let encrypted = ctr_encrypt(key, nonce, plaintext);
     (encrypted, tag)
 }
@@ -277,10 +318,73 @@ pub fn run_ccmp_decrypt(
     ciphertext: &[u8],
     known_tag: &[u8],
 ) -> (Vec<u8>, bool) {
+    run_ccmp_decrypt_with_tag(key, nonce, aad, ciphertext, known_tag, 8)
+}
+
+pub fn run_ccmp_decrypt_with_tag(
+    key: &[u8],
+    nonce: &[u8; 13],
+    aad: &[u8],
+    ciphertext: &[u8],
+    known_tag: &[u8],
+    tag_len: usize,
+) -> (Vec<u8>, bool) {
     let plaintext = ctr_encrypt(key, nonce, ciphertext);
-    let tag = cbc_mac(key, &plaintext, aad, nonce, 8);
+    let tag = cbc_mac(key, &plaintext, aad, nonce, tag_len);
     let valid = constant_time_eq(&tag, known_tag);
     (plaintext, valid)
+}
+
+/// GCMP authenticated encryption using RustCrypto AES-GCM.
+pub fn run_gcmp_encrypt(
+    key: &[u8],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Option<(Vec<u8>, [u8; 16])> {
+    let mut ciphertext = plaintext.to_vec();
+    let tag = match key.len() {
+        16 => Aes128Gcm::new(GenericArray::from_slice(key))
+            .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, &mut ciphertext)
+            .ok()?,
+        32 => Aes256Gcm::new(GenericArray::from_slice(key))
+            .encrypt_in_place_detached(Nonce::from_slice(nonce), aad, &mut ciphertext)
+            .ok()?,
+        _ => return None,
+    };
+    Some((ciphertext, tag.into()))
+}
+
+/// GCMP authenticated decryption using RustCrypto AES-GCM.
+pub fn run_gcmp_decrypt(
+    key: &[u8],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8],
+) -> Option<Vec<u8>> {
+    let tag: &[u8; 16] = tag.try_into().ok()?;
+    let mut plaintext = ciphertext.to_vec();
+    match key.len() {
+        16 => Aes128Gcm::new(GenericArray::from_slice(key))
+            .decrypt_in_place_detached(
+                Nonce::from_slice(nonce),
+                aad,
+                &mut plaintext,
+                GenericArray::from_slice(tag),
+            )
+            .ok()?,
+        32 => Aes256Gcm::new(GenericArray::from_slice(key))
+            .decrypt_in_place_detached(
+                Nonce::from_slice(nonce),
+                aad,
+                &mut plaintext,
+                GenericArray::from_slice(tag),
+            )
+            .ok()?,
+        _ => return None,
+    };
+    Some(plaintext)
 }
 
 // ---------------------------------------------------------------------------

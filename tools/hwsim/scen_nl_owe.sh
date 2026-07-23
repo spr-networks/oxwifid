@@ -8,7 +8,7 @@ sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hws
 sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set wlan0 up
 sudo /tmp/barely-ap --mode netlink --iface wlan0 --band 5 --channel 36 --owe --mac 02:00:00:00:00:00 --ssid owenl > /tmp/apowe.log 2>&1 &
 sleep 2
-echo "START_AP ok: $(sudo grep -ac 'START_AP ok' /tmp/apowe.log)"
+echo "START_AP ok: $(sudo grep -acE 'START_AP.*ok' /tmp/apowe.log)"
 sudo ip netns add sta; PHYB=phy$(iw dev wlan1 info | awk '/wiphy/{print $2}'); sudo iw phy $PHYB set netns name sta
 sudo ip netns exec sta ip link set wlan1 up
 printf 'ctrl_interface=/run/wpa_n\nnetwork={\n ssid="owenl"\n key_mgmt=OWE\n ieee80211w=2\n scan_freq=5180\n}\n' > /tmp/cowe.conf

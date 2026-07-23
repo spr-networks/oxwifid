@@ -1,9 +1,11 @@
 #!/bin/bash
 # Capture the exact MU-EDCA (ext 38) + Spatial Reuse (ext 39) element bytes from
-# a hostapd HE AP explicitly configured to emit them. Writes /tmp/musr_result.txt.
-HAPD=/home/ubuntu/hostap-hwsim/hostapd/hostapd; R=/tmp/musr_result.txt
+# a reference HE AP explicitly configured to emit them. Writes /tmp/musr_result.txt.
+REFERENCE_AP=${REFERENCE_AP:?set REFERENCE_AP to the reference AP binary}
+REFERENCE_AP_PROCESS=$(basename "$REFERENCE_AP")
+R=/tmp/musr_result.txt
 rm -f "$R" /tmp/hm.pcap; : > "$R"
-pkill -9 wlantest 2>/dev/null; pkill -9 -f "hostap-hwsim" 2>/dev/null; pkill -9 -x hostapd 2>/dev/null; pkill -9 -f "[b]arely-ap --mode" 2>/dev/null
+pkill -9 wlantest 2>/dev/null; pkill -9 -x "$REFERENCE_AP_PROCESS" 2>/dev/null; pkill -9 -f "[b]arely-ap --mode" 2>/dev/null
 sleep 1; modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; modprobe mac80211_hwsim rctbl=1 radios=4; sleep 2
 iw reg set US 2>/dev/null; sleep 1
 mapfile -t HW < <(for n in $(ls /sys/class/net|grep ^wlan); do [ "$(basename "$(readlink /sys/class/net/$n/device/driver 2>/dev/null)")" = mac80211_hwsim ] && echo "$n"; done)
@@ -73,11 +75,11 @@ he_bss_color=42
 he_spr_sr_control=3
 he_spr_non_srg_obss_pd_max_offset=20
 EOF
-setsid "$HAPD" -B /tmp/hm.conf >/tmp/hm.log 2>&1; sleep 3
-echo "hostapd up: $(grep -c "AP-ENABLED" /tmp/hm.log)" >> "$R"
+setsid "$REFERENCE_AP" -B /tmp/hm.conf >/tmp/hm.log 2>&1; sleep 3
+echo "reference AP up: $(grep -c "AP-ENABLED" /tmp/hm.log)" >> "$R"
 grep -aiE "Invalid|unknown configuration|line " /tmp/hm.log | tail -3 >> "$R"
 timeout 4 tcpdump -i "$MON" -c 4 -w /tmp/hm.pcap 'type mgt subtype beacon' >/dev/null 2>&1
 echo "=== MU-EDCA (38) + Spatial Reuse (39) element bytes ===" >> "$R"
 python3 /tmp/dump.py /tmp/hm.pcap 38 39 >> "$R" 2>>"$R"
 echo "DONE" >> "$R"
-pkill -9 -x hostapd 2>/dev/null
+pkill -9 -x "$REFERENCE_AP_PROCESS" 2>/dev/null

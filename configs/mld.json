@@ -1,0 +1,18 @@
+{
+  "ssid": "mld-test",
+  "passphrase": "password1234",
+  "key_mgmt": "sae",
+  "phy": "be",
+  "mode": "netlink",
+  "iface": "wlan0",
+  "mld": true,
+  "mac": "02:00:00:00:00:00",
+  "channel": 1,
+  "band": 2.4,
+  "width": 20,
+  "link_id": 0,
+  "mld_links": [
+    { "link_id": 0, "mac": "02:00:00:00:aa:01", "band": 2.4, "channel": 1,  "width": 20 },
+    { "link_id": 1, "mac": "02:00:00:00:aa:02", "band": 5, "channel": 36, "width": 80 }
+  ]
+}

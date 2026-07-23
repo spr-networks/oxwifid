@@ -1,0 +1,19 @@
+[package]
+name = "barely-ap-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+barely-ap = { path = ".." }
+
+[[bin]]
+name = "frame_state_machines"
+path = "fuzz_targets/frame_state_machines.rs"
+test = false
+doc = false
+bench = false

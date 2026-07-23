@@ -1,0 +1,112 @@
+//! Multi-Link authentication and association frame support.
+
+use crate::frames::*;
+
+pub const AMLD_RATES: [u8; 10] = [0x01, 0x08, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24];
+pub const AMLD_EXTRATES: [u8; 6] = [0x32, 0x04, 0x30, 0x48, 0x60, 0x6c];
+/// RSN: group CCMP, pairwise CCMP, AKM PSK-SHA256 (00-0F-AC:6), MFPR|MFPC,
+/// group-mgmt BIP-GMAC-256 (00-0F-AC:12) — 32-byte IGTK for the back-index geometry.
+pub const AMLD_RSN_PSK256: [u8; 28] = [
+    0x30, 0x1a, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,
+    0x00, 0x0f, 0xac, 0x06, 0xcc, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xac, 0x0c,
+];
+/// RSN: group CCMP, pairwise CCMP, AKM SAE (00-0F-AC:8), MFPR|MFPC,
+/// group-mgmt BIP-GMAC-256 (00-0F-AC:12) — verbatim from the captured MLD assoc.
+pub const AMLD_RSN_SAE: [u8; 28] = [
+    0x30, 0x1a, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00,
+    0x00, 0x0f, 0xac, 0x08, 0xcc, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xac, 0x0c,
+];
+pub const AMLD_HTCAP: [u8; 28] = [
+    0x2d, 0x1a, 0x7e, 0x10, 0x1b, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+pub const AMLD_EXTCAP: [u8; 12] = [
+    0x7f, 0x0a, 0x04, 0x00, 0x4a, 0x02, 0x01, 0x40, 0x00, 0x40, 0x00, 0x01,
+];
+pub const AMLD_HECAP: [u8; 24] = [
+    0xff, 0x16, 0x23, 0x01, 0x78, 0xc8, 0x1a, 0x40, 0x00, 0x02, 0xbf, 0xce, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xfa, 0xff, 0xfa, 0xff,
+];
+pub const AMLD_EHTCAP: [u8; 19] = [
+    0xff, 0x11, 0x6c, 0x07, 0x00, 0x7c, 0x00, 0x00, 0xfe, 0xff, 0xff, 0x07, 0x01, 0x00, 0x88, 0x88,
+    0x88, 0x00, 0x00,
+];
+pub const AMLD_WMM: [u8; 9] = [0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00];
+/// Link-1 STA-Profile inner IEs (no RSN — inherited from link 0): RATES, EXTRATES,
+/// HT-CAP, HE-CAP, EHT-CAP.
+pub const AMLD_LINK1_PROFILE_IES: [u8; 87] = [
+    0x01, 0x08, 0x02, 0x04, 0x0b, 0x16, 0x0c, 0x12, 0x18, 0x24, 0x32, 0x04, 0x30, 0x48, 0x60, 0x6c,
+    0x2d, 0x1a, 0x7e, 0x10, 0x1b, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x16, 0x23, 0x01,
+    0x78, 0xc8, 0x1a, 0x40, 0x00, 0x02, 0xbf, 0xce, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xfa, 0xff, 0xfa, 0xff, 0xff, 0x11, 0x6c, 0x07, 0x00, 0x7c, 0x00, 0x00, 0xfe, 0xff, 0xff, 0x07,
+    0x01, 0x00, 0x88, 0x88, 0x88, 0x00, 0x00,
+];
+
+/// Basic Multi-Link element carrying a Per-STA Profile for link 1 (STA-Control
+/// link_id=1, complete profile, MAC present) — what makes reference AP create a 2-link
+/// MLD station.
+fn multi_link_sta(mld_mac: &[u8; 6], link1_mac: &[u8; 6]) -> Vec<u8> {
+    let mut ml = Vec::new();
+    ml.extend_from_slice(&[0x00, 0x01]); // ML control: Basic, MLD-Caps present
+    ml.push(9); // Common Info Length
+    ml.extend_from_slice(mld_mac); // MLD MAC Address
+    ml.extend_from_slice(&[0x00, 0x00]); // MLD Capabilities
+                                         // Per-STA Profile subelement (id 0) for link 1
+    let mut prof = Vec::new();
+    prof.extend_from_slice(&[0x31, 0x00]); // STA-Control: link_id=1, complete, MAC present
+    prof.push(7); // STA-Info Length (incl. itself)
+    prof.extend_from_slice(link1_mac); // link-1 STA MAC
+    prof.extend_from_slice(&[0x30, 0x04]); // link-1 Capability Info
+    prof.extend_from_slice(&AMLD_LINK1_PROFILE_IES);
+    ml.push(0); // subelement id: Per-STA Profile
+    ml.push(prof.len() as u8);
+    ml.extend_from_slice(&prof);
+    ext_ie(107, &ml)
+}
+
+/// Fixed Basic Multi-Link element for Authentication frames: Common Info only
+/// (MLD MAC), no per-STA profile and no presence bits. reference implementation/wpa_supplicant use
+/// this exact 12-octet IE shape during SAE MLD authentication.
+pub fn multi_link_auth(mld_mac: &[u8; 6]) -> Vec<u8> {
+    let mut ml = Vec::new();
+    ml.extend_from_slice(&[0x00, 0x00]); // ML control: Basic, no presence bits
+    ml.push(7); // Common Info Length: length field + MLD MAC Address
+    ml.extend_from_slice(mld_mac); // MLD MAC Address
+    ext_ie(107, &ml)
+}
+
+/// 2-link MLD (Re)Association Request (PSK-SHA256). Frame addressed with link-0
+/// addresses; the ML element advertises the MLD MAC + the link-1 per-STA profile.
+pub fn build_assoc_req_mld(
+    ap_bssid: &[u8; 6],
+    sta_link0: &[u8; 6],
+    mld_mac: &[u8; 6],
+    link1_mac: &[u8; 6],
+    ssid: &[u8],
+    sc: u16,
+) -> Vec<u8> {
+    let mut v = dot11_header(
+        TYPE_MGMT,
+        SUBTYPE_ASSOC_REQ,
+        FC_TODS,
+        ap_bssid,
+        sta_link0,
+        ap_bssid,
+        sc,
+    );
+    v.extend_from_slice(&[0x30, 0x04]); // Capability Info (0x0430)
+    v.extend_from_slice(&[0x05, 0x00]); // Listen interval
+    v.extend_from_slice(&ie(0, ssid));
+    v.extend_from_slice(&AMLD_RATES);
+    v.extend_from_slice(&AMLD_EXTRATES);
+    v.extend_from_slice(&AMLD_RSN_SAE);
+    v.extend_from_slice(&AMLD_HTCAP);
+    v.extend_from_slice(&AMLD_EXTCAP);
+    v.extend_from_slice(&AMLD_HECAP);
+    v.extend_from_slice(&multi_link_sta(mld_mac, link1_mac));
+    v.extend_from_slice(&AMLD_EHTCAP);
+    v.extend_from_slice(&RSNXE_H2E); // SAE H2E capability (RSNXE)
+    v.extend_from_slice(&AMLD_WMM);
+    v
+}

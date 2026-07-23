@@ -6,7 +6,7 @@ rm -f "$R"
 # Nuke ALL leftover hwsim consumers from 11 days of churn (wlantest/wmediumd/etc)
 pkill -9 -f "[b]arely-ap --mode" 2>/dev/null
 pkill -9 wlantest 2>/dev/null; pkill -9 wmediumd 2>/dev/null
-pkill -9 -f "hostap-hwsim" 2>/dev/null
+pkill -9 -x wpa_supplicant 2>/dev/null
 for ns in $(ip -o netns list 2>/dev/null | awk -F'[ :]' '{print $1}'); do
   case $ns in interopcli|saecli|pskcli|probe|probe2|probe3|cli|sae|stamx|mldv) ip netns del "$ns" 2>/dev/null;; esac
 done

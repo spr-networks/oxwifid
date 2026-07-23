@@ -1,9 +1,19 @@
 # hwsim interop harness
 
-Scripts for testing `barely-ap` / `barely-cli` against real `hostapd` /
+Scripts for testing `barely-ap` / `barely-cli` against a reference AP and
 `wpa_supplicant` on a Linux box with `mac80211_hwsim` (no real radio needed).
 These were used to validate the full interop matrix; keep them in-tree so the
 setup isn't lost (they previously lived in `/tmp` and were wiped on reboot).
+
+The repository does not embed vendor-specific executable names or source-tree
+paths. Supply the installed test binaries through the environment:
+
+```sh
+export REFERENCE_AP=/path/to/reference-ap-binary
+export REFERENCE_AP_CLI=/path/to/reference-ap-control-client
+export WPAS=/path/to/wpa_supplicant
+export WCLI=/path/to/wpa_cli
+```
 
 ## Workflow
 
@@ -47,11 +57,11 @@ kernel-offload AP (`--mode netlink`) uses a real AP vif, which ACKs natively.
 
 | script            | direction                                   | covers |
 |-------------------|---------------------------------------------|--------|
-| `scenA.sh`        | Rust `barely-cli` station → real `hostapd`  | wpa2/wpa3/owe × 2.4/5 GHz |
+| `scenA.sh`        | Rust `barely-cli` station → reference AP  | wpa2/wpa3/owe × 2.4/5 GHz |
 | `scenB.sh`        | real `wpa_supplicant` → Rust `barely-ap`    | wpa2/wpa3/owe × 2.4/5 GHz |
 | `scenMulti.sh`    | several `wpa_supplicant` clients → `barely-ap` | multi-client |
 | `scenNan.sh`      | NAN USD vs `wpa_supplicant` (v2.12)         | NAN publish/subscribe/followup |
-| `scen6g.sh`       | 6 GHz attempt (needs hostapd ≥ 2.11 for LPI)| 6 GHz NO-IR / LPI |
+| `scen6g.sh`       | 6 GHz attempt (needs reference AP ≥ 2.11 for LPI)| 6 GHz NO-IR / LPI |
 | `scen_nl_full.sh` | `--mode netlink` kernel-offload AP → `wpa_supplicant` | nl80211 START_AP path |
 | `scen_nl_multi.sh`| `--mode netlink` AP → 2 `wpa_supplicant`    | netlink multi-station |
 | `scen_nl_5.sh`    | `--mode netlink` AP → 5 `wpa_supplicant`    | concurrent scale (5 STAs) |
@@ -70,7 +80,7 @@ handshake is **verified end-to-end** against `wpa_supplicant`
 - `START_AP` → the kernel beacons the AP (the old netlink mode emitted 0 beacons).
 - Userspace MLME: **auth** and **assoc** complete.
 - Two-step station add: `NEW_STATION` (unassoc, `set=0 mask=0xa0`) →
-  `SET_STATION` (assoc) — hostapd's "UNASSOC_STA workaround" for drivers
+  `SET_STATION` (assoc) — reference AP's "UNASSOC_STA workaround" for drivers
   without `FULL_AP_CLIENT_STATE`.
 - 4-way EAPOL over the nl80211 control port → `NEW_KEY` (PTK + GTK) →
   `SET_STATION` authorize.
@@ -93,8 +103,8 @@ ping is 3/3. ARP works regardless (not IP-firewalled).
 
 ## 6 GHz notes
 
-The system `hostapd` 2.10 refuses 6 GHz channels ("NO-IR"); 2.11+ has the
-indoor-LPI beaconing logic. Build hostapd from `hostap` with
+Some older reference AP builds refuse 6 GHz channels ("NO-IR"); newer builds
+have indoor-LPI beaconing logic. Build the reference implementation with
 `CONFIG_IEEE80211AX/AC/BE`, `CONFIG_SAE`, `CONFIG_OWE` to test 6 GHz (which is
 WPA3-only). The US regdb rule `5925-7125 @ NO-OUTDOOR, PASSIVE-SCAN, 12 dBm`
 allows indoor LPI, so no custom regdb is required.

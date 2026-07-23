@@ -1,4 +1,4 @@
-//! GTK rekeying via the Group Key Handshake (hostapd `wpa_group_rekey`).
+//! GTK rekeying via the Group Key Handshake (reference AP `wpa_group_rekey`).
 
 use barely_ap::ap::Ap;
 use barely_ap::client::Client;
@@ -99,7 +99,7 @@ fn protected_group_key_handshake_stays_on_the_controlled_port() {
     let sta_mac = sta.mac;
     let tk = ap.station_tk(&sta_mac).expect("installed pairwise key");
 
-    // Real hostapd sends the post-association Group-Key EAPOL exchange inside
+    // Real reference AP sends the post-association Group-Key EAPOL exchange inside
     // CCMP-protected data. Re-wrap the Rust AP's canonical Message 1 that way.
     let message_1 = ap.rekey_gtk().remove(0);
     let eapol = dot11::strip_radiotap(&message_1)
@@ -170,7 +170,7 @@ fn ap_processes_group_msg2_and_coalesces_rekeys() {
     let msgs = ap.rekey_gtk();
     assert_eq!(msgs.len(), 1);
     // A second rekey while the first is still in flight is coalesced to nothing
-    // (hostapd waits for GKeyDoneStations to reach 0 before starting another).
+    // (reference AP waits for GKeyDoneStations to reach 0 before starting another).
     assert!(
         ap.rekey_gtk().is_empty(),
         "rekey coalesces while one is in flight"

@@ -1,13 +1,13 @@
 //! WPA3-capable nl80211 (generic netlink) transport.
 //!
-//! This is an alternative to the [`crate::raw_frames::af_packet`] monitor-mode
+//! This is an alternative to the `raw_frames::af_packet` monitor-mode
 //! socket: instead of a raw `AF_PACKET` socket it talks to the kernel's
-//! `cfg80211`/`mac80211` over generic netlink (the same interface hostapd uses).
+//! `cfg80211`/`mac80211` over generic netlink (the same interface reference AP uses).
 //! It configures the radio (interface type + channel) and injects/receives
 //! management frames via `NL80211_CMD_FRAME`.
 //!
 //! The message-encoding layer ([`msg`]) is platform independent and unit
-//! tested; the socket/[`Link`] layer is Linux-only.
+//! tested; the socket/[`crate::raw_frames::Link`] layer is Linux-only.
 //!
 //! Scope: management-frame TX/RX + radio setup. Because `NL80211_CMD_FRAME`
 //! only carries management frames, userspace-encrypted CCMP **data** frames
@@ -110,7 +110,7 @@ pub const NL80211_ATTR_EHT_CAPABILITY: u16 = 310;
 pub const NL80211_ATTR_EML_CAPABILITY: u16 = 317;
 pub const NL80211_ATTR_MLD_CAPA_AND_OPS: u16 = 318;
 pub const NL80211_ATTR_IFTYPE_EXT_CAPA: u16 = 230;
-// BSS parameters hostapd submits immediately after every START_AP/SET_BEACON.
+// BSS parameters reference AP submits immediately after every START_AP/SET_BEACON.
 pub const NL80211_ATTR_BSS_CTS_PROT: u16 = 28;
 pub const NL80211_ATTR_BSS_SHORT_PREAMBLE: u16 = 29;
 pub const NL80211_ATTR_BSS_BASIC_RATES: u16 = 36;
@@ -129,7 +129,7 @@ pub const NL80211_BSS_BEACON_IES: u16 = 11;
 pub const NL80211_BSS_MLO_LINK_ID: u16 = 21;
 pub const NL80211_BSS_MLD_ADDR: u16 = 22;
 
-// NL80211_ATTR_STA_INFO nested attributes used by hostapd's STA control reply.
+// NL80211_ATTR_STA_INFO nested attributes used by reference AP's STA control reply.
 pub const NL80211_STA_INFO_SIGNAL: u16 = 7;
 pub const NL80211_STA_INFO_TX_BITRATE: u16 = 8;
 pub const NL80211_STA_INFO_SIGNAL_AVG: u16 = 13;
@@ -138,7 +138,7 @@ pub const NL80211_RATE_INFO_BITRATE: u16 = 1;
 pub const NL80211_RATE_INFO_BITRATE32: u16 = 5;
 
 // Nested NL80211_ATTR_WIPHY_BANDS attributes. These are the radio capabilities
-// hostapd uses to construct HT/VHT/HE/EHT capability elements; advertising the
+// reference AP uses to construct HT/VHT/HE/EHT capability elements; advertising the
 // driver's bytes avoids internally inconsistent, synthetic beacon capabilities.
 pub const NL80211_BAND_ATTR_HT_MCS_SET: u16 = 3;
 pub const NL80211_BAND_ATTR_HT_CAPA: u16 = 4;
@@ -205,7 +205,7 @@ pub const NL80211_IFTYPE_AP: u32 = 3;
 pub const NL80211_IFTYPE_AP_VLAN: u32 = 4;
 pub const NL80211_IFTYPE_MONITOR: u32 = 6;
 
-/// hostapd allocates per-station VIF ids above the 802.1Q VLAN range. With
+/// reference AP allocates per-station VIF ids above the 802.1Q VLAN range. With
 /// `MAX_VLAN_ID` 4094, its first dynamic id is 4096.
 pub const PER_STA_VLAN_ID_START: u32 = 4096;
 
@@ -214,6 +214,9 @@ pub const NL80211_AUTHTYPE_OPEN_SYSTEM: u32 = 0;
 pub const NL80211_AUTHTYPE_SAE: u32 = 4;
 pub const NL80211_WPA_VERSION_2: u32 = 2;
 pub const WLAN_CIPHER_SUITE_CCMP: u32 = 0x000f_ac04;
+pub const WLAN_CIPHER_SUITE_GCMP: u32 = 0x000f_ac08;
+pub const WLAN_CIPHER_SUITE_GCMP_256: u32 = 0x000f_ac09;
+pub const WLAN_CIPHER_SUITE_CCMP_256: u32 = 0x000f_ac0a;
 pub const WLAN_CIPHER_SUITE_BIP_CMAC_128: u32 = 0x000f_ac06;
 pub const WLAN_AKM_SUITE_PSK: u32 = 0x000f_ac02;
 pub const WLAN_AKM_SUITE_SAE: u32 = 0x000f_ac08;
@@ -229,7 +232,7 @@ pub const NL80211_STA_FLAG_AUTHENTICATED: u32 = 5;
 pub const NL80211_STA_FLAG_ASSOCIATED: u32 = 7;
 
 /// Management frame-control type+subtype values to register for, matching
-/// hostapd's AP MLME subscription. Deauth and disassoc are essential both for
+/// reference AP's AP MLME subscription. Deauth and disassoc are essential both for
 /// PMF validation and for promptly removing a station that leaves.
 pub const REGISTER_SUBTYPES: [u16; 6] = [
     0x0040, // probe request  (subtype 4)
@@ -282,14 +285,14 @@ pub(crate) fn default_multicast_key_attr(idx: u8) -> msg::Attr {
     )
 }
 
-/// Return hostapd's lowest-free per-station VIF id.
+/// Return reference AP's lowest-free per-station VIF id.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn first_free_per_sta_vlan_id(used: impl IntoIterator<Item = u32>) -> Option<u32> {
     let used: std::collections::HashSet<u32> = used.into_iter().collect();
     (PER_STA_VLAN_ID_START..=u32::MAX).find(|id| !used.contains(id))
 }
 
-/// Expand hostapd's wildcard `<base>.#` convention for a per-station VIF.
+/// Expand reference AP's wildcard `<base>.#` convention for a per-station VIF.
 /// Linux interface names are limited to IFNAMSIZ-1 (15) bytes.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn per_sta_vif_name(base: &str, vlan_id: u32) -> Result<String, String> {
@@ -338,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn per_sta_vif_ids_and_names_match_hostapd() {
+    fn per_sta_vif_ids_and_names_match_reference_ap() {
         assert_eq!(first_free_per_sta_vlan_id([]), Some(4096));
         assert_eq!(first_free_per_sta_vlan_id([4096, 4098, 4100]), Some(4097));
         assert_eq!(per_sta_vif_name("wlan3", 4096).unwrap(), "wlan3.4096");

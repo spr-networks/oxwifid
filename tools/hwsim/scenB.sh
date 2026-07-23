@@ -3,7 +3,8 @@ RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pw
 # scenB.sh <wpa2|wpa3|owe> <chan> : real wpa_supplicant -> Rust barely-ap
 SEC=${1:-wpa2}; CHAN=${2:-1}
 FREQ=2412; [ "$CHAN" -ge 36 ] && FREQ=5180
-sudo pkill -f hostapd 2>/dev/null; sudo pkill -f /tmp/barely 2>/dev/null; sudo pkill -f wpa_supplicant 2>/dev/null
+[ -z "${REFERENCE_AP:-}" ] || sudo pkill -x "$(basename "$REFERENCE_AP")" 2>/dev/null
+sudo pkill -f /tmp/barely 2>/dev/null; sudo pkill -f wpa_supplicant 2>/dev/null
 sudo systemctl stop wpa_supplicant NetworkManager 2>/dev/null
 sudo iw reg set US 2>/dev/null
 sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hwsim radios=2; sleep 3; sudo rfkill unblock all

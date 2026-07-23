@@ -1,15 +1,6 @@
 # barely-ap (Rust)
 
-A Rust port of [`barely-ap`](./barely-ap) — a minimal IEEE 802.11 Access Point
-that speaks **WPA2-PSK / CCMP-128**. It implements just enough of the protocol
-to beacon, answer probes, run the full 4-way handshake, and carry encrypted data
-to and from associated stations.
-
-This is a faithful, byte-for-byte port of the Python/Scapy reference: every
-frame the Rust AP emits is verified equal to what the original `ap.py` produces,
-and the resulting AP has been driven end-to-end by the **unmodified reference
-Python station** (`client.py`) — completing a real handshake and a CCMP-encrypted
-ping round-trip.
+Auto-coded (vibe) wifi 7 userland access point for linux.
 
 > This remains experimental software. Its WPA state machines include replay,
 > cache-lifetime, anti-clogging, and key-erasure hardening, but it has not had
@@ -22,10 +13,6 @@ cargo build --release      # binary at target/release/barely-ap
 cargo test                 # full test suite (see "Testing" below)
 ```
 
-The only system dependency is a Rust toolchain. The cross-language tests
-additionally use `python3` with `scapy` installed; they skip gracefully if those
-are missing.
-
 ## Running
 
 Configuration comes from a JSON config file (`--config`), with CLI flags as
@@ -35,13 +22,22 @@ overrides:
 barely-ap --config barely-ap.json
 barely-ap --config FILE.json [--ssid NAME] [--mac AA:BB:CC:DD:EE:FF]
           [--channel N] [--ip 10.10.10.1] [--mode stdio|iface|netlink] [--iface wlanN]
+          [--cipher ccmp-128|gcmp-128|ccmp-256|gcmp-256]
           [--band 2.4|5|6] [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--per-sta-vif]
 ```
 
 The config file (see `barely-ap.example.json`) sets `ssid`, `passphrase`,
-`key_mgmt` (`psk`/`sae`/`sae-transition`/`owe`), `channel`, `interface`, `mode`,
+`key_mgmt` (`psk`/`sae`/`sae-transition`/`owe`), `pairwise_cipher`
+(`ccmp-128`/`gcmp-128`/`ccmp-256`/`gcmp-256`), `channel`, `interface`, `mode`,
 `mac`, `ip`, explicit `band` (`2.4`, `5`, or `6`), and the feature toggles
 `ocv`, `btm`, `rnr`, `per_sta_vif`.
+
+For the AP, non-default pairwise ciphers use Linux/mac80211
+authenticated-encryption offload and therefore require `mode: "netlink"`.
+`barely-cli` also implements WPA2 single-link CCMP/GCMP protection in userspace
+(GCMP uses RustCrypto `aes-gcm`) for reverse-direction interop. The group cipher
+remains CCMP-128. The 256-bit suites derive and install a 32-byte pairwise TK.
+
 Unknown keys and type mismatches are hard errors. See [`src/config.rs`](src/config.rs).
 Passwords are accepted only through the JSON `passphrase` or `psk_file`
 settings; command-line password arguments are deliberately rejected because
@@ -51,7 +47,7 @@ For an 802.11be MLD, `mld_default_links: [1]` advertises that every QoS TID
 uses Link ID 1 in both directions. The array may contain multiple configured
 Link IDs (for example `[0, 1]`); omitting it leaves link selection to the client
 and driver. This is the all-TIDs/same-link-set advertised-TTLM form supported by
-current mac80211 and hostapd.
+current mac80211 and reference AP.
 
 ### stdio mode (default, all platforms)
 
@@ -94,7 +90,7 @@ directly from SPR JSON; command-line passwords are rejected.
 
 The production loop validates SSID/BSSID/RSN/AKM/PMF before authenticating,
 supports WPA2-PSK, WPA-PSK-SHA256, WPA3-SAE, and OWE, and handles protected
-hostapd group rekeys. Native nl80211 scanning matches every enabled SPR network,
+reference AP group rekeys. Native nl80211 scanning matches every enabled SPR network,
 honors optional BSSID pins and highest `Priority`, uses directed probes for
 manually entered/hidden SSIDs, and chooses the strongest compatible BSS within
 that priority. While disconnected it rescans and retunes every ten seconds, so
@@ -115,17 +111,22 @@ continues to act only after the authenticated `CONNECTED` state file appears.
 
 ## Architecture
 
-| Module        | Responsibility                                                        |
-|---------------|-----------------------------------------------------------------------|
-| `crypto`      | CCM\* (CCMP), AES-128, AES key-wrap, PBKDF2, PRF-512, HMAC-SHA1        |
-| `sae`         | WPA3-SAE (Dragonfly) with Hash-to-Element, ECC group 19 (P-256)       |
-| `dot11`       | 802.11 frame build/parse: beacon, probe/auth/assoc, EAPOL, SAE, CCMP   |
-| `ap`          | The AP state machine: probe/auth/assoc, 4-way handshake, encrypt/decrypt |
-| `client`      | WPA2/WPA3/OWE station state machine used by `barely-cli` and the SPR TAP uplink |
-| `fakenet`     | Minimal DHCP / ARP / ICMP responder for the AP subnet                 |
-| `raw_frames`  | `Link`/`Node` event loop + raw-frame transports (stdio, AF_PACKET monitor) |
-| `netlink`     | nl80211 (generic netlink) transport: radio setup + mgmt frame I/O (Linux) |
-| `util`        | hex / MAC helpers                                                      |
+[`ARCHITECTURE.md`](ARCHITECTURE.md). The primary protocol domains are:
+
+| Module | Responsibility |
+| --- | --- |
+| `auth` | Shared RSN/EAPOL/crypto plus dedicated `wpa2` and `wpa3` implementations |
+| `frames` | Low-level management/data frames, channel helpers, and Wi-Fi 4/5/6/7 information elements |
+| `mlo` | Multi-Link elements, association, EAPOL integration, and link-scoped keys |
+| `group_keys` | GTK/IGTK/BIGTK, BIP, and group rekey messages |
+| `roaming` | BSS Transition Management and neighbor reports |
+| `action_frames` | SA Query, TWT, WNM, and Radio Measurement action frames |
+| `structures` | Shared wire/security/PHY definitions plus the runtime-type discovery surface |
+| `ap` / `client` | AP and station state-machine orchestration |
+| `raw_frames` / `netlink` | Frame transports and Linux nl80211 integration |
+
+The former `dot11`, `crypto`, and `sae` paths remain public compatibility
+aliases. New code should use the narrow domain paths above.
 
 ### Transports (`--mode`)
 
@@ -161,6 +162,7 @@ into `tests/vectors.json`. The Rust tests assert byte-for-byte equality.
 | Test file                 | What it proves                                                                 |
 |---------------------------|--------------------------------------------------------------------------------|
 | `tests/crypto_vectors.rs` | PMK, PTK/PRF-512, CCMP encrypt/decrypt, AES key-wrap, MIC == Python            |
+| `tests/cipher_suites.rs`  | CCMP/GCMP selectors, TK/PTK sizing, EAPOL lengths, userspace crypto/tamper rejection |
 | `tests/frame_vectors.rs`  | Beacon / probe / auth / assoc / EAPOL m1+m3 / CCMP data == scapy, and parsers  |
 | `tests/ap_handshake.rs`   | The state machine reproduces `ap.py`'s handshake frames exactly; bad-MIC deauth |
 | `tests/fakenet_vectors.rs`| DHCP/ARP/ICMP replies (built from scapy requests) are well-formed w/ checksums |
@@ -261,15 +263,15 @@ independent implementation:
   tears down only on a valid CCMP-protected deauth. A WPA2 control case shows the
   non-PMF AP restarts (no SA Query), confirming the PMF path is what changes it.
 
-## Verified against real hostapd & wpa_supplicant (mac80211_hwsim)
+## Verified against real reference AP & wpa_supplicant (mac80211_hwsim)
 
 Every combination below was run on Linux with `mac80211_hwsim` radios against
-**real hostapd / wpa_supplicant v2.10**, completing the full handshake with data
+**real reference AP / wpa_supplicant v2.10**, completing the full handshake with data
 flowing (ICMP ping replies through the AP's fakenet):
 
 | direction | WPA2 | WPA3-SAE | OWE |
 |---|---|---|---|
-| Rust client → hostapd (2.4 / 5 GHz) | ✅ | ✅ | ✅ |
+| Rust client → reference AP (2.4 / 5 GHz) | ✅ | ✅ | ✅ |
 | Rust AP ← wpa_supplicant (2.4 / 5 GHz) | ✅ | ✅ | ✅ |
 
 The AP also serves **multiple simultaneous clients** (verified with two
@@ -294,11 +296,14 @@ demo's co-located managed vif worked, made channel-stable for newer kernels.
 ### nl80211 kernel-offload AP (`--mode netlink`)
 
 The netlink mode is a real nl80211 AP that offloads beaconing and data-plane
-CCMP to the kernel (`START_AP` + `NEW_KEY`), while the 4-way handshake stays in
+CCMP/GCMP to the kernel (`START_AP` + `NEW_KEY`), while the 4-way handshake stays in
 `Ap`. The full handshake is verified end-to-end against `wpa_supplicant`
-(`wpa_state=COMPLETED`): two-step station add (the hostapd "UNASSOC_STA
+(`wpa_state=COMPLETED`): two-step station add (the reference AP "UNASSOC_STA
 workaround"), 4-way over the nl80211 control port, PTK/GTK install, authorize,
-and CCMP data both directions (**ping works**, STA in a netns). See
+and authenticated data both directions (**ping works**, STA in a netns). The
+matrix explicitly covers CCMP-128, GCMP-128, CCMP-256, and GCMP-256 against
+`wpa_supplicant`; the reverse Rust-client matrix covers the same four suites
+against reference AP. See
 `tools/hwsim/README.md`.
 
 It picks the `START_AP` RSN AKM from the AP's security mode — **WPA2-PSK,
@@ -332,7 +337,7 @@ The 6 GHz / 320 MHz path uses the **WPA3-SAE netlink AP** below.
 
 Verified to scale and recover: **5 concurrent stations** all reach
 `COMPLETED`/keyed, and a **client that disconnects and rejoins** re-handshakes
-and passes data again. Reliability properties borrowed from hostapd:
+and passes data again. Reliability properties borrowed from reference AP:
 
 - **EAPOL m1/m3 retransmission + 4-way timeout** — the AP caches the m1/m3 it
   last sent and, on a tick, retransmits it if the matching m2/m4 hasn't arrived
@@ -359,13 +364,13 @@ and passes data again. Reliability properties borrowed from hostapd:
   could see still re-handshakes cleanly (otherwise the reconnect 4-way fails
   with a MIC/"wrong key" against stale state). Group key is installed once
   (BSS-wide), not per-station, so a rejoin doesn't reset the group PN.
-- **Idle reaping** (`prune_idle`, hostapd `ap_max_inactivity`) — a station that
+- **Idle reaping** (`prune_idle`, reference AP `ap_max_inactivity`) — a station that
   vanishes without deauthing is disassociated after the advertised BSS Max Idle
   period so it doesn't leak state forever.
 
 #### Per-station VIF / AP_VLAN (`--per-sta-vif`)
 
-hostapd's `per_sta_vif`: each associated station is placed in its own kernel
+reference AP's `per_sta_vif`: each associated station is placed in its own kernel
 `AP_VLAN` interface (`NEW_INTERFACE` iftype AP_VLAN → `SET_STATION` with
 `NL80211_ATTR_STA_VLAN`) and gets its **own GTK** installed on that VLAN, so a
 station cannot read broadcast/multicast addressed to another. Verified on hwsim:
@@ -400,11 +405,11 @@ plain Data both directions.
 
 #### Runtime control interface (`--ctrl PATH` / `ctrl_path`)
 
-A hostapd-style control socket (Unix datagram) for live management + monitoring
+A reference AP-style control socket (Unix datagram) for live management + monitoring
 of the netlink AP. Clients send text commands and get replies; `ATTACH`
 subscribes to the event stream. Commands: `PING`, `STATUS` (ssid / channel /
 station counts), `STA-DUMP`, `DEAUTH <mac>` (admin kick), `FAILURES` (dump the
-intrusion log), `ATTACH`/`DETACH`. The AP emits hostapd-style events —
+intrusion log), `ATTACH`/`DETACH`. The AP emits reference AP-style events —
 `AP-STA-CONNECTED <mac>` (after a verified 4-way), `AP-STA-DISCONNECTED <mac>
 reason=<n>`, `AP-STA-AUTH-FAILED <mac> kind=<k> count=<n>` — to the log in every
 mode and to attached clients on the socket. Verified on hwsim: a `wpa_supplicant`
@@ -438,7 +443,7 @@ userspace. `chandef_is_dfs` and `fallback_channel` are unit-tested.
 
 Two pieces are deliberately box-gated and not yet done: (1) the live
 `RADAR_DETECT` round-trip — the test radio returned `EOPNOTSUPP` (driver-dependent;
-needs an strace-diff against hostapd to confirm message vs. driver support); and
+needs an strace-diff against reference AP to confirm message vs. driver support); and
 (2) an *in-process* channel switch on radar (vs. the current vacate-and-exit),
 which would restructure the verified beaconing loop and is only worth doing once
 the CAC itself is confirmed on hardware.
@@ -460,11 +465,11 @@ AP for out-of-band discovery — is implemented and verified on air.
 #### Enabling 6 GHz on a signed-regdb kernel
 
 The test kernel sets `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y` and every regdb
-country flags 6 GHz `NO-IR` for AP mode (hostapd refuses it; hostap's own hwsim
+country flags 6 GHz `NO-IR` for AP mode (reference AP refuses it; reference implementation's own hwsim
 tests `HwsimSkip` 6 GHz). For testing on the *virtual* hwsim radios, the small
 reversible kernel module in `tools/hwsim/hwsim6g/` clears the `NO-IR` flag on
 each hwsim wiphy's 6 GHz channels (`insmod hwsim6g.ko`; reset by reloading
-`mac80211_hwsim`). With it loaded, both hostapd **and** this AP beacon on 6 GHz.
+`mac80211_hwsim`). With it loaded, both reference AP **and** this AP beacon on 6 GHz.
 The full SAE handshake on 6 GHz additionally needs an ACK source for the raw
 monitor-injection path (IBSS/mesh aren't permitted on 6 GHz) — i.e. the
 nl80211 kernel-offload AP extended to SAE; the beacon/HE layer above is verified.
@@ -473,7 +478,7 @@ Remaining limits: group 19 only (not 20/21/FFC). Full MLD multi-link operation
 (per-link profiles, multi-link (re)association and key derivation) is a larger
 effort layered on the elements above.
 
-## Standard AP/STA features (hostapd-style)
+## Standard AP/STA features (reference AP-style)
 
 Beyond the handshakes, these standard features are implemented and tested:
 
@@ -489,11 +494,6 @@ Beyond the handshakes, these standard features are implemented and tested:
 | Transition mode | mixed WPA2-PSK + WPA3-SAE RSN; accept both | `tests/sae_handshake.rs` |
 | BSS Max Idle / inactivity | advertise max-idle; disassociate idle STAs | `tests/sae_handshake.rs` |
 | Beacon Protection | BIGTK delivery + BIP-protected beacons (`beacon_prot`) | `tests/sae_handshake.rs` |
-
-## More standard features (second batch)
-
-| Feature | What | Test |
-|---|---|---|
 | 802.11ac VHT | VHT Capabilities + Operation (5 GHz) | `tests/frame_vectors.rs` |
 | Extended Capabilities | BTM + Beacon Protection bits | `tests/frame_vectors.rs` |
 | Supported Operating Classes | current operating class element | `tests/frame_vectors.rs` |

@@ -1,5 +1,5 @@
 //! Station-side security regressions. These cover the clean, hook-free parts of
-//! the hostap/wpa_supplicant adversarial model from the supplicant's side.
+//! the reference implementation/wpa_supplicant adversarial model from the supplicant's side.
 
 use barely_ap::ap::Ap;
 use barely_ap::client::Client;

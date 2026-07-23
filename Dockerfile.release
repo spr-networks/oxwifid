@@ -1,0 +1,104 @@
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
+
+ARG RUST_IMAGE=docker.io/library/rust:1.97.0-alpine3.23@sha256:ca0daf101eef0c8cd1e49dfc137154a220efb8c458c85a3eacacc7dfd5d9e04c
+
+FROM ${RUST_IMAGE} AS source
+ARG TARGETARCH
+ARG SOURCE_DATE_EPOCH=0
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_NET_RETRY=3 \
+    CARGO_TARGET_DIR=/target \
+    SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    RUSTFLAGS="--remap-path-prefix=/src=/usr/src/barely-ap --remap-path-prefix=/usr/local/cargo=/cargo -C strip=symbols -C link-arg=-Wl,--build-id=none"
+WORKDIR /src
+
+RUN test "${TARGETARCH}" = "arm64"
+RUN rustc --version | grep -E '^rustc 1\.97\.0 '
+
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY configs/ configs/
+
+# Cargo.lock fixes every crate version and checksum. This networked stage runs
+# once and becomes the immutable, source-only base for both clean compiles.
+FROM source AS dependencies
+RUN cargo fetch --locked --target aarch64-unknown-linux-musl
+
+# These stages inherit the same checksum-verified crate sources but have
+# independent filesystems and target directories. The pass marker deliberately
+# gives BuildKit two distinct operations; Cargo and rustc do not consume it.
+FROM dependencies AS builder-one
+ENV REPRODUCIBLE_BUILD_PASS=one
+RUN test "${REPRODUCIBLE_BUILD_PASS}" = one && \
+    cargo build \
+      --release \
+      --locked \
+      --offline \
+      --bins \
+      --target aarch64-unknown-linux-musl
+
+FROM dependencies AS builder-two
+ENV REPRODUCIBLE_BUILD_PASS=two
+RUN test "${REPRODUCIBLE_BUILD_PASS}" = two && \
+    cargo build \
+      --release \
+      --locked \
+      --offline \
+      --bins \
+      --target aarch64-unknown-linux-musl
+
+FROM builder-one AS release-one
+ARG VERSION
+ARG SOURCE_DATE_EPOCH=0
+RUN set -eux; \
+    case "${VERSION}" in \
+      ''|*[!0-9.]*) echo "VERSION must be numeric SemVer" >&2; exit 1;; \
+    esac; \
+    package="barely-ap-v${VERSION}-aarch64-unknown-linux-musl"; \
+    mkdir -p "/package/${package}" /out; \
+    install -m 0755 /target/aarch64-unknown-linux-musl/release/barely-ap "/package/${package}/barely-ap"; \
+    install -m 0755 /target/aarch64-unknown-linux-musl/release/barely-cli "/package/${package}/barely-cli"; \
+    install -m 0755 /target/aarch64-unknown-linux-musl/release/barely-nan "/package/${package}/barely-nan"; \
+    touch -d "@${SOURCE_DATE_EPOCH}" "/package/${package}" "/package/${package}/barely-ap" "/package/${package}/barely-cli" "/package/${package}/barely-nan"; \
+    cd /package; \
+    tar -czf "/out/${package}.tar.gz" \
+      "${package}/barely-ap" \
+      "${package}/barely-cli" \
+      "${package}/barely-nan"; \
+    cd /out; \
+    sha256sum "${package}.tar.gz" > SHA256SUMS
+
+FROM builder-two AS release-two
+ARG VERSION
+ARG SOURCE_DATE_EPOCH=0
+RUN set -eux; \
+    case "${VERSION}" in \
+      ''|*[!0-9.]*) echo "VERSION must be numeric SemVer" >&2; exit 1;; \
+    esac; \
+    package="barely-ap-v${VERSION}-aarch64-unknown-linux-musl"; \
+    mkdir -p "/package/${package}" /out; \
+    install -m 0755 /target/aarch64-unknown-linux-musl/release/barely-ap "/package/${package}/barely-ap"; \
+    install -m 0755 /target/aarch64-unknown-linux-musl/release/barely-cli "/package/${package}/barely-cli"; \
+    install -m 0755 /target/aarch64-unknown-linux-musl/release/barely-nan "/package/${package}/barely-nan"; \
+    touch -d "@${SOURCE_DATE_EPOCH}" "/package/${package}" "/package/${package}/barely-ap" "/package/${package}/barely-cli" "/package/${package}/barely-nan"; \
+    cd /package; \
+    tar -czf "/out/${package}.tar.gz" \
+      "${package}/barely-ap" \
+      "${package}/barely-cli" \
+      "${package}/barely-nan"; \
+    cd /out; \
+    sha256sum "${package}.tar.gz" > SHA256SUMS
+
+FROM source AS verified
+ARG VERSION
+COPY --from=release-one /out/ /verify/one/
+COPY --from=release-two /out/ /verify/two/
+RUN set -eux; \
+    asset="barely-ap-v${VERSION}-aarch64-unknown-linux-musl.tar.gz"; \
+    cmp "/verify/one/${asset}" "/verify/two/${asset}"; \
+    cmp /verify/one/SHA256SUMS /verify/two/SHA256SUMS; \
+    mkdir /out; \
+    cp "/verify/one/${asset}" /verify/one/SHA256SUMS /out/
+
+FROM scratch AS artifact
+COPY --from=verified /out/ /

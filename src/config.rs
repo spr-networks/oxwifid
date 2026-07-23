@@ -20,6 +20,7 @@
 //! ```
 
 use crate::ap::{Ap, MldLink};
+use crate::structures::DataCipher;
 use crate::util::{mac_to_bytes, try_mac_to_bytes};
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
@@ -67,6 +68,8 @@ pub struct Config {
     pub ssid: String,
     pub passphrase: String,
     pub key_mgmt: KeyMgmt,
+    /// RSN pairwise cipher. Group traffic remains CCMP-128.
+    pub pairwise_cipher: DataCipher,
     /// 2-letter regulatory country code for the beacon Country IE. The actual
     /// channel regulatory domain is left to the system (e.g. `iw reg set`).
     pub country: [u8; 2],
@@ -76,7 +79,7 @@ pub struct Config {
     pub width: u16,
     /// PHY generation advertised on 2.4/5 GHz: `Vht` (ac), `He` (ax), `Eht` (be).
     /// 6 GHz is always HE+. Default `Vht`.
-    pub phy: crate::dot11::PhyMode,
+    pub phy: crate::frames::PhyMode,
     pub ip: [u8; 4],
     /// Transport: `stdio`, `iface` (raw monitor) or `netlink` (kernel offload).
     pub mode: String,
@@ -105,7 +108,7 @@ pub struct Config {
     /// Advertised TID-to-link mapping shared by all eight QoS TIDs, expressed
     /// as the configured MLD Link IDs that may carry traffic. This is the
     /// interoperable advertised-TTLM form supported by current mac80211 and
-    /// hostapd; `None` leaves link selection to the peer/driver.
+    /// reference AP; `None` leaves link selection to the peer/driver.
     pub mld_default_links: Option<Vec<u8>>,
     /// One authoritative credential file. RustAP accepts SPR's WPA form
     /// (`MAC passphrase`, all-zero wildcard) and SAE form
@@ -115,23 +118,23 @@ pub struct Config {
     /// WMM (Wi-Fi Multimedia / WME QoS): advertise the WMM parameter element and
     /// exchange QoS Data frames with stations that negotiate it. Default on.
     pub wmm: bool,
-    /// Path for the runtime control socket (hostapd-style `ctrl_interface`).
+    /// Path for the runtime control socket (reference AP-style `ctrl_interface`).
     /// `None` disables it. netlink mode only.
     pub ctrl_path: Option<String>,
     /// SPR API Unix socket. When set, station events are delivered directly as
-    /// HTTP PUT requests without spawning hostapd_cli, an action script, or curl.
+    /// HTTP PUT requests without spawning reference AP control client, an action script, or curl.
     pub spr_api_socket: Option<String>,
-    /// SPR's hostap DHCP/XDP helper. When set alongside `spr_api_socket`, the
+    /// SPR's reference implementation DHCP/XDP helper. When set alongside `spr_api_socket`, the
     /// event worker invokes `add|remove <AP_VLAN iface> <station MAC>` before
     /// reporting the corresponding event to the SPR API.
     pub spr_dhcp_helper: Option<String>,
     /// Additional co-hosted BSSes (extra SSIDs) on the same radio. Each gets its
     /// own netdev/BSSID and 4-way. netlink mode only.
     pub bss: Vec<BssConfig>,
-    /// GTK rekey period in seconds (hostapd `wpa_group_rekey`, default 600; 0
+    /// GTK rekey period in seconds (reference AP `wpa_group_rekey`, default 600; 0
     /// disables periodic group rekeying).
     pub group_rekey: u64,
-    /// Rekey the GTK when an authorized station leaves (hostapd
+    /// Rekey the GTK when an authorized station leaves (reference AP
     /// `wpa_strict_rekey`, default on).
     pub strict_rekey: bool,
 }
@@ -177,11 +180,12 @@ impl Default for Config {
             // supply `passphrase` or an authoritative `psk_file`.
             passphrase: String::new(),
             key_mgmt: KeyMgmt::Psk,
+            pairwise_cipher: DataCipher::Ccmp128,
             country: *b"US",
             mac: mac_to_bytes("02:00:00:00:00:00"),
             channel: 1,
             width: 20,
-            phy: crate::dot11::PhyMode::Vht,
+            phy: crate::frames::PhyMode::Vht,
             ip: [10, 10, 10, 1],
             mode: "stdio".to_string(),
             iface: "wlan0".to_string(),
@@ -201,7 +205,7 @@ impl Default for Config {
             spr_api_socket: None,
             // wifid installs this helper at the container root. It is only used
             // when `spr_api_socket` enables the SPR event worker.
-            spr_dhcp_helper: Some("/hostap_dhcp_helper".to_string()),
+            spr_dhcp_helper: Some("/spr_dhcp_helper".to_string()),
             bss: Vec::new(),
             group_rekey: 600,
             strict_rekey: true,
@@ -262,6 +266,9 @@ impl Config {
                 self.passphrase = as_str(key, val)?.to_string()
             }
             "key_mgmt" | "security" => self.key_mgmt = parse_key_mgmt(as_str(key, val)?)?,
+            "pairwise_cipher" | "cipher" | "rsn_pairwise" => {
+                self.pairwise_cipher = parse_data_cipher(as_str(key, val)?)?
+            }
             "country" | "country_code" => self.country = parse_country(as_str(key, val)?)?,
             "channel" => self.channel = as_u8(key, val)?,
             "width" | "channel_width" => {
@@ -367,6 +374,15 @@ impl Config {
         // not permitted on 6 GHz in any mode.
         if self.band.is_6ghz() && self.key_mgmt == KeyMgmt::Psk {
             return Err("6 GHz mandates WPA3/SAE or OWE, not WPA2-PSK".to_string());
+        }
+        if self.pairwise_cipher != DataCipher::Ccmp128 && self.mode != "netlink" {
+            return Err(format!(
+                "{} requires Linux netlink mode (kernel CCMP/GCMP offload)",
+                self.pairwise_cipher.config_name()
+            ));
+        }
+        if self.pairwise_cipher != DataCipher::Ccmp128 && self.mld {
+            return Err("non-default pairwise ciphers are not yet supported with MLO".to_string());
         }
         // Channel width.
         if !matches!(self.width, 20 | 40 | 80 | 160 | 320) {
@@ -509,7 +525,7 @@ impl Config {
     /// `band: 6` likewise forces SAE because 6 GHz mandates WPA3. OWE is already
     /// PMF-protected and is left as-is.
     pub fn effective_key_mgmt(&self) -> KeyMgmt {
-        if self.phy == crate::dot11::PhyMode::Eht
+        if self.phy == crate::frames::PhyMode::Eht
             && matches!(self.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition)
         {
             KeyMgmt::Sae
@@ -555,6 +571,7 @@ impl Config {
             }
         }
         ap.set_phy(self.phy);
+        ap.set_pairwise_cipher(self.pairwise_cipher);
         ap.set_wmm(self.wmm);
         ap.set_group_rekey(self.group_rekey);
         ap.set_strict_rekey(self.strict_rekey);
@@ -628,12 +645,13 @@ impl Config {
         ap.set_country(self.country);
         ap.set_width(self.width);
         ap.set_phy(self.phy);
+        ap.set_pairwise_cipher(self.pairwise_cipher);
         ap.set_wmm(self.wmm);
         ap.set_group_rekey(self.group_rekey);
         ap.set_strict_rekey(self.strict_rekey);
         // EHT mandates PMF for every BSS on the radio, the same way `band: 6` does
         // below — upgrade a non-MFPR mode to SAE (see `effective_key_mgmt`).
-        let km = if self.phy == crate::dot11::PhyMode::Eht
+        let km = if self.phy == crate::frames::PhyMode::Eht
             && matches!(bss.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition)
         {
             KeyMgmt::Sae
@@ -843,8 +861,8 @@ pub fn parse_band_str(s: &str) -> Result<Band, String> {
     }
 }
 
-pub fn parse_phy(s: &str) -> Result<crate::dot11::PhyMode, String> {
-    use crate::dot11::PhyMode;
+pub fn parse_phy(s: &str) -> Result<crate::frames::PhyMode, String> {
+    use crate::frames::PhyMode;
     match s.to_ascii_lowercase().as_str() {
         "n" | "ht" => Ok(PhyMode::Ht),
         "ac" | "vht" => Ok(PhyMode::Vht),
@@ -862,6 +880,18 @@ fn parse_key_mgmt(s: &str) -> Result<KeyMgmt, String> {
         "owe" => Ok(KeyMgmt::Owe),
         _ => Err(format!(
             "unknown key_mgmt {s:?} (psk|sae|sae-transition|owe)"
+        )),
+    }
+}
+
+pub fn parse_data_cipher(s: &str) -> Result<DataCipher, String> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "ccmp" | "ccmp-128" | "aes-ccmp" | "aes-ccmp-128" => Ok(DataCipher::Ccmp128),
+        "gcmp" | "gcmp-128" | "aes-gcmp" | "aes-gcmp-128" => Ok(DataCipher::Gcmp128),
+        "ccmp-256" | "aes-ccmp-256" | "aes256-ccmp" => Ok(DataCipher::Ccmp256),
+        "gcmp-256" | "aes-gcmp-256" | "aes256-gcmp" => Ok(DataCipher::Gcmp256),
+        _ => Err(format!(
+            "unknown pairwise cipher {s:?} (ccmp-128|gcmp-128|ccmp-256|gcmp-256)"
         )),
     }
 }
@@ -905,7 +935,7 @@ fn as_u8(key: &str, val: &Value) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dot11;
+    use crate::frames as dot11;
 
     #[test]
     fn defaults_are_wpa2_psk() {
@@ -1127,7 +1157,7 @@ mod tests {
 
     #[test]
     fn eht_mandates_pmf_upgrading_non_mfpr_modes_to_sae() {
-        use crate::dot11::{PhyMode, SecurityMode};
+        use crate::frames::{PhyMode, SecurityMode};
         // 802.11be (EHT) requires PMF: a non-MFPR mode (WPA2-PSK / SAE-transition)
         // is upgraded to WPA3-SAE, so the AP advertises an MFPR|MFPC RSN that a
         // spec-compliant Wi-Fi 7 client will accept.
@@ -1237,7 +1267,7 @@ mod tests {
             "ocv": true,
             "per_sta_vif": true,
             "spr_api_socket": "/state/wifi/apisock",
-            "spr_dhcp_helper": "/hostap_dhcp_helper"
+            "spr_dhcp_helper": "/spr_dhcp_helper"
         }"#;
         let c = Config::from_json(json).unwrap();
         assert_eq!(c.ssid, "lab");
@@ -1252,7 +1282,7 @@ mod tests {
         assert!(c.ocv);
         assert!(c.per_sta_vif);
         assert_eq!(c.spr_api_socket.as_deref(), Some("/state/wifi/apisock"));
-        assert_eq!(c.spr_dhcp_helper.as_deref(), Some("/hostap_dhcp_helper"));
+        assert_eq!(c.spr_dhcp_helper.as_deref(), Some("/spr_dhcp_helper"));
     }
 
     #[test]

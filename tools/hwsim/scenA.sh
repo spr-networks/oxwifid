@@ -1,10 +1,12 @@
 #!/bin/bash
 RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
-# scenA.sh <wpa2|wpa3|owe> <chan> : Rust barely-cli station -> real hostapd AP
+# scenA.sh <wpa2|wpa3|owe> <chan> : Rust barely-cli station -> reference AP
+REFERENCE_AP=${REFERENCE_AP:?set REFERENCE_AP to the reference AP binary}
+REFERENCE_AP_PROCESS=$(basename "$REFERENCE_AP")
 SEC=${1:-wpa2}; CHAN=${2:-1}
 FREQ=2412; HWMODE=g; EXTRA=""
 if [ "$CHAN" -ge 36 ]; then FREQ=5180; HWMODE=a; EXTRA=$'country_code=US\nieee80211d=1'; fi
-sudo pkill -f hostapd 2>/dev/null; sudo pkill -f /tmp/barely 2>/dev/null; sleep 1
+sudo pkill -x "$REFERENCE_AP_PROCESS" 2>/dev/null; sudo pkill -f /tmp/barely 2>/dev/null; sleep 1
 sudo systemctl stop wpa_supplicant NetworkManager 2>/dev/null
 sudo iw reg set US 2>/dev/null
 sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hwsim radios=2; sleep 2; sudo rfkill unblock all
@@ -27,9 +29,9 @@ $PMF
 rsn_pairwise=CCMP
 $CRED
 CFG
-sudo hostapd -t /tmp/h.conf > /tmp/h.log 2>&1 &
+sudo "$REFERENCE_AP" -t /tmp/h.conf > /tmp/h.log 2>&1 &
 sleep 3
-grep -aq AP-ENABLED /tmp/h.log || { echo "[$SEC ch$CHAN] HOSTAPD FAILED:"; grep -aiE 'error|invalid|fail|not support' /tmp/h.log | head -3; }
+grep -aq AP-ENABLED /tmp/h.log || { echo "[$SEC ch$CHAN] REFERENCE AP FAILED:"; grep -aiE 'error|invalid|fail|not support' /tmp/h.log | head -3; }
 sudo iw dev wlan1 del
 sudo iw phy $PHYB interface add ibss1 type ibss
 sudo ip link set ibss1 address 02:00:00:00:01:00
@@ -43,5 +45,5 @@ for attempt in 1 2 3; do
   grep -aq AUTHENTICATED /tmp/cli.log && break
 done
 echo "[$SEC ch$CHAN] cli:     $(grep -aoE 'AUTHENTICATED|PING_REPLY_OK' /tmp/cli.log | tr '\n' ' ')"
-echo "[$SEC ch$CHAN] hostapd: $(sudo grep -aoE 'AP-STA-CONNECTED|EAPOL-4WAY-HS-COMPLETED' /tmp/h.log | sort -u | tr '\n' ' ')"
-sudo pkill -f hostapd; sudo pkill -f /tmp/barely
+echo "[$SEC ch$CHAN] reference AP: $(sudo grep -aoE 'AP-STA-CONNECTED|EAPOL-4WAY-HS-COMPLETED' /tmp/h.log | sort -u | tr '\n' ' ')"
+sudo pkill -x "$REFERENCE_AP_PROCESS"; sudo pkill -f /tmp/barely

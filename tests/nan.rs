@@ -22,7 +22,7 @@ fn sdf_build_parse_roundtrip() {
     let ssi = b"hello-world";
     let body = nan::build_sdf(nan::NAN_SRV_CTRL_PUBLISH, &sid, 7, 0, Some(ssi), 2);
 
-    // Byte-for-byte match against the hostap SDF layout (verified via Python).
+    // Byte-for-byte match against the reference implementation SDF layout (verified via Python).
     assert_eq!(
         to_hex(&body),
         "0409506f9a1303090079ff4a94ed190700000e14000700000f00506f9a0268656c6c6f2d776f726c64"

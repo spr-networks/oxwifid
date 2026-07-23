@@ -84,7 +84,7 @@ fn beacon_5ghz_matches() {
     assert_eq!(
         &built[34..36],
         &[0x11, 0x00],
-        "5 GHz AP capability must match hostapd (ESS + Privacy only)"
+        "5 GHz AP capability must match reference AP (ESS + Privacy only)"
     );
 }
 
@@ -149,7 +149,7 @@ fn band_aware_ies_differ_correctly() {
         )
         .unwrap(),
         &[128, 0],
-        "80 MHz 5 GHz BSS uses global operating class 128 like hostapd"
+        "80 MHz 5 GHz BSS uses global operating class 128 like reference AP"
     );
 }
 
@@ -298,7 +298,7 @@ fn he_caps_advertise_twt_responder() {
 }
 
 #[test]
-fn he_operation_disables_unconfigured_bss_color_like_hostapd() {
+fn he_operation_disables_unconfigured_bss_color_like_reference_ap() {
     let op = dot11::he_operation_5ghz();
     // [255, len, ext-id 36, params(3), BSS color, basic MCS(2)]
     assert_eq!(op[2], 36);
@@ -324,7 +324,7 @@ fn default_he_beacon_omits_unconfigured_mu_edca_and_spatial_reuse() {
 
 #[test]
 fn eht_operation_preamble_puncturing() {
-    // On 5 GHz without puncturing, match hostapd's short operation form: no
+    // On 5 GHz without puncturing, match reference AP's short operation form: no
     // redundant Operation Information and a one-stream basic MCS requirement.
     let op0 = dot11::eht_operation(36, 80, false, 0);
     assert_eq!(op0, [0xff, 0x06, 106, 0x40, 0x11, 0x00, 0x00, 0x00]);
@@ -609,7 +609,7 @@ fn auth_multi_link_element_matches_wpa_shape() {
 }
 
 #[test]
-fn mlo_key_kdes_match_hostap_layout() {
+fn mlo_key_kdes_match_reference_stack_layout() {
     let gtk: Vec<u8> = (0u8..16).collect();
     let igtk: [u8; 16] = (0u8..16).collect::<Vec<_>>().try_into().unwrap();
     let ipn = [1, 2, 3, 4, 5, 6];
@@ -677,7 +677,7 @@ fn mld_reduced_neighbor_report_uses_partner_link_identity() {
     assert_eq!(
         &p[11..15],
         &dot11::short_ssid(b"rustaptest").to_le_bytes(),
-        "hostapd-compatible Short SSID"
+        "reference AP-compatible Short SSID"
     );
     assert_eq!(p[15], 0x42, "same SSID and co-located BSS flags");
     assert_eq!(p[16], 127, "unknown/max 20 MHz PSD encoding");
@@ -704,7 +704,7 @@ fn mld_reduced_neighbor_report_marks_a_dormant_partner_link() {
 }
 
 #[test]
-fn advertised_tid_to_link_mapping_matches_hostapd_layout() {
+fn advertised_tid_to_link_mapping_matches_reference_ap_layout() {
     let built = dot11::tid_to_link_mapping_same_set(1 << 1);
     let mut expected = vec![255, 19, 109, 2, 0xff];
     for _ in 0..8 {
@@ -1260,7 +1260,7 @@ fn ccmp_mld_uses_mld_addresses_for_security() {
     // 802.11be MLO: the MAC header carries the *link* addresses (so the frame
     // traverses the link) but the CCMP nonce/AAD — and thus the AP's STA lookup
     // — use the *MLD* addresses, consistent with the PTK derivation. This is the
-    // exact bug behind hostapd dropping uplink data as "not associated STA
+    // exact bug behind reference AP dropping uplink data as "not associated STA
     // <link-addr>": the link-addressed CCMP context can't be mapped to the MLD STA.
     let tk = from_hex(vectors()["crypto"]["tk"].as_str().unwrap());
     let sta_link = mac6("02:00:00:00:04:00"); // STA link-0 address
@@ -1299,7 +1299,7 @@ fn ccmp_mld_uses_mld_addresses_for_security() {
     );
 
     // Decrypting with the link addresses (the old, buggy single-link behaviour)
-    // MUST fail — this mirrors hostapd's MLD data path rejecting the frame.
+    // MUST fail — this mirrors reference AP's MLD data path rejecting the frame.
     assert!(
         dot11::decrypt_ccmp(&frame, &tk, false).is_none(),
         "link-addressed CCMP context must NOT verify (this was the bug)"

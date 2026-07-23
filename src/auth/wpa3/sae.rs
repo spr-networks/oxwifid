@@ -1,33 +1,23 @@
 //! WPA3-SAE (Simultaneous Authentication of Equals) with Hash-to-Element (H2E),
-//! ECC group 19 (NIST P-256). Ported from hostap's `src/common/sae.c` and
-//! `dragonfly.c`, and cross-checked against the IEEE 802.11-2020 Annex J.10 test
+//! ECC group 19 (NIST P-256), cross-checked against the IEEE 802.11-2020 Annex J.10 test
 //! vectors.
 //!
 //! Scope: group 19 only, H2E PWE derivation. The SAE protocol (commit/confirm,
 //! shared secret k, KCK/PMK/PMKID derivation) is independent of the PWE method.
 
+pub use super::group19::{generator, mod_inverse, Curve, Point, SecretScalar, SAE_GROUP_19};
+use super::group19::{
+    point_from_p256, point_to_p256, scalar_from_p256, scalar_pad, scalar_to_bin, scalar_to_p256,
+    sswu_from_okm, PRIME_LEN,
+};
+pub use super::owe::{owe_derive, owe_keypair};
 use hmac::{Hmac, Mac};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
-use p256::{
-    elliptic_curve::{
-        array::Array,
-        consts::U48,
-        ops::Reduce,
-        sec1::{FromSec1Point, ToSec1Point},
-        Group, PrimeField,
-    },
-    hash2curve::MapToCurve,
-    AffinePoint as P256AffinePoint, FieldBytes, NistP256, ProjectivePoint as P256ProjectivePoint,
-    Scalar as P256Scalar,
-};
 use sha2::Sha256;
 use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
-
-const PRIME_LEN: usize = 32;
-pub const SAE_GROUP_19: u16 = 19;
 
 // ---------------------------------------------------------------------------
 // Hash helpers
@@ -78,159 +68,6 @@ fn sha256_prf(key: &[u8], label: &[u8], context: &[u8], out_len: usize) -> Vec<u
         counter += 1;
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// P-256 (group 19) field & point arithmetic over num-bigint
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Point {
-    Infinity,
-    Affine(BigUint, BigUint),
-}
-
-fn point_to_p256(point: &Point) -> Option<P256ProjectivePoint> {
-    match point {
-        Point::Infinity => Some(P256ProjectivePoint::IDENTITY),
-        Point::Affine(x, y) => {
-            let mut sec1 = [0u8; 1 + 2 * PRIME_LEN];
-            sec1[0] = 0x04;
-            sec1[1..1 + PRIME_LEN].copy_from_slice(&scalar_pad(x, PRIME_LEN));
-            sec1[1 + PRIME_LEN..].copy_from_slice(&scalar_pad(y, PRIME_LEN));
-            P256AffinePoint::from_sec1_bytes(&sec1)
-                .ok()
-                .map(P256ProjectivePoint::from)
-        }
-    }
-}
-
-fn point_from_p256(point: P256ProjectivePoint) -> Point {
-    if bool::from(point.is_identity()) {
-        return Point::Infinity;
-    }
-    let encoded = point.to_affine().to_sec1_point(false);
-    let bytes = encoded.as_bytes();
-    Point::Affine(
-        BigUint::from_bytes_be(&bytes[1..1 + PRIME_LEN]),
-        BigUint::from_bytes_be(&bytes[1 + PRIME_LEN..]),
-    )
-}
-
-fn scalar_to_p256(value: &BigUint, modulus: &BigUint) -> P256Scalar {
-    let reduced = value % modulus;
-    let mut bytes = FieldBytes::default();
-    bytes.copy_from_slice(&scalar_pad(&reduced, PRIME_LEN));
-    Option::<P256Scalar>::from(P256Scalar::from_repr(bytes)).expect("scalar reduced modulo n")
-}
-
-fn scalar_from_p256(value: &P256Scalar) -> BigUint {
-    let bytes: FieldBytes = value.into();
-    BigUint::from_bytes_be(&bytes)
-}
-
-pub struct Curve {
-    pub p: BigUint,
-    pub a: BigUint,
-    pub b: BigUint,
-    pub n: BigUint, // group order
-}
-
-fn bn(hex: &str) -> BigUint {
-    BigUint::parse_bytes(hex.as_bytes(), 16).expect("valid hex")
-}
-
-impl Curve {
-    pub fn p256() -> Curve {
-        Curve {
-            p: bn("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"),
-            a: bn("ffffffff00000001000000000000000000000000fffffffffffffffffffffffc"),
-            b: bn("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"),
-            n: bn("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"),
-        }
-    }
-
-    pub fn on_curve(&self, pt: &Point) -> bool {
-        point_to_p256(pt).is_some()
-    }
-
-    pub fn negate(&self, pt: &Point) -> Point {
-        point_from_p256(-point_to_p256(pt).expect("validated P-256 point"))
-    }
-
-    pub fn add(&self, p1: &Point, p2: &Point) -> Point {
-        let p1 = point_to_p256(p1).expect("validated P-256 point");
-        let p2 = point_to_p256(p2).expect("validated P-256 point");
-        point_from_p256(p1 + p2)
-    }
-
-    pub fn scalar_mul(&self, k: &BigUint, pt: &Point) -> Point {
-        let point = point_to_p256(pt).expect("validated P-256 point");
-        point_from_p256(point * scalar_to_p256(k, &self.n))
-    }
-
-    /// Serialize an affine point as x||y (big-endian, prime_len each).
-    pub fn point_to_bin(&self, pt: &Point) -> Option<Vec<u8>> {
-        match pt {
-            Point::Infinity => None,
-            Point::Affine(x, y) => {
-                let mut out = vec![0u8; 2 * PRIME_LEN];
-                let xb = x.to_bytes_be();
-                let yb = y.to_bytes_be();
-                out[PRIME_LEN - xb.len()..PRIME_LEN].copy_from_slice(&xb);
-                out[2 * PRIME_LEN - yb.len()..].copy_from_slice(&yb);
-                Some(out)
-            }
-        }
-    }
-
-    /// Parse x||y, validating the point is on the curve.
-    pub fn point_from_bin(&self, data: &[u8]) -> Option<Point> {
-        if data.len() != 2 * PRIME_LEN {
-            return None;
-        }
-        let mut sec1 = Vec::with_capacity(1 + data.len());
-        sec1.push(0x04);
-        sec1.extend_from_slice(data);
-        let affine = P256AffinePoint::from_sec1_bytes(&sec1).ok()?;
-        Some(point_from_p256(P256ProjectivePoint::from(affine)))
-    }
-
-    /// Serialize a point in SEC1 compressed form (0x02/0x03 || X), as OWE and
-    /// most EC protocols exchange public keys.
-    pub fn point_to_compressed(&self, pt: &Point) -> Option<Vec<u8>> {
-        match pt {
-            Point::Infinity => None,
-            Point::Affine(x, y) => {
-                let mut out = Vec::with_capacity(1 + PRIME_LEN);
-                out.push(if y.bit(0) { 0x03 } else { 0x02 });
-                out.extend_from_slice(&scalar_pad(x, PRIME_LEN));
-                Some(out)
-            }
-        }
-    }
-
-    /// Parse a SEC1 compressed point (0x02/0x03 || X), recovering Y. P-256 has
-    /// p ≡ 3 (mod 4), so the square root is `v^((p+1)/4) mod p`.
-    pub fn point_from_compressed(&self, data: &[u8]) -> Option<Point> {
-        let affine = P256AffinePoint::from_sec1_bytes(data).ok()?;
-        Some(point_from_p256(P256ProjectivePoint::from(affine)))
-    }
-}
-
-// RustCrypto's P-256 hash-to-curve implementation uses the same RFC 9380
-// Simplified SWU map and z=-10 parameter required by SAE group 19. SAE supplies
-// its own HKDF-expanded 48-byte field input, then delegates both reduction and
-// mapping to the constant-time library implementation.
-fn sswu_from_okm(okm: &[u8]) -> Point {
-    debug_assert_eq!(okm.len(), 48);
-    let mut uniform = Array::<u8, U48>::default();
-    uniform.copy_from_slice(okm);
-    let element =
-        <<NistP256 as MapToCurve>::FieldElement as Reduce<Array<u8, U48>>>::reduce(&uniform);
-    let point = point_from_p256(NistP256::map_to_curve(element));
-    uniform.zeroize();
-    point
 }
 
 // ---------------------------------------------------------------------------
@@ -376,51 +213,6 @@ impl Drop for Sae {
     fn drop(&mut self) {
         self.kck.zeroize();
         self.pmk.zeroize();
-    }
-}
-
-/// A private P-256 scalar stored in a fixed-size zeroizing buffer rather than
-/// `BigUint` (whose heap limbs are not cleared on drop).
-pub struct SecretScalar([u8; 32]);
-
-impl SecretScalar {
-    fn zero() -> Self {
-        Self([0u8; 32])
-    }
-
-    fn random() -> Self {
-        // Rejection-sample uniformly in [2, n-1]. RustCrypto performs the range
-        // check; unlike `% n`, this introduces no modulo bias.
-        loop {
-            let mut bytes = [0u8; 32];
-            getrandom::getrandom(&mut bytes).expect("OS RNG");
-            let not_zero_or_one = bytes[..31].iter().any(|byte| *byte != 0) || bytes[31] > 1;
-            if not_zero_or_one
-                && Option::<P256Scalar>::from(P256Scalar::from_repr(FieldBytes::from(bytes)))
-                    .is_some()
-            {
-                return Self(bytes);
-            }
-            bytes.zeroize();
-        }
-    }
-
-    fn from_biguint(value: &BigUint, modulus: &BigUint) -> Self {
-        let bytes: [u8; 32] = scalar_pad(&(value % modulus), PRIME_LEN)
-            .try_into()
-            .expect("P-256 scalar length");
-        Self(bytes)
-    }
-
-    fn scalar(&self) -> P256Scalar {
-        Option::<P256Scalar>::from(P256Scalar::from_repr(FieldBytes::from(self.0)))
-            .expect("validated private scalar")
-    }
-}
-
-impl Drop for SecretScalar {
-    fn drop(&mut self) {
-        self.0.zeroize();
     }
 }
 
@@ -696,7 +488,7 @@ impl Sae {
             &self.commit_scalar,
             &self.commit_element,
         );
-        if crate::crypto::constant_time_eq(&verifier, &data[2..2 + 32]) {
+        if crate::auth::crypto::constant_time_eq(&verifier, &data[2..2 + 32]) {
             Ok(())
         } else {
             Err(SaeError::BadConfirm)
@@ -751,101 +543,4 @@ impl Sae {
             send_confirm: 0,
         }
     }
-}
-
-/// Modular inverse mod n (n prime), via Fermat.
-pub fn mod_inverse(a: &BigUint, n: &BigUint) -> BigUint {
-    (a % n).modpow(&(n - 2u32), n)
-}
-
-// ---------------------------------------------------------------------------
-// OWE - Opportunistic Wireless Encryption (RFC 8110), group 19
-// ---------------------------------------------------------------------------
-
-/// The P-256 base point G.
-pub fn generator() -> Point {
-    Point::Affine(
-        bn("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"),
-        bn("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"),
-    )
-}
-
-/// Generate an OWE Diffie-Hellman key pair: private scalar and public key as the
-/// bare X-coordinate (`prime_len` bytes). OWE (and hostapd) exchange only X; the
-/// receiver recovers a Y, and the ECDH shared X is independent of Y's parity.
-pub fn owe_keypair() -> (SecretScalar, Vec<u8>) {
-    let priv_k = SecretScalar::random();
-    let pubk =
-        point_from_p256(point_to_p256(&generator()).expect("P-256 generator") * priv_k.scalar());
-    let x = match pubk {
-        Point::Affine(x, _) => scalar_pad(&x, PRIME_LEN),
-        Point::Infinity => unreachable!("k*G is finite for k in [1,n)"),
-    };
-    (priv_k, x)
-}
-
-/// Reconstruct a curve point from a bare X-coordinate (recovering an even Y).
-fn point_from_x(curve: &Curve, x_bytes: &[u8]) -> Option<Point> {
-    let mut compressed = Vec::with_capacity(1 + x_bytes.len());
-    compressed.push(0x02); // even Y; ECDH shared X is parity-independent
-    compressed.extend_from_slice(x_bytes);
-    curve.point_from_compressed(&compressed)
-}
-
-/// Derive the OWE PMK and PMKID (RFC 8110 §4.4). `sta_pub`/`ap_pub` are the
-/// public keys as exchanged (bare X-coordinates); `peer_pub_bytes` is the
-/// *other* party's X. Both sides compute the same result.
-pub fn owe_derive(
-    priv_k: &SecretScalar,
-    peer_pub_bytes: &[u8],
-    sta_pub: &[u8],
-    ap_pub: &[u8],
-    group: u16,
-) -> Option<([u8; 32], [u8; 16])> {
-    let curve = Curve::p256();
-    let peer_pub = point_from_x(&curve, peer_pub_bytes)?;
-    let shared =
-        point_from_p256(point_to_p256(&peer_pub).expect("validated P-256 point") * priv_k.scalar());
-    let mut z = match shared {
-        Point::Affine(x, _) => scalar_pad(&x, PRIME_LEN),
-        Point::Infinity => return None,
-    };
-    // prk = HKDF-Extract(C | A | group, z)  (C = STA pubkey, A = AP pubkey)
-    let mut salt = Vec::new();
-    salt.extend_from_slice(sta_pub);
-    salt.extend_from_slice(ap_pub);
-    salt.extend_from_slice(&group.to_le_bytes());
-    let mut prk = hkdf_extract(&salt, &[&z]);
-    // PMK = HKDF-Expand(prk, "OWE Key Generation", 32)
-    let mut pmk_v = hkdf_expand(&prk, b"OWE Key Generation", 32);
-    // PMKID = Truncate-128(SHA-256(C | A))
-    let mut hasher = sha2::Sha256::new();
-    use sha2::Digest;
-    hasher.update(sta_pub);
-    hasher.update(ap_pub);
-    let digest = hasher.finalize();
-    let mut pmk = [0u8; 32];
-    pmk.copy_from_slice(&pmk_v);
-    let mut pmkid = [0u8; 16];
-    pmkid.copy_from_slice(&digest[..16]);
-    z.zeroize();
-    prk.zeroize();
-    pmk_v.zeroize();
-    Some((pmk, pmkid))
-}
-
-/// Left-pad a scalar to `len` bytes, big-endian.
-fn scalar_pad(v: &BigUint, len: usize) -> Vec<u8> {
-    let b = v.to_bytes_be();
-    let mut out = vec![0u8; len];
-    if b.len() <= len {
-        out[len - b.len()..].copy_from_slice(&b);
-    } else {
-        out.copy_from_slice(&b[b.len() - len..]);
-    }
-    out
-}
-
-fn scalar_to_bin(v: &BigUint) -> Vec<u8> {
-    scalar_pad(v, PRIME_LEN)
 }

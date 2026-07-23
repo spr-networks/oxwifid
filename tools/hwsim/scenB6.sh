@@ -1,9 +1,10 @@
 #!/bin/bash
 RUSTAP_CONFIG=${RUSTAP_CONFIG:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/tests/interop-config.json}
+HWSIM6G=${HWSIM6G:-/tmp/hwsim6g/hwsim6g.ko}
 sudo pkill -f /tmp/barely 2>/dev/null; sudo pkill -f wpa_supplicant 2>/dev/null
 sudo rmmod hwsim6g 2>/dev/null; sudo iw reg set US 2>/dev/null
 sudo modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; sudo modprobe mac80211_hwsim radios=2; sleep 3; sudo iw reg set US; sleep 2
-sudo insmod ~/hwsim6g/hwsim6g.ko
+sudo insmod "$HWSIM6G"
 PHYA=phy$(iw dev wlan0 info | awk '/wiphy/{print $2}')
 # AP side: IBSS ack-provider + monitor on phyA at 6135
 sudo iw dev wlan0 del
@@ -32,4 +33,4 @@ sudo wpa_supplicant -B -Dnl80211 -iwlan1 -c /tmp/supp6.conf -f /tmp/supp6.log 2>
 for t in 1 2 3 4 5 6 7; do sleep 2; ST=$(sudo wpa_cli -p /run/wpa_b -iwlan1 status 2>/dev/null | awk -F= '/wpa_state/{print $2}'); [ "$ST" = COMPLETED ] && break; done
 echo "wpa_state=$ST"
 echo "=== wpa SAE/6GHz ==="; sudo grep -aiE "CTRL-EVENT-CONNECTED|SME: Trying to auth|SAE|6 GHz|selected BSS" /tmp/supp6.log 2>/dev/null | grep -aivE hexdump | tail -3
-sudo pkill -f /tmp/barely 2>/dev/null; sudo pkill -f wpa_supplicant 2>/dev/null
+sudo pkill -f /tmp/barely 2>/dev/null; sudo pkill -f wpa_supplicant 2>/dev/null; sudo rmmod hwsim6g 2>/dev/null

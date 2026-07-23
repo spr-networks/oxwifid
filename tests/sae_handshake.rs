@@ -577,7 +577,7 @@ fn mld_sae_userspace_data_uses_mld_ccmp_addresses() {
     let first = handle_command_with_station_info(&mut ap, "STA-FIRST", &station_info).0;
     assert!(
         first.starts_with(&format!("{}\n", bytes_to_mac(&sta_mld))),
-        "hostapd control station identity must be the MLD MAC: {first}"
+        "reference AP control station identity must be the MLD MAC: {first}"
     );
     let by_mld = handle_command_with_station_info(
         &mut ap,

@@ -1,5 +1,5 @@
 // hwsim6g — clear the regulatory restrictions that block AP beaconing on every
-// mac80211_hwsim wiphy, so a Rust/hostapd AP can operate on 6 GHz *and* on wide
+// mac80211_hwsim wiphy, so a Rust/reference AP AP can operate on 6 GHz *and* on wide
 // (80/160 MHz) 5 GHz channels — including DFS radar blocks — for *interop
 // testing on a signed-regdb kernel*:
 //

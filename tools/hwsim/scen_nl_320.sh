@@ -8,7 +8,7 @@ sudo insmod /tmp/hwsim6g/hwsim6g.ko 2>/dev/null && echo "hwsim6g: $(sudo dmesg|g
 sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set wlan0 up
 sudo /tmp/barely-ap --config "$RUSTAP_CONFIG" --mode netlink --iface wlan0 --channel 37 --width 320 --band 6 --sae --ssid turtle320 > /tmp/ap320.log 2>&1 &
 sleep 2
-echo "START_AP ok: $(sudo grep -ac 'START_AP ok' /tmp/ap320.log)   err: $(sudo grep -aiE 'invalid|failed|error' /tmp/ap320.log | head -1)"
+echo "START_AP ok: $(sudo grep -acE 'START_AP.*ok' /tmp/ap320.log)   err: $(sudo grep -aiE 'invalid|failed|error' /tmp/ap320.log | head -1)"
 echo "AP chan: $(sudo iw dev wlan0 info 2>/dev/null | grep -iE 'channel|width' | tr '\n' ' ')"
 printf 'ctrl_interface=/run/wpa_n\nsae_pwe=2\nnetwork={\n ssid="turtle320"\n sae_password="password1234"\n key_mgmt=SAE\n ieee80211w=2\n scan_freq=6135\n freq_list=6135\n}\n' > /tmp/c320.conf
 sudo ip link set wlan1 up

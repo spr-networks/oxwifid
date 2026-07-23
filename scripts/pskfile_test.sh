@@ -2,7 +2,7 @@
 # =============================================================================
 # HOW THIS E2E TEST RUNS  (read before touching it)
 # =============================================================================
-# WHAT it proves: a real barely-ap AP with a hostapd-style psk_file authenticates
+# WHAT it proves: a real barely-ap AP with a reference AP-style psk_file authenticates
 # clients by the right credential — MAC-specific entry, wildcard onboarding, the
 # wildcard *fallback*, and rejects a wrong password — over real mac80211_hwsim.
 #
@@ -24,7 +24,7 @@
 #            cat /tmp/pskfile_result.txt'
 #
 # GOTCHAS that WILL bite you (all learned the hard way):
-#  * hwsim medium contamination: a leftover `wlantest`/`wmediumd`/hostap-hwsim
+#  * hwsim medium contamination from leftover test processes
 #    process keeps the module from cleanly reloading -> stale medium state ->
 #    clients see "0 BSSes" on random cells. This script's reset kills them all
 #    before `modprobe -r`. If scans come back empty, THAT is why.
@@ -44,10 +44,10 @@
 # restarts the AP fresh (no stale station state) and drives one wpa_supplicant
 # connect. Writes /tmp/pskfile_result.txt. Run: sudo setsid bash pskfile_test.sh &
 B=/tmp/iopbin/barely-ap; NS=pskcli; R=/tmp/pskfile_result.txt
-WPAS=/home/ubuntu/hostap-hwsim/wpa_supplicant/wpa_supplicant
+WPAS=${WPAS:?set WPAS to the wpa_supplicant binary}
 rm -f "$R"; : > "$R"
 pkill -9 -f "[b]arely-ap --mode" 2>/dev/null; pkill -9 wlantest 2>/dev/null
-pkill -9 wmediumd 2>/dev/null; pkill -9 -f "hostap-hwsim" 2>/dev/null
+pkill -9 wmediumd 2>/dev/null; pkill -9 -x wpa_supplicant 2>/dev/null
 for n in $NS interopcli saecli probe probe2; do ip netns del "$n" 2>/dev/null; done
 sleep 1; modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; modprobe mac80211_hwsim rctbl=1 radios=4; sleep 2
 iw reg set US 2>/dev/null; sleep 1
@@ -70,7 +70,7 @@ EOF
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up
 ip addr flush dev "$AP" 2>/dev/null; ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null
 setsid "$B" --config /tmp/ap.json </dev/null >/tmp/pskfile_ap.log 2>&1 &
-sleep 4; grep -aq "START_AP ok" /tmp/pskfile_ap.log && echo "AP: START_AP ok" >> "$R" || { echo "AP FAILED" >> "$R"; exit 1; }
+sleep 4; grep -aqE "START_AP.*ok" /tmp/pskfile_ap.log && echo "AP: START_AP ok" >> "$R" || { echo "AP FAILED" >> "$R"; exit 1; }
 
 run() { # $1 label  $2 (unused)  $3 client-password  $4 expect(PASS|FAIL)
   # AP stays up; each connect is a real-time reconnect (>250ms apart), so the

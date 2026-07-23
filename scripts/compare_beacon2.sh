@@ -1,12 +1,13 @@
 #!/bin/bash
-# Definitive HE/EHT beacon element diff: capture raw beacons from hostapd v2.12
+# Definitive HE/EHT beacon element diff: capture raw beacons from a reference AP
 # and barely-ap on the same hwsim radio, parse the element IDs (and ext-IDs for
 # element 255) directly. Writes /tmp/cmp2_result.txt.
-HAPD=/home/ubuntu/hostap-hwsim/hostapd/hostapd
+REFERENCE_AP=${REFERENCE_AP:?set REFERENCE_AP to the reference AP binary}
+REFERENCE_AP_PROCESS=$(basename "$REFERENCE_AP")
 B=/tmp/iopbin/barely-ap; R=/tmp/cmp2_result.txt
 rm -f "$R" /tmp/h.pcap /tmp/b.pcap; : > "$R"
 pkill -9 wlantest 2>/dev/null; pkill -9 wmediumd 2>/dev/null
-pkill -9 -f "hostap-hwsim" 2>/dev/null; pkill -9 -f "[b]arely-ap --mode" 2>/dev/null; pkill -9 -x hostapd 2>/dev/null
+pkill -9 -f "[b]arely-ap --mode" 2>/dev/null; pkill -9 -x "$REFERENCE_AP_PROCESS" 2>/dev/null
 sleep 1; modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; modprobe mac80211_hwsim rctbl=1 radios=4; sleep 2
 iw reg set US 2>/dev/null; sleep 1
 mapfile -t HW < <(for n in $(ls /sys/class/net|grep ^wlan); do [ "$(basename "$(readlink /sys/class/net/$n/device/driver 2>/dev/null)")" = mac80211_hwsim ] && echo "$n"; done)
@@ -40,15 +41,15 @@ def pcap(path):
         except Exception: r=None
         if r and r[0] and r[0] not in seen: seen[r[0]]=r[1]
     return seen
-for name,path in [('hostapd',sys.argv[1]),('barely-ap',sys.argv[2])]:
+for name,path in [('reference AP',sys.argv[1]),('barely-ap',sys.argv[2])]:
     for ssid,ids in pcap(path).items():
         print('%s ssid=%s: %s'%(name, ssid, ' '.join(ids)))
 PY
 
-# hostapd HE
-cat > /tmp/hapd_he.conf <<EOF
+# reference AP HE
+cat > /tmp/ref_ap_he.conf <<EOF
 interface=$AP
-ssid=hapd-he
+ssid=ref_ap-he
 country_code=US
 hw_mode=a
 channel=36
@@ -59,10 +60,10 @@ wpa_key_mgmt=WPA-PSK
 wpa_passphrase=password1234
 rsn_pairwise=CCMP
 EOF
-setsid "$HAPD" -B /tmp/hapd_he.conf >/tmp/hapd.log 2>&1; sleep 3
+setsid "$REFERENCE_AP" -B /tmp/ref_ap_he.conf >/tmp/ref_ap.log 2>&1; sleep 3
 timeout 4 tcpdump -i "$MON" -c 4 -w /tmp/h.pcap 'type mgt subtype beacon' >/dev/null 2>&1
-echo "hostapd start: $(grep -c "Setup of interface done\|AP-ENABLED" /tmp/hapd.log)" >> "$R"
-pkill -9 -x hostapd 2>/dev/null; sleep 2
+echo "reference AP start: $(grep -c "Setup of interface done\|AP-ENABLED" /tmp/ref_ap.log)" >> "$R"
+pkill -9 -x "$REFERENCE_AP_PROCESS" 2>/dev/null; sleep 2
 
 # barely-ap HE
 ip link set "$AP" down 2>/dev/null; iw dev "$AP" set type __ap 2>/dev/null; ip link set "$AP" up

@@ -1,4 +1,4 @@
-//! barely-cli: a minimal WPA2/CCMP station to drive an AP over stdio.
+//! barely-cli: a minimal WPA2/WPA3 CCMP/GCMP station.
 //!
 //! Connects to the first matching beacon, completes the 4-way handshake, and
 //! (with --ping) sends one ICMP echo to the gateway, printing AUTHENTICATED and
@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use barely_ap::client::Client;
-use barely_ap::config::{parse_psk_file, Config, KeyMgmt};
+use barely_ap::config::{parse_data_cipher, parse_psk_file, Config, KeyMgmt};
 use barely_ap::raw_frames::{self, ClientNode, StdioLink};
 use barely_ap::uplink::{self, ScanCandidate, UplinkSecurity};
 use barely_ap::util::{mac_to_bytes, try_mac_to_bytes};
@@ -53,6 +53,7 @@ fn main() {
     let mut configured_iface: Option<String> = None;
     let mut configured_mode: Option<String> = None;
     let mut configured_channel: Option<u8> = None;
+    let mut configured_pairwise_cipher = barely_ap::structures::DataCipher::Ccmp128;
     let mut configured_band6 = false;
     let mut configured_bssid: Option<[u8; 6]> = None;
     for i in 1..args.len() {
@@ -82,6 +83,7 @@ fn main() {
             configured_iface = Some(cfg.iface.clone());
             configured_mode = Some(cfg.mode.clone());
             configured_channel = Some(cfg.channel);
+            configured_pairwise_cipher = cfg.pairwise_cipher;
             configured_band6 = cfg.band.is_6ghz();
             // In a station config, `bssid`/`mac` identifies the selected AP.
             // The all-zero default means no BSSID pin.
@@ -111,6 +113,7 @@ fn main() {
     let mut channel: u8 = configured_channel.unwrap_or(1);
     let mut target_bssid = configured_bssid;
     let mut psk_sha256 = false;
+    let mut pairwise_cipher = configured_pairwise_cipher;
     let mut mld_mac: Option<[u8; 6]> = None;
     let mut link1_mac: Option<[u8; 6]> = None;
     let mut ap_mld_mac: Option<[u8; 6]> = None;
@@ -168,6 +171,12 @@ fn main() {
             "--mode" => mode = next(i),
             "--iface" => iface = next(i),
             "--channel" => channel = next(i).parse().unwrap_or(1),
+            "--cipher" | "--pairwise-cipher" => {
+                pairwise_cipher = parse_data_cipher(&next(i)).unwrap_or_else(|error| {
+                    eprintln!("barely-cli: {error}");
+                    std::process::exit(2);
+                })
+            }
             "--mld-mac" => mld_mac = Some(mac_to_bytes(&next(i))),
             "--link1-mac" => link1_mac = Some(mac_to_bytes(&next(i))),
             "--ap-mld-mac" => ap_mld_mac = Some(mac_to_bytes(&next(i))),
@@ -306,9 +315,18 @@ fn main() {
         eprintln!("barely-cli: PSK/SAE requires a credential in --config");
         std::process::exit(1);
     }
+    if pairwise_cipher != barely_ap::structures::DataCipher::Ccmp128
+        && (sae || owe || mld_mac.is_some())
+    {
+        eprintln!(
+            "barely-cli: {} currently supports WPA2-Personal single-link mode only",
+            pairwise_cipher.config_name()
+        );
+        std::process::exit(2);
+    }
 
     eprintln!(
-        "barely-cli: ssid={ssid:?} mac={} ping={ping} wmm_tid={wmm_tid:?} dscp={dscp} {}",
+        "barely-cli: ssid={ssid:?} mac={} ping={ping} wmm_tid={wmm_tid:?} dscp={dscp} {} cipher={}",
         barely_ap::util::bytes_to_mac(&mac),
         if owe {
             "OWE"
@@ -317,9 +335,11 @@ fn main() {
         } else {
             "WPA2-PSK"
         },
+        pairwise_cipher.config_name(),
     );
 
     let mut client = Client::new(&ssid, &psk, mac);
+    client.set_pairwise_cipher(pairwise_cipher);
     psk.zeroize();
     if sae {
         client.enable_sae();

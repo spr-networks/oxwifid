@@ -3,7 +3,7 @@
 
 This keeps the AP and station test endpoints in one host namespace without
 creating two conflicting local routes. The TAP frame still traverses the Rust
-client, CCMP, hostapd/mac80211, and the AP host IPv4 stack in both directions.
+client, CCMP, reference AP/mac80211, and the AP host IPv4 stack in both directions.
 """
 
 import argparse

@@ -4,7 +4,7 @@
 //! Transports all carry radiotap-prefixed 802.11 frames and implement [`Link`]:
 //!   * [`StdioLink`] — length-prefixed frames on stdin/stdout (portable; wire
 //!     compatible with the reference `ap.py` stdio mode).
-//!   * [`af_packet::IfaceLink`] — a Linux monitor-mode `AF_PACKET` raw socket
+//!   * `af_packet::IfaceLink` — a Linux monitor-mode `AF_PACKET` raw socket
 //!     (real radios / `mac80211_hwsim`).
 //!
 //! The netlink (`nl80211`) transport in [`crate::netlink`] implements the same
@@ -137,12 +137,15 @@ where
 }
 
 #[cfg(target_os = "linux")]
+type RescanHook<'a, L> = &'a mut dyn FnMut(&mut Client, &mut L) -> std::io::Result<()>;
+
+#[cfg(target_os = "linux")]
 fn run_client_tap_inner<L: Link>(
     mut client: Client,
     mut wifi: L,
     mut tap: TapDevice,
     state_file: Option<&std::path::Path>,
-    mut rescan: Option<&mut dyn FnMut(&mut Client, &mut L) -> std::io::Result<()>>,
+    mut rescan: Option<RescanHook<'_, L>>,
 ) -> std::io::Result<()> {
     CLIENT_SHUTDOWN.store(false, Ordering::Relaxed);
     clear_client_state(state_file);
@@ -334,7 +337,7 @@ impl Node for ApNode {
     }
     fn on_tick(&mut self) -> Vec<Vec<u8>> {
         // Disassociate stations idle past the advertised BSS Max Idle period
-        // (hostapd `ap_max_inactivity`, default 300 s) — a station that vanishes
+        // (reference AP `ap_max_inactivity`, default 300 s) — a station that vanishes
         // without deauthing is otherwise never reaped.
         let mut frames = vec![self.ap.beacon_frame()];
         frames.extend(self.ap.prune_idle(Duration::from_secs(300)));

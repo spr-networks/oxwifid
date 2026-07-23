@@ -1,13 +1,13 @@
-//! NAN USD — Wi-Fi Aware Unsynchronized Service Discovery, ported from hostap's
-//! `nan_de.c`.
+//! NAN USD — Wi-Fi Aware Unsynchronized Service Discovery, ported from reference implementation's
+//! the IEEE 802.11 NAN service-discovery definitions.
 //!
 //! Implements the service-discovery half of NAN (Neighbor Awareness Networking):
 //! Publish, Subscribe, Follow-up, and matching, carried in Service Discovery
 //! Frames (Public Action frames with the NAN vendor type). The synchronized
 //! data path (NDP/NDL) is out of scope.
 
-use crate::crypto;
-use crate::dot11;
+use crate::auth::crypto;
+use crate::frames as dot11;
 
 // Public Action frame + NAN vendor type (OUI 50:6F:9A, type 0x13).
 pub const WLAN_ACTION_PUBLIC: u8 = 4;
@@ -26,7 +26,7 @@ pub const NAN_SRV_CTRL_SUBSCRIBE: u8 = 1;
 pub const NAN_SRV_CTRL_FOLLOW_UP: u8 = 2;
 
 /// The NAN Network ID (a group address) used as both the destination (A1) and
-/// BSSID (A3) of USD Service Discovery Frames, per hostap's `nan_de.c`.
+/// BSSID (A3) of USD Service Discovery Frames.
 const NAN_NETWORK_ID: [u8; 6] = [0x51, 0x6f, 0x9a, 0x01, 0x00, 0x00];
 
 /// Derive the 6-byte NAN Service ID: SHA-256 of the lowercased service name.

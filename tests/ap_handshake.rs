@@ -277,7 +277,7 @@ fn eapol_m1_retransmits_then_times_out() {
     ));
     // a tick before the timeout does nothing
     assert!(ap.tick().frames.is_empty(), "no retransmit before timeout");
-    // hostapd's default update count is four total sends: initial + 3 retries.
+    // reference AP's default update count is four total sends: initial + 3 retries.
     let mut retransmits = 0;
     for _ in 0..3 {
         ap.test_expire_eapol();

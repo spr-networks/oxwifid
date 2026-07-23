@@ -9,7 +9,7 @@ sudo insmod /tmp/hwsim6g/hwsim6g.ko 2>>/tmp/mod160.log && echo "module: loaded (
 sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set wlan0 up
 sudo /tmp/barely-ap --config "$RUSTAP_CONFIG" --mode netlink --iface wlan0 --band 5 --channel 36 --width 160 --mac 02:00:00:00:00:00 --ssid turtle160 > /tmp/ap160.log 2>&1 &
 sleep 2
-echo "START_AP ok: $(sudo grep -ac 'START_AP ok' /tmp/ap160.log)   err: $(sudo grep -aiE 'invalid|failed' /tmp/ap160.log | head -1)"
+echo "START_AP ok: $(sudo grep -acE 'START_AP.*ok' /tmp/ap160.log)   err: $(sudo grep -aiE 'invalid|failed' /tmp/ap160.log | head -1)"
 echo "AP chan: $(sudo iw dev wlan0 info 2>/dev/null | grep -iE 'channel|width' | tr '\n' ' ')"
 printf 'ctrl_interface=/run/wpa_n\nnetwork={\n ssid="turtle160"\n psk="password1234"\n key_mgmt=WPA-PSK\n scan_freq=5180\n}\n' > /tmp/c160.conf
 sudo ip link set wlan1 up

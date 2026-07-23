@@ -1,4 +1,4 @@
-//! hostapd-style `wpa_psk_file` candidate selection: per-MAC entries tried
+//! reference AP-style `wpa_psk_file` candidate selection: per-MAC entries tried
 //! before wildcard onboarding entries, verified against the
 //! 4-way handshake's message-2 MIC. Deterministic in-process handshakes (no
 //! hwsim) so the credential-matching logic is tested independent of the medium.

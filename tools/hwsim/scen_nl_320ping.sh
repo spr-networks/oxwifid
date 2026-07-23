@@ -13,7 +13,7 @@ sudo ip link set wlan0 down; sudo iw dev wlan0 set type __ap; sudo ip link set w
 sudo ip addr flush dev wlan0 2>/dev/null; sudo ip addr add 192.168.213.1/24 dev wlan0
 sudo /tmp/barely-ap --config "$RUSTAP_CONFIG" --mode netlink --iface wlan0 --channel 37 --width 320 --band 6 --sae --mac 02:00:00:00:00:00 --ssid turtle320 > /tmp/ap320.log 2>&1 &
 sleep 2
-echo "START_AP ok: $(sudo grep -ac 'START_AP ok' /tmp/ap320.log)"
+echo "START_AP ok: $(sudo grep -acE 'START_AP.*ok' /tmp/ap320.log)"
 echo "AP width: $(sudo iw dev wlan0 info 2>/dev/null | grep -oiE 'width: [0-9]+ MHz')"
 sudo ip netns add sta; PHYB=phy$(iw dev wlan1 info | awk '/wiphy/{print $2}'); sudo iw phy $PHYB set netns name sta
 sudo ip netns exec sta ip link set lo up; sudo ip netns exec sta ip link set wlan1 up

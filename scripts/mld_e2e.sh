@@ -4,14 +4,24 @@
 # MLD client at it. Reports each stage so the failure point (if any) is explicit.
 # hwsim ONLY — never touches r_wlan1/rustap. Writes /tmp/mld_result.txt.
 B=/tmp/iopbin/barely-ap; NS=mldcli; R=/tmp/mld_result.txt
-WPAS=/home/ubuntu/hostap-hwsim/wpa_supplicant/wpa_supplicant
-WCLI=/home/ubuntu/hostap-hwsim/wpa_supplicant/wpa_cli
+FIREWALL_COMMENT="barely-mld-$$"
+WPAS=${WPAS:?set WPAS to the wpa_supplicant binary}
+WCLI=${WCLI:?set WCLI to the wpa_cli binary}
+cleanup() {
+  pkill -9 -f "[b]arely-ap --" 2>/dev/null
+  ip netns del "$NS" 2>/dev/null
+  handle=$(nft -a list chain inet filter INPUT 2>/dev/null |
+    awk -v marker="$FIREWALL_COMMENT" '$0 ~ marker { for (i=1; i<=NF; i++) if ($i == "handle") print $(i+1) }' |
+    head -1)
+  [ -z "$handle" ] || nft delete rule inet filter INPUT handle "$handle" 2>/dev/null
+}
+trap cleanup EXIT
 rm -f "$R"; : > "$R"
 # Clean the hwsim medium the way hwsim_interop.sh does: kill EVERY consumer of
 # the hwsim monitor (a leftover wlantest/wmediumd holds it open, rmmod fails, and
 # the stale medium stops delivering frames), then retry rmmod until it succeeds.
 pkill -9 -f "[b]arely-ap --" 2>/dev/null; pkill -9 wlantest 2>/dev/null; pkill -9 wmediumd 2>/dev/null
-pkill -9 -f "hostap-hwsim" 2>/dev/null; pkill -9 -x wpa_supplicant 2>/dev/null
+pkill -9 -x wpa_supplicant 2>/dev/null
 for n in $NS; do ip netns del "$n" 2>/dev/null; done
 sleep 2
 for _ in 1 2 3 4 5; do rmmod mac80211_hwsim 2>/dev/null && break; sleep 2; done
@@ -28,6 +38,8 @@ modprobe mac80211_hwsim $MLOPARAM radios=3 2>>"$R"; sleep 2
 iw reg set US 2>/dev/null; sleep 1
 mapfile -t HW < <(for n in $(ls /sys/class/net|grep ^wlan); do [ "$(basename "$(readlink /sys/class/net/$n/device/driver 2>/dev/null)")" = mac80211_hwsim ] && echo "$n"; done)
 AP=${HW[0]}; STA=${HW[1]}; MON=${HW[2]}
+nft insert rule inet filter INPUT iifname "$AP" ip daddr 10.10.10.1 \
+  ip protocol icmp accept comment "$FIREWALL_COMMENT"
 # Monitor on ch1 (link 0) to see whether the client's auth is on-air and whether
 # the AP answers.
 ip link set "$MON" down 2>/dev/null; iw dev "$MON" set type monitor 2>/dev/null; ip link set "$MON" up 2>/dev/null; iw dev "$MON" set channel 36 2>/dev/null
@@ -103,4 +115,3 @@ echo "-- on-air auth/assoc frames on ch1 (src->dst subtype) --" >> "$R"
 tcpdump -r /tmp/mld_air.pcap -e -n 2>/dev/null | sed -E 's/.*(SA:[^ ]+).*(DA:[^ ]+).*(Authentication|Assoc).*/\1 \2 \3/' | sort | uniq -c | head >> "$R"
 tcpdump -r /tmp/mld_air.pcap -e -n 2>/dev/null | grep -aiE "auth|assoc" | head -6 >> "$R"
 echo "DONE" >> "$R"
-pkill -9 -f "[b]arely-ap --" 2>/dev/null; ip netns del "$NS" 2>/dev/null

@@ -1,5 +1,5 @@
 //! Verify the SAE implementation against the IEEE 802.11-2020 Annex J.10 test
-//! vectors (the same ones hostap's `sae_tests()` uses).
+//! vectors (the same ones reference implementation's `sae_tests()` uses).
 //!
 //!   * H2E PWE (group 19) is checked directly against `pwe_19_x/y`.
 //!   * The SAE protocol (commit, shared secret k, KCK/PMK/PMKID) is checked

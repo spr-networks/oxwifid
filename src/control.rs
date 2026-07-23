@@ -1,9 +1,9 @@
-//! Runtime control interface, modelled on hostapd's `ctrl_interface`.
+//! Runtime control interface, modelled on reference AP's `ctrl_interface`.
 //!
 //! A Unix datagram socket carries text commands (`STATUS`, `STA-DUMP`,
 //! `DEAUTH <mac>`, `FAILURES`, `PING`) and an event subscription (`ATTACH` /
 //! `DETACH`). Subscribed clients receive `AP-STA-*` event lines as they happen
-//! (connect / disconnect / failed-auth), the same way `hostapd_cli` does.
+//! (connect / disconnect / failed-auth), the same way `reference AP control client` does.
 //!
 //! [`handle_command`] is portable and unit-tested; the socket server is gated to
 //! Unix targets.
@@ -11,7 +11,7 @@
 use crate::ap::Ap;
 use crate::util::bytes_to_mac;
 
-/// Netlink-owned metadata exposed through hostapd's `STA <mac>` control
+/// Netlink-owned metadata exposed through reference AP's `STA <mac>` control
 /// command. SPR uses `vlan_id` to derive the per-station interface name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StationControlInfo {
@@ -21,7 +21,7 @@ pub struct StationControlInfo {
 }
 
 /// Live per-station counters read from NL80211_CMD_GET_STATION. Rates use the
-/// kernel/hostapd control-interface unit of 100 kbit/s (60 = 6 Mbit/s).
+/// kernel/reference AP control-interface unit of 100 kbit/s (60 = 6 Mbit/s).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StationTelemetry {
     pub signal: Option<i8>,
@@ -51,7 +51,7 @@ pub fn handle_command_with_station_info(
 fn frequency(ap: &Ap) -> u32 {
     if ap.band6() {
         5950 + 5 * ap.channel as u32
-    } else if crate::dot11::is_5ghz(ap.channel) {
+    } else if crate::frames::is_5ghz(ap.channel) {
         5000 + 5 * ap.channel as u32
     } else if ap.channel == 14 {
         2484
@@ -60,7 +60,7 @@ fn frequency(ap: &Ap) -> u32 {
     }
 }
 
-/// hostapd exposes a non-AP MLD as one station keyed by its stable MLD MAC,
+/// reference AP exposes a non-AP MLD as one station keyed by its stable MLD MAC,
 /// regardless of which affiliated link carried the association.
 fn control_station_macs(ap: &Ap) -> Vec<[u8; 6]> {
     let mut macs: Vec<[u8; 6]> = ap
@@ -81,8 +81,8 @@ fn station_reply(
     let core_mac = ap.station_link_for_peer(mac).unwrap_or(*mac);
     let assoc_ies = ap.station_assoc_ies(&core_mac).unwrap_or(&[]);
     let flags = station_flags(ap.is_associated(&core_mac), assoc_ies);
-    // hostapd's STA/STA-FIRST/STA-NEXT replies begin with the raw MAC line.
-    // hostapd_cli all_sta relies on that exact shape while SPR consumes vlan_id.
+    // reference AP's STA/STA-FIRST/STA-NEXT replies begin with the raw MAC line.
+    // reference AP control client all_sta relies on that exact shape while SPR consumes vlan_id.
     let mut reply = format!("{}\nflags={flags}\n", bytes_to_mac(mac));
     if let Some(selector) = akm_suite_selector(assoc_ies) {
         reply.push_str(&format!("AKMSuiteSelector={selector}\n"));
@@ -110,7 +110,7 @@ fn station_reply(
     reply
 }
 
-/// Reproduce hostapd's per-station PHY flags from the capabilities negotiated
+/// Reproduce reference AP's per-station PHY flags from the capabilities negotiated
 /// in that station's association request. SPR uses these flags to label clients
 /// as 802.11n/ac/ax/be; using the AP's configured maximum would overstate older
 /// clients connected to an EHT AP.
@@ -119,10 +119,10 @@ fn station_flags(associated: bool, assoc_ies: &[u8]) -> String {
     if associated {
         flags.push_str("[AUTH][ASSOC][AUTHORIZED]");
     }
-    if crate::dot11::find_ie(assoc_ies, 45).is_some() {
+    if crate::frames::find_ie(assoc_ies, 45).is_some() {
         flags.push_str("[HT]");
     }
-    if crate::dot11::find_ie(assoc_ies, 191).is_some() {
+    if crate::frames::find_ie(assoc_ies, 191).is_some() {
         flags.push_str("[VHT]");
     }
     if find_ext_ie(assoc_ies, 35).is_some() {
@@ -152,10 +152,10 @@ fn find_ext_ie(ies: &[u8], ext_id: u8) -> Option<&[u8]> {
     None
 }
 
-/// Format the station-selected RSN AKM the same way hostapd exposes
+/// Format the station-selected RSN AKM the same way reference AP exposes
 /// `AKMSuiteSelector` (for example SAE is `00-0f-ac-8`).
 fn akm_suite_selector(assoc_ies: &[u8]) -> Option<String> {
-    let rsn = crate::dot11::find_ie(assoc_ies, 48)?;
+    let rsn = crate::frames::find_ie(assoc_ies, 48)?;
     let mut off = 2 + 4; // version + group cipher
     let pairwise_count = u16::from_le_bytes([*rsn.get(off)?, *rsn.get(off + 1)?]) as usize;
     off = off.checked_add(2 + 4 * pairwise_count)?;
@@ -171,7 +171,7 @@ fn akm_suite_selector(assoc_ies: &[u8]) -> Option<String> {
     ))
 }
 
-/// Execute the hostapd-compatible command set SPR uses, with the BSS interface
+/// Execute the reference AP-compatible command set SPR uses, with the BSS interface
 /// name included in STATUS.
 pub fn handle_command_with_context(
     ap: &mut Ap,
@@ -196,17 +196,17 @@ pub fn handle_command_with_context(
                 format!(
                     "state=ENABLED\nbackend=rustap\ndriver=rustap-netlink\nphy={}\nfreq={}\nchannel={}\nwidth={}\nieee80211n=1\nieee80211ac={}\nieee80211ax={}\nieee80211be={}\nbss[0]={}\nbssid[0]={}\nssid[0]={}\nssid={}\nnum_sta[0]={}\nstations={}\nassociated={}\n",
                     match phy {
-                        crate::dot11::PhyMode::Ht => "HT",
-                        crate::dot11::PhyMode::Vht => "VHT",
-                        crate::dot11::PhyMode::He => "HE",
-                        crate::dot11::PhyMode::Eht => "EHT",
+                        crate::frames::PhyMode::Ht => "HT",
+                        crate::frames::PhyMode::Vht => "VHT",
+                        crate::frames::PhyMode::He => "HE",
+                        crate::frames::PhyMode::Eht => "EHT",
                     },
                     frequency(ap),
                     ap.channel,
                     ap.channel_width,
-                    u8::from(phy >= crate::dot11::PhyMode::Vht),
-                    u8::from(phy >= crate::dot11::PhyMode::He),
-                    u8::from(phy >= crate::dot11::PhyMode::Eht),
+                    u8::from(phy >= crate::frames::PhyMode::Vht),
+                    u8::from(phy >= crate::frames::PhyMode::He),
+                    u8::from(phy >= crate::frames::PhyMode::Eht),
                     ifname,
                     bytes_to_mac(&ap.mac),
                     String::from_utf8_lossy(&ap.ssid),
@@ -270,7 +270,7 @@ pub fn handle_command_with_context(
             // The control socket carries untrusted input, so parse the MAC
             // without panicking (a malformed MAC must not crash the AP).
             Some(arg) => match crate::util::try_mac_to_bytes(arg) {
-                // hostapd acknowledges an administratively requested removal
+                // reference AP acknowledges an administratively requested removal
                 // even when the station has already disappeared. SPR sends
                 // DISASSOCIATE followed by DEAUTHENTICATE, so the second must
                 // remain idempotent.
@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn hostapd_disconnect_commands_are_idempotent() {
+    fn reference_ap_disconnect_commands_are_idempotent() {
         let mut ap = ap();
         let (reply, frames) = handle_command(&mut ap, "DEAUTH 02:00:00:00:ab:cd");
         assert_eq!(reply, "OK\n");
@@ -394,11 +394,11 @@ mod tests {
     #[test]
     fn spr_phy_and_akm_fields_are_derived_per_station() {
         let mut ies = Vec::new();
-        ies.extend_from_slice(&crate::dot11::ie(45, &[0; 26]));
-        ies.extend_from_slice(&crate::dot11::ie(191, &[0; 12]));
-        ies.extend_from_slice(&crate::dot11::ie(255, &[35, 0]));
-        ies.extend_from_slice(&crate::dot11::ie(255, &[108, 0]));
-        ies.extend_from_slice(&crate::dot11::RSN_WPA3);
+        ies.extend_from_slice(&crate::frames::ie(45, &[0; 26]));
+        ies.extend_from_slice(&crate::frames::ie(191, &[0; 12]));
+        ies.extend_from_slice(&crate::frames::ie(255, &[35, 0]));
+        ies.extend_from_slice(&crate::frames::ie(255, &[108, 0]));
+        ies.extend_from_slice(&crate::frames::RSN_WPA3);
 
         assert_eq!(
             super::station_flags(true, &ies),
@@ -447,7 +447,7 @@ mod server {
             sock.set_nonblocking(true)?;
             // Harden the socket to owner-only (0600). The control interface can
             // deauthenticate stations and trigger rekeys, so it must not be
-            // writable by other local users. (hostapd guards its ctrl_interface
+            // writable by other local users. (reference AP guards its ctrl_interface
             // the same way, via directory ownership + mode.)
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -531,7 +531,7 @@ mod server {
         }
 
         /// Push one event line to every attached client; drop clients whose
-        /// socket has gone away. hostapd prefixes events with a `<prio>` tag.
+        /// socket has gone away. reference AP prefixes events with a `<prio>` tag.
         pub fn broadcast(&mut self, line: &str) {
             let msg = format!("<3>{line}\n");
             let sock = &self.sock;

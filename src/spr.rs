@@ -1,6 +1,6 @@
 //! Direct SPR event delivery over its Unix-domain HTTP socket.
 //!
-//! This replaces the hot-path `hostapd_cli -> action.sh -> curl` process chain.
+//! This replaces the hot-path `reference AP control client -> action.sh -> curl` process chain.
 //! The AP loop only performs a bounded, non-blocking queue operation; a worker
 //! thread does the local Unix-socket HTTP request and validates the response.
 
@@ -126,7 +126,7 @@ impl SprNotifier {
     }
 }
 
-/// Reproduce wifid's action-script call to `hostap_dhcp_helper`. The helper
+/// Reproduce wifid's action-script call to `spr_dhcp_helper`. The helper
 /// owns stale nft-map cleanup, generic-XDP attachment, and the new map element.
 /// It runs on the same background worker as HTTP delivery, never the AP loop.
 /// A helper failure is reported but does not suppress the API event, matching

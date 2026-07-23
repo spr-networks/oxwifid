@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use super::msg::{self, Attr, GenlMessage};
 use super::*;
-use crate::dot11;
+use crate::frames as dot11;
 use crate::raw_frames::Link;
 
 /// A generic-netlink socket bound to a unique port id.
@@ -262,9 +262,9 @@ pub struct ScanResult {
 fn scan_frequency(freq: u32) -> Option<(u8, &'static str)> {
     match freq {
         2484 => Some((14, "2.4")),
-        2412..=2472 if (freq - 2407) % 5 == 0 => Some((((freq - 2407) / 5) as u8, "2.4")),
-        5005..=5895 if (freq - 5000) % 5 == 0 => Some((((freq - 5000) / 5) as u8, "5")),
-        5955..=7115 if (freq - 5950) % 5 == 0 => Some((((freq - 5950) / 5) as u8, "6")),
+        2412..=2472 if (freq - 2407).is_multiple_of(5) => Some((((freq - 2407) / 5) as u8, "2.4")),
+        5005..=5895 if (freq - 5000).is_multiple_of(5) => Some((((freq - 5000) / 5) as u8, "5")),
+        5955..=7115 if (freq - 5950).is_multiple_of(5) => Some((((freq - 5950) / 5) as u8, "6")),
         _ => None,
     }
 }
@@ -683,7 +683,7 @@ fn nl_add_link(
     sock.request_ack(m)
 }
 
-/// Complete AP bring-up with the SET_BSS operation hostapd issues after every
+/// Complete AP bring-up with the SET_BSS operation reference AP issues after every
 /// successful START_AP/SET_BEACON. ath12k can acknowledge START_AP and expose
 /// the MLD links through `iw` while transmitting no beacons until these
 /// per-link BSS parameters have been installed.
@@ -694,7 +694,7 @@ fn nl_set_bss(
     link_id: Option<u8>,
     ht_enabled: bool,
 ) -> io::Result<()> {
-    // 6, 12 and 24 Mbps in nl80211's 500-kbps units, matching hostapd's
+    // 6, 12 and 24 Mbps in nl80211's 500-kbps units, matching reference AP's
     // mandatory OFDM basic-rate set on 5/6 GHz.
     const AP_BASIC_RATES: [u8; 3] = [0x0c, 0x18, 0x30];
     let seq = sock.next_seq();
@@ -733,7 +733,7 @@ fn nl_send_eapol(
     if let Some(link_id) = link_id {
         m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
     }
-    // Synchronous send (NLM_F_ACK), like hostapd's send_and_recv: a fire-and-
+    // Synchronous send (NLM_F_ACK), like reference AP's send_and_recv: a fire-and-
     // forget send() never surfaces a kernel rejection — the error lands on the
     // socket unread and the EAPOL silently vanishes. NOTE: must be called on the
     // command socket, not the event socket (request_ack drains unrelated
@@ -775,7 +775,7 @@ fn sta_flags(mask: u32, set: u32) -> Vec<u8> {
 }
 
 /// Add a station to the kernel in the *unassociated* state. hwsim lacks
-/// `FULL_AP_CLIENT_STATE`, so — like hostapd's "UNASSOC_STA workaround" — the
+/// `FULL_AP_CLIENT_STATE`, so — like reference AP's "UNASSOC_STA workaround" — the
 /// station must be added with AUTH/ASSOC explicitly cleared (set=0, mask=0xa0),
 /// then promoted to associated via SET_STATION.
 fn nl_new_station(
@@ -851,7 +851,7 @@ fn station_ext_ie<'a>(outer: &'a [u8], link: Option<&'a [u8]>, ext_id: u8) -> Op
         .or_else(|| find_ext_ie(outer, ext_id))
 }
 
-/// Attach the same station PHY capability attributes hostapd sends. A partner
+/// Attach the same station PHY capability attributes reference AP sends. A partner
 /// link's Per-STA Profile overrides the outer association IEs; anything it
 /// omits is inherited from the outer request.
 fn with_station_phy_capabilities(
@@ -916,7 +916,7 @@ fn nl_set_station_assoc(
 ) {
     let seq = sock.next_seq();
     // Real supported rates from the assoc request (Supported Rates id 1 + Extended
-    // Rates id 50), basic-rate bits preserved, like hostapd; fall back to OFDM.
+    // Rates id 50), basic-rate bits preserved, like reference AP; fall back to OFDM.
     let mut rates: Vec<u8> = Vec::new();
     if let Some(ies) = assoc_ies {
         if let Some(sr) = dot11::find_ie(ies, 1) {
@@ -971,7 +971,7 @@ fn nl_set_station_assoc(
         // Mark the station QoS/WMM-capable so the kernel enables A-MPDU
         // aggregation. The QoS Info byte comes from the station's WMM Information
         // element; without this nest a VHT/HE station negotiates a high MCS but
-        // moves almost no data (every MPDU goes out unaggregated). hostapd sends
+        // moves almost no data (every MPDU goes out unaggregated). reference AP sends
         // the identical nested attribute.
         if let Some(qosinfo) = qosinfo {
             m = m.attr(Attr::nested(
@@ -1101,7 +1101,7 @@ fn nl_set_default_group_key(
     }
 }
 
-/// Install a CCMP key into the kernel (pairwise PTK or group GTK).
+/// Install a pairwise CCMP/GCMP key or the BSS-wide CCMP-128 GTK.
 #[allow(clippy::too_many_arguments)]
 fn nl_new_key(
     sock: &mut NetlinkSocket,
@@ -1110,6 +1110,7 @@ fn nl_new_key(
     sta: Option<&[u8; 6]>,
     idx: u8,
     key: &[u8],
+    cipher: u32,
     pairwise: bool,
     link_id: Option<u8>,
 ) {
@@ -1117,7 +1118,7 @@ fn nl_new_key(
     let mut m = GenlMessage::new(family, NL80211_CMD_NEW_KEY, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
         .attr(Attr::bytes(NL80211_ATTR_KEY_DATA, key))
-        .attr(Attr::u32(NL80211_ATTR_KEY_CIPHER, WLAN_CIPHER_SUITE_CCMP))
+        .attr(Attr::u32(NL80211_ATTR_KEY_CIPHER, cipher))
         .attr(Attr::bytes(NL80211_ATTR_KEY_IDX, &[idx]))
         .attr(Attr::u32(
             NL80211_ATTR_KEY_TYPE,
@@ -1278,7 +1279,7 @@ mod station_authorization_tests {
                 .iter()
                 .all(|attr| attr.typ != NL80211_ATTR_MLD_ADDR
                     && attr.typ != NL80211_ATTR_MLO_LINK_ID),
-            "hostapd authorizes MLD state once; it does not address a link station"
+            "reference AP authorizes MLD state once; it does not address a link station"
         );
         let flags = msg
             .attrs
@@ -1317,7 +1318,7 @@ fn reconstruct_eapol(bssid: &[u8; 6], sta: &[u8; 6], eapol: &[u8]) -> Vec<u8> {
 ///
 /// STATUS: verified end-to-end against `wpa_supplicant` (`wpa_state=COMPLETED`,
 /// **ping works**): beacon, auth, assoc, the two-step station add (NEW_STATION
-/// unassoc → SET_STATION assoc, the hostapd "UNASSOC_STA workaround" for
+/// unassoc → SET_STATION assoc, the reference AP "UNASSOC_STA workaround" for
 /// non-`FULL_AP_CLIENT_STATE` drivers), the 4-way over the nl80211 control port,
 /// PTK/GTK install (`NEW_KEY`), authorization, and CCMP data both directions.
 /// See `tools/hwsim/README.md`.
@@ -1392,7 +1393,7 @@ fn read_iface_mac(iface: &str) -> Option<[u8; 6]> {
 }
 
 /// Capability element payloads derived from this radio's nl80211 GET_WIPHY
-/// response. hostapd builds its beacon/response capability IEs from the same
+/// response. reference AP builds its beacon/response capability IEs from the same
 /// attributes. Keeping the driver's bytes is important: an internally
 /// inconsistent synthetic HE/EHT advertisement is tolerated by some Linux
 /// scanners but rejected by stricter clients (notably macOS).
@@ -1440,7 +1441,7 @@ fn build_he_capability(attrs: &[(u16, &[u8])]) -> Option<Vec<u8>> {
         return None;
     }
     let mut phy = raw_phy[..11].to_vec();
-    // RustAP does not currently configure SU/MU beamforming. Match hostapd's
+    // RustAP does not currently configure SU/MU beamforming. Match reference AP's
     // default mask so we advertise only features enabled by the AP, not every
     // feature the radio could support under a different configuration.
     phy[3] &= !0x80; // SU beamformer
@@ -1503,7 +1504,7 @@ fn build_eht_capability(attrs: &[(u16, &[u8])], he: &[u8], band: u16) -> Option<
     if mcs.len() < mcs_len {
         return None;
     }
-    // The 320 MHz bit is meaningful only in the 6 GHz band; hostapd clears it
+    // The 320 MHz bit is meaningful only in the 6 GHz band; reference AP clears it
     // in lower-band beacons even when the same radio supports 320 MHz elsewhere.
     if band != NL80211_BAND_6GHZ {
         phy[0] &= !0x02;
@@ -1532,7 +1533,7 @@ mod wiphy_capability_tests {
     use super::*;
 
     #[test]
-    fn trims_and_masks_driver_he_eht_arrays_like_hostapd() {
+    fn trims_and_masks_driver_he_eht_arrays_like_reference_ap() {
         let he_mac = [0x0d, 0x00, 0x08, 0x9a, 0x40, 0x18];
         let he_phy = [
             0x0c, 0x63, 0x40, 0x88, 0xff, 0xd9, 0x9f, 0x1c, 0x11, 0x0e, 0x00,
@@ -1787,7 +1788,7 @@ fn nl_get_wiphy_capabilities(
         return None;
     };
 
-    // Ask for the split dump hostapd/iw use and merge every response belonging
+    // Ask for the split dump reference AP/iw use and merge every response belonging
     // to this wiphy. HE/EHT per-iftype data commonly arrives in a later message
     // than HT/VHT, so returning after the first multipart record drops it.
     let seq = sock.next_seq();
@@ -1847,7 +1848,7 @@ fn apply_wiphy_capabilities(frame: &mut Vec<u8>, caps: &WiphyCapabilities) {
     dot11::apply_phy_capabilities(frame, ies, &caps.phy_capabilities());
 }
 
-/// hostapd's nl80211 flush operation: DEL_STATION without NL80211_ATTR_MAC
+/// reference AP's nl80211 flush operation: DEL_STATION without NL80211_ATTR_MAC
 /// removes every station left by a previous AP instance. This must happen even
 /// after SIGKILL/SIGTERM, where userspace destructors cannot be relied upon.
 fn nl_flush_stations(sock: &mut NetlinkSocket, family: u16, ifindex: u32) -> io::Result<()> {
@@ -1858,7 +1859,7 @@ fn nl_flush_stations(sock: &mut NetlinkSocket, family: u16, ifindex: u32) -> io:
     )
 }
 
-/// Read the same live station measurements hostapd exposes from `STA` and
+/// Read the same live station measurements reference AP exposes from `STA` and
 /// `all_sta`. Keeping this on the existing command netlink socket avoids an
 /// `iw`/process spawn for every SPR API poll.
 fn nl_get_station_telemetry(
@@ -2028,14 +2029,14 @@ pub fn run_offload_ap(
     }
     iface_set_state(iface, true)?;
     eprintln!("netlink AP: {iface} set type __ap and brought up");
-    // Match hostapd's i802_flush(): remove every kernel station left by a
+    // Match reference AP's i802_flush(): remove every kernel station left by a
     // previous process before bringing up a new BSS. Without this, a client can
     // remain associated to the old SSID while this BSSID advertises a new one.
     match nl_flush_stations(&mut sock, family_id, ifindex) {
         Ok(()) => eprintln!("netlink AP: flushed stale kernel stations"),
         Err(e) => eprintln!("netlink AP: station flush failed (continuing): {e}"),
     }
-    // Register for auth + (re)assoc BEFORE START_AP, the order hostapd uses. On
+    // Register for auth + (re)assoc BEFORE START_AP, the order reference AP uses. On
     // MLO-capable drivers (ath12k) registering only after START_AP leaves the BSS
     // beaconing but never delivers the STA's Authentication/Association frames to
     // userspace — the client sees "unable to join". Registering pre-START_AP binds
@@ -2193,7 +2194,7 @@ pub fn run_offload_ap(
             .attr(Attr::u32(NL80211_ATTR_WPA_VERSIONS, NL80211_WPA_VERSION_2))
             .attr(Attr::bytes(
                 NL80211_ATTR_CIPHER_SUITES_PAIRWISE,
-                &WLAN_CIPHER_SUITE_CCMP.to_ne_bytes(),
+                &ap.pairwise_cipher().suite_selector().to_ne_bytes(),
             ))
             .attr(Attr::u32(
                 NL80211_ATTR_CIPHER_SUITE_GROUP,
@@ -2227,7 +2228,7 @@ pub fn run_offload_ap(
             link.link_id,
             link_freq
         );
-        // hostapd follows its pre-start station flush with a broadcast Deauth
+        // reference AP follows its pre-start station flush with a broadcast Deauth
         // once the new beacon is live. The flush removes stale AP-side state;
         // this frame makes clients that survived the restart immediately leave
         // their old association instead of caching the previous SSID on this
@@ -2246,7 +2247,7 @@ pub fn run_offload_ap(
         );
         eprintln!("netlink AP: broadcast Deauth sent after BSS restart");
     }
-    // hostapd updates every affiliated link's beacon after all links have
+    // reference AP updates every affiliated link's beacon after all links have
     // reached START_AP. During the first START_AP the partner link is not yet
     // active, so mac80211/ath12k retains only the Basic MLE Common Info and
     // drops the Per-STA Profile that references that inactive link. Re-submit
@@ -2304,7 +2305,7 @@ pub fn run_offload_ap(
 
     let mut stations: Vec<[u8; 6]> = Vec::new();
     let mut keyed: HashSet<[u8; 6]> = HashSet::new();
-    // hostapd does not start WPA until the successful Association Response is
+    // reference AP does not start WPA until the successful Association Response is
     // MAC-ACKed. Track its sequence-control value so a stale TX-status event for
     // an older response cannot release the current handshake's EAPOL frame.
     let mut assoc_tx: std::collections::HashMap<[u8; 6], u16> = std::collections::HashMap::new();
@@ -2337,7 +2338,7 @@ pub fn run_offload_ap(
     // The BSS-wide GTK/IGTK installed in the kernel, tracked as (key index,
     // bytes). We install once a station is keyed, then re-install whenever the
     // AP rotates the key (group rekey toggles the GTK index 1<->2 and the IGTK
-    // index 4<->5), removing the stale index — a hostapd-style two-phase rekey.
+    // index 4<->5), removing the stale index — a reference AP-style two-phase rekey.
     // (Per-STA-VIF mode installs each station's own GTK on its AP_VLAN instead.)
     let mut gtk_state: std::collections::HashMap<Option<u8>, (u8, [u8; 16])> =
         std::collections::HashMap::new();
@@ -2364,14 +2365,14 @@ pub fn run_offload_ap(
         map: std::collections::HashMap::new(),
     };
 
-    // hostapd uses separate netlink sockets for synchronous commands vs async
+    // reference AP uses separate netlink sockets for synchronous commands vs async
     // events. We do the same: `cmd` issues request/ACK commands (NEW_STATION,
     // NEW_KEY, AP_VLAN, …) so their ACK read-loop never swallows a frame event
     // (auth/assoc/EAPOL) that belongs to the event socket `sock`. Sharing one
     // socket dropped EAPOL frames mid-handshake and made rejoins fail.
     let mut cmd = NetlinkSocket::open()?;
 
-    // Optional hostapd-style runtime control socket (STATUS / STA-DUMP / DEAUTH /
+    // Optional reference AP-style runtime control socket (STATUS / STA-DUMP / DEAUTH /
     // FAILURES / ATTACH) carrying live AP-STA-* events to attached clients.
     let mut control =
         ctrl_path.and_then(
@@ -2440,7 +2441,7 @@ pub fn run_offload_ap(
                     }
                     continue;
                 }
-                // hostapd pre-adds the kernel station, sends the successful
+                // reference AP pre-adds the kernel station, sends the successful
                 // (Re)Association Response, and starts WPA only from this TX-
                 // status callback. Mirror that ordering: release the held m1/m3
                 // only after an 802.11 ACK. If the response was not ACKed, remove
@@ -2658,7 +2659,7 @@ pub fn run_offload_ap(
                             }
                             let mut client = [0u8; 6];
                             client.copy_from_slice(&fbytes[10..16]);
-                            // hostapd translates every address belonging to the
+                            // reference AP translates every address belonging to the
                             // peer MLD back to the association station before
                             // running its MLME. Without this, an iPhone that
                             // later uses its MLD MAC (or partner-link MAC) is
@@ -2761,7 +2762,7 @@ pub fn run_offload_ap(
         // timeout), so `stations`/`keyed` don't grow unbounded over connect/
         // disconnect cycles (and the key-install loop below doesn't iterate dead
         // entries). Keep a disconnected station's AP_VLAN briefly: SPR's
-        // hostapd action calls `STA <mac>` after receiving AP-STA-DISCONNECTED,
+        // reference AP action calls `STA <mac>` after receiving AP-STA-DISCONNECTED,
         // then uses the returned vlan_id to remove DHCP/firewall state.
         let live: HashSet<[u8; 6]> = ap.station_macs().into_iter().collect();
         stations.retain(|s| live.contains(s));
@@ -2822,7 +2823,7 @@ pub fn run_offload_ap(
             } else {
                 ifindex
             };
-            if let Some(tk) = ap.station_tk(sta) {
+            if let Some(tk) = ap.station_pairwise_key(sta) {
                 let mld_mac = ap.mld.then(|| ap.station_mld_mac(sta)).flatten();
                 let key_sta = mld_mac.as_ref().unwrap_or(sta);
                 // MLO pairwise keys are addressed to the peer MLD. The kernel
@@ -2834,7 +2835,8 @@ pub fn run_offload_ap(
                     key_if,
                     Some(key_sta),
                     0,
-                    &tk,
+                    tk,
+                    ap.pairwise_cipher().suite_selector(),
                     true,
                     None,
                 );
@@ -2852,12 +2854,20 @@ pub fn run_offload_ap(
                     };
                     for link_id in group_links {
                         nl_new_key(
-                            &mut cmd, family_id, key_if, None, gidx, &gkey, false, link_id,
+                            &mut cmd,
+                            family_id,
+                            key_if,
+                            None,
+                            gidx,
+                            &gkey,
+                            WLAN_CIPHER_SUITE_CCMP,
+                            false,
+                            link_id,
                         );
                         vlan_gtk.insert((*sta, link_id), (gidx, gkey));
                     }
                 }
-                // Authorization is MLD-level state. Match hostapd: select an
+                // Authorization is MLD-level state. Match reference AP: select an
                 // MLO peer by its MLD MAC and issue one plain SET_STATION,
                 // without MLO_LINK_ID/MLD_ADDR and without MODIFY_LINK_STA on
                 // partner links. Applying AUTHORIZED/WME/MFP to link stations
@@ -2894,7 +2904,15 @@ pub fn run_offload_ap(
                     // Install the (new) GTK at its index and make it the multicast
                     // default TX key, then remove the previous index.
                     nl_new_key(
-                        &mut cmd, family_id, ifindex, None, gtk_idx, &gtk, false, link_id,
+                        &mut cmd,
+                        family_id,
+                        ifindex,
+                        None,
+                        gtk_idx,
+                        &gtk,
+                        WLAN_CIPHER_SUITE_CCMP,
+                        false,
+                        link_id,
                     );
                     if let Some((old_idx, _)) = gtk_state.get(&link_id).copied() {
                         if old_idx != gtk_idx {
@@ -2935,7 +2953,17 @@ pub fn run_offload_ap(
                 for link_id in group_links {
                     let state_key = (*sta, link_id);
                     if vlan_gtk.get(&state_key) != Some(&(gidx, gkey)) {
-                        nl_new_key(&mut cmd, family_id, vidx, None, gidx, &gkey, false, link_id);
+                        nl_new_key(
+                            &mut cmd,
+                            family_id,
+                            vidx,
+                            None,
+                            gidx,
+                            &gkey,
+                            WLAN_CIPHER_SUITE_CCMP,
+                            false,
+                            link_id,
+                        );
                         if let Some(&(old_idx, _)) = vlan_gtk.get(&state_key) {
                             if old_idx != gidx {
                                 nl_del_key(&mut cmd, family_id, vidx, old_idx, link_id);
@@ -3079,7 +3107,7 @@ pub fn run_offload_ap(
             }
         }
         for ev in ap.drain_events() {
-            // hostapd adds `vlanid` (no underscore) to the connect event. SPR's
+            // reference AP adds `vlanid` (no underscore) to the connect event. SPR's
             // action script ignores that extra argv today and synchronously asks
             // `STA <mac>` for `vlan_id`, which the control responder above serves.
             let line = match &ev {
@@ -3130,7 +3158,7 @@ fn nl_del_station(sock: &mut NetlinkSocket, family: u16, ifindex: u32, sta: &[u8
     let _ = sock.request_ack(m);
 }
 
-/// Bring a network interface up (set IFF_UP) via an ioctl, like hostapd's
+/// Bring a network interface up (set IFF_UP) via an ioctl, like reference AP's
 /// `linux_set_iface_flags`. Needed after creating an AP_VLAN interface.
 fn iface_set_state(name: &str, up: bool) -> io::Result<()> {
     #[repr(C)]
@@ -3355,7 +3383,7 @@ fn nl_del_iface(sock: &mut NetlinkSocket, family: u16, ifindex: u32) {
     let _ = sock.request_ack(m);
 }
 
-/// Allow an attached hostapd_cli action enough time to query `STA <mac>` and
+/// Allow an attached reference AP control client action enough time to query `STA <mac>` and
 /// remove SPR DHCP/firewall state after a disconnect event.
 const VLAN_EVENT_GRACE: Duration = Duration::from_secs(5);
 
@@ -3370,7 +3398,7 @@ struct VlanAssignment {
     retire_at: Option<Instant>,
 }
 
-/// Per-station-VIF bookkeeping. IDs and names follow hostapd's wildcard VLAN
+/// Per-station-VIF bookkeeping. IDs and names follow reference AP's wildcard VLAN
 /// convention (`wlan3.#` -> `wlan3.4096`, `wlan3.4097`, ...).
 struct VlanState {
     enabled: bool,
@@ -3588,7 +3616,7 @@ fn route_outputs(
                 && d.body.len() >= 6
                 && u16::from_le_bytes([d.body[2], d.body[3]]) == 0;
 
-            // hostapd's add_associated_sta() runs before send_assoc_resp(). It
+            // reference AP's add_associated_sta() runs before send_assoc_resp(). It
             // deliberately puts the kernel station into associated state early:
             // otherwise cfg80211/the driver can drop EAPOL data before the
             // Association Response TX-status is processed. Our old order was the
@@ -3650,7 +3678,7 @@ fn route_outputs(
                         ap.station_mld_link_ids(&sta_addr),
                     );
                 }
-                // Match hostapd's MLO state-transition order exactly:
+                // Match reference AP's MLO state-transition order exactly:
                 //
                 //   1. NEW_STATION creates the association-link peer unassociated.
                 //   2. ADD_LINK_STA creates every negotiated partner peer.
@@ -3712,7 +3740,7 @@ fn route_outputs(
                 }
                 if vlan.enabled {
                     // Per-station VIF: give this station its own AP_VLAN so its
-                    // group key is isolated from other stations. Match hostapd's
+                    // group key is isolated from other stations. Match reference AP's
                     // `<base>.#` naming and lowest-free id allocation.
                     let (vlan_id, name) = match vlan.allocate() {
                         Ok(v) => v,
@@ -3724,7 +3752,7 @@ fn route_outputs(
                     match nl_create_ap_vlan(cmd, family, ifindex, &name) {
                         Ok(vidx) => {
                             // cfg80211 stores an MLO peer under its MLD MAC.
-                            // hostapd translates the station identity before
+                            // reference AP translates the station identity before
                             // SET_STATION(STA_VLAN); using the link address here
                             // returns ENOENT on ath12k.
                             let kernel_addr = mld_mac.unwrap_or(sta_addr);

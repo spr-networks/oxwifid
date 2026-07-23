@@ -67,6 +67,13 @@ fn parse_args() -> Config {
                     std::process::exit(1);
                 })
             }
+            "--cipher" | "--pairwise-cipher" => {
+                cfg.pairwise_cipher =
+                    barely_ap::config::parse_data_cipher(&next(i)).unwrap_or_else(|e| {
+                        eprintln!("barely-ap: {e}");
+                        std::process::exit(1);
+                    })
+            }
             "--band" => {
                 cfg.band = barely_ap::config::parse_band_str(&next(i)).unwrap_or_else(|e| {
                     eprintln!("barely-ap: {e}");
@@ -98,8 +105,13 @@ fn parse_args() -> Config {
                 eprintln!(
                     "          [--channel N] [--ip IP] [--mode stdio|iface|netlink] [--iface NAME]"
                 );
-                eprintln!("          [--band 2.4|5|6] [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--per-sta-vif]");
-                eprintln!("          [--ctrl PATH]   (netlink: hostapd-style control socket; multi-BSS via config `bss`)");
+                eprintln!(
+                    "          [--band 2.4|5|6] [--cipher ccmp-128|gcmp-128|ccmp-256|gcmp-256]"
+                );
+                eprintln!(
+                    "          [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--per-sta-vif]"
+                );
+                eprintln!("          [--ctrl PATH]   (netlink: reference AP-style control socket; multi-BSS via config `bss`)");
                 eprintln!("          [--spr-api-socket PATH] (direct SPR HTTP over a Unix socket; no action-script exec)");
                 eprintln!("          [--spr-dhcp-helper PATH] (invoke SPR DHCP/XDP helper for AP_VLAN clients)");
                 eprintln!("          [--country CC]  (2-letter regulatory code for the Country IE; default US)");
@@ -139,7 +151,7 @@ fn main() {
         KeyMgmt::Owe => "OWE",
     };
     eprintln!(
-        "barely-ap: ssid={:?} channel={} mac={} ip={}.{}.{}.{} mode={} {}",
+        "barely-ap: ssid={:?} channel={} mac={} ip={}.{}.{}.{} mode={} {} cipher={}",
         cfg.ssid,
         cfg.channel,
         barely_ap::util::bytes_to_mac(&cfg.mac),
@@ -149,6 +161,7 @@ fn main() {
         cfg.ip[3],
         cfg.mode,
         security,
+        cfg.pairwise_cipher.config_name(),
     );
 
     let channel = cfg.channel;

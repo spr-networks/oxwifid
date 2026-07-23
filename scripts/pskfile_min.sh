@@ -3,10 +3,10 @@
 # (fresh, no stale pin) connect uses the WILDCARD password -> must fall through
 # the MAC-specific candidate to the wildcard. Then a 2nd connect uses devicepass.
 B=/tmp/iopbin/barely-ap; NS=pskcli; R=/tmp/pskmin_result.txt
-WPAS=/home/ubuntu/hostap-hwsim/wpa_supplicant/wpa_supplicant
+WPAS=${WPAS:?set WPAS to the wpa_supplicant binary}
 rm -f "$R"; : > "$R"
 pkill -9 -f "[b]arely-ap --mode" 2>/dev/null; pkill -9 wlantest 2>/dev/null
-pkill -9 -f "hostap-hwsim" 2>/dev/null; for n in $NS interopcli; do ip netns del "$n" 2>/dev/null; done
+pkill -9 -x wpa_supplicant 2>/dev/null; for n in $NS interopcli; do ip netns del "$n" 2>/dev/null; done
 sleep 1; modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; modprobe mac80211_hwsim rctbl=1 radios=4; sleep 2
 iw reg set US 2>/dev/null; sleep 1
 mapfile -t HW < <(for n in $(ls /sys/class/net|grep ^wlan); do [ "$(basename "$(readlink /sys/class/net/$n/device/driver 2>/dev/null)")" = mac80211_hwsim ] && echo "$n"; done)
@@ -20,7 +20,7 @@ cat > /tmp/ap.json <<EOF
 EOF
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up; ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null
 setsid "$B" --config /tmp/ap.json </dev/null >/tmp/pskmin_ap.log 2>&1 &
-sleep 4; grep -aq "START_AP ok" /tmp/pskmin_ap.log && echo "AP: START_AP ok" >> "$R" || { echo "AP FAILED" >> "$R"; exit 1; }
+sleep 4; grep -aqE "START_AP.*ok" /tmp/pskmin_ap.log && echo "AP: START_AP ok" >> "$R" || { echo "AP FAILED" >> "$R"; exit 1; }
 ip netns add "$NS"; iw phy "$(cat /sys/class/net/$STA/phy80211/name)" set netns name "$NS"
 ip netns exec "$NS" iw reg set US 2>/dev/null; ip netns exec "$NS" ip link set lo up
 ip netns exec "$NS" ip link set "$STA" up; sleep 1

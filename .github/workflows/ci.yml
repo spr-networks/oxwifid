@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        # SHA-pinned actions/checkout v5.
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Show pinned Rust toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings -A clippy::too_many_arguments
+
+      - name: Run tests
+        run: cargo test --locked --all-targets

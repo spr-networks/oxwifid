@@ -4,7 +4,7 @@
 # bitmap in EHT Operation (ext 106). Writes /tmp/twteht_result.txt.
 B=/tmp/iopbin/barely-ap; R=/tmp/twteht_result.txt
 rm -f "$R" /tmp/te.pcap; : > "$R"
-pkill -9 wlantest 2>/dev/null; pkill -9 -f "hostap-hwsim" 2>/dev/null; pkill -9 -f "[b]arely-ap --mode" 2>/dev/null
+pkill -9 wlantest 2>/dev/null; pkill -9 -x wpa_supplicant 2>/dev/null; pkill -9 -f "[b]arely-ap --mode" 2>/dev/null
 sleep 1; modprobe -r mac80211_hwsim 2>/dev/null; sleep 1; modprobe mac80211_hwsim rctbl=1 radios=4; sleep 2
 iw reg set US 2>/dev/null; sleep 1
 mapfile -t HW < <(for n in $(ls /sys/class/net|grep ^wlan); do [ "$(basename "$(readlink /sys/class/net/$n/device/driver 2>/dev/null)")" = mac80211_hwsim ] && echo "$n"; done)
@@ -42,7 +42,7 @@ EOF
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up; ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null
 setsid "$B" --config /tmp/te.json </dev/null >/tmp/te.log 2>&1 &
 sleep 4
-grep -aq "START_AP ok" /tmp/te.log && echo "AP: START_AP ok" >> "$R" || echo "AP FAILED: $(tail -1 /tmp/te.log)" >> "$R"
+grep -aqE "START_AP.*ok" /tmp/te.log && echo "AP: START_AP ok" >> "$R" || echo "AP FAILED: $(tail -1 /tmp/te.log)" >> "$R"
 timeout 4 tcpdump -i "$MON" -c 4 -w /tmp/te.pcap 'type mgt subtype beacon' >/dev/null 2>&1
 echo "=== HE caps (ext 35, byte after '23' = MAC byte0; bit2=TWT) + EHT op (ext 106) ===" >> "$R"
 python3 /tmp/dump.py /tmp/te.pcap 35 106 >> "$R" 2>>"$R"
