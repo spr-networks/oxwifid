@@ -1,0 +1,43 @@
+[package]
+name = "barely-ap"
+version = "0.1.0"
+edition = "2021"
+description = "A userland 802.11 AP with WPA2/WPA3 and CCMP/GCMP support"
+license = "MIT"
+
+[[bin]]
+name = "barely-ap"
+path = "src/main.rs"
+
+[[bin]]
+name = "barely-cli"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "barely-nan"
+path = "src/bin/nan.rs"
+
+[lib]
+name = "barely_ap"
+path = "src/lib.rs"
+
+[dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+cipher = "0.4"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+p256 = { version = "0.14", default-features = false, features = ["arithmetic", "hash2curve"] }
+getrandom = "0.2"
+num-bigint = "0.4"
+num-traits = "0.2"
+serde_json = "1"
+zeroize = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3

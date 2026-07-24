@@ -1,0 +1,17 @@
+{
+  "ssid": "turtlenet",
+  "psk_file": "/run/secrets/wifi-credentials",
+  "key_mgmt": "sae",
+  "country_code": "US",
+  "band": 5,
+  "channel": 36,
+  "mode": "netlink",
+  "interface": "wlan0",
+  "mac": "02:00:00:00:00:00",
+  "ip": "10.10.10.1",
+  "ocv": true,
+  "btm": false,
+  "per_sta_vif": true,
+  "width": 80,
+  "wmm": true
+}

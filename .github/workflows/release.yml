@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Apply requested version tag
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release: ${{ steps.release.outputs.release }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out the tested commit
+        # SHA-pinned actions/checkout v5.
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Reject stale CI runs
+        id: current
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          remote_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [ "$remote_sha" = "$TESTED_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping stale CI result for $TESTED_SHA; main is $remote_sha"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attach the tested commit to main
+        if: ${{ steps.current.outputs.current == 'true' }}
+        env:
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: git checkout -B main "$TESTED_SHA"
+
+      - name: Bump version and push tag
+        if: ${{ steps.current.outputs.current == 'true' }}
+        # SHA-pinned github-tag-action 1.40.0, matching super_plugins.
+        uses: anothrNick/github-tag-action@38e273cbdda80759cc0232a36f559999f4e47d29
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WITH_V: true
+          INITIAL_VERSION: 0.1.0
+          DEFAULT_BUMP: none
+          BRANCH_HISTORY: last
+
+      - name: Select an exact release tag
+        id: release
+        if: ${{ steps.current.outputs.current == 'true' }}
+        run: |
+          set -euo pipefail
+          tag="$(
+            git tag --points-at HEAD --list 'v[0-9]*' --sort=-version:refname |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              head -n 1 || true
+          )"
+          if [ -z "$tag" ]; then
+            echo "No #patch, #minor, or #major marker; nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "release=true"
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and publish Linux ARM64
+    needs: tag
+    if: ${{ needs.tag.outputs.release == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out release tag
+        # SHA-pinned actions/checkout v5.
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.tag.outputs.tag }}
+
+      - name: Load reproducible build pins
+        run: grep -vE '^[[:space:]]*(#|$)' reproducible.env >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        # SHA-pinned docker/setup-qemu-action v3.
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130
+        with:
+          platforms: arm64
+
+      - name: Set up pinned BuildKit
+        # SHA-pinned docker/setup-buildx-action v3.
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+
+      - name: Build Linux ARM64 release
+        run: ./scripts/build-release.sh --single "${{ needs.tag.outputs.version }}" dist
+
+      - name: Attest release archive
+        if: ${{ github.event.repository.visibility == 'public' }}
+        # SHA-pinned actions/attest-build-provenance v3.
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/barely-ap-v${{ needs.tag.outputs.version }}-aarch64-unknown-linux-musl.tar.gz
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi

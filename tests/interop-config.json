@@ -1,0 +1,10 @@
+{
+  "ssid": "turtlenet",
+  "passphrase": "password1234",
+  "key_mgmt": "psk",
+  "ocv": false,
+  "mode": "stdio",
+  "mac": "02:00:00:00:00:00",
+  "band": 2.4,
+  "channel": 1
+}
