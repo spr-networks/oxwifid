@@ -9,6 +9,11 @@ use barely_ap::config::Config;
 const L0_MAC: [u8; 6] = [0x0a, 0, 0, 0, 0xaa, 0x01];
 const L1_MAC: [u8; 6] = [0x0e, 0, 0, 0, 0xaa, 0x02];
 
+/// A parsed information element: (element id, body).
+type Ie = (u8, Vec<u8>);
+/// A per-STA-profile partner link: (link id, link MAC).
+type MlePartner = (u8, [u8; 6]);
+
 fn mld_ap() -> barely_ap::ap::Ap {
     let cfg = Config::from_json(
         r#"{
@@ -30,8 +35,8 @@ fn mld_ap() -> barely_ap::ap::Ap {
 /// elements (a 255-octet element followed by Fragment elements, ID 242 is for
 /// subelements — the element-level Fragment ID is 254). `offset` skips the
 /// beacon's fixed fields (timestamp + interval + capabilities).
-fn ies(frame: &[u8], offset: usize) -> Vec<(u8, Vec<u8>)> {
-    let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
+fn ies(frame: &[u8], offset: usize) -> Vec<Ie> {
+    let mut out: Vec<Ie> = Vec::new();
     let mut i = offset;
     while i + 2 <= frame.len() {
         let id = frame[i];
@@ -51,7 +56,7 @@ fn ies(frame: &[u8], offset: usize) -> Vec<(u8, Vec<u8>)> {
 }
 
 /// The beacon's Basic Multi-Link element: (own link id, per-STA profile link ids).
-fn parse_mle(ies: &[(u8, Vec<u8>)]) -> Option<(u8, Vec<(u8, [u8; 6])>)> {
+fn parse_mle(ies: &[Ie]) -> Option<(u8, Vec<MlePartner>)> {
     for (id, body) in ies {
         if *id != 255 || body.first() != Some(&107) {
             continue;
@@ -96,7 +101,7 @@ fn parse_mle(ies: &[(u8, Vec<u8>)]) -> Option<(u8, Vec<(u8, [u8; 6])>)> {
 }
 
 /// Every RNR TBTT entry carrying MLD parameters: (link id, BSSID, channel).
-fn parse_rnr_mld(ies: &[(u8, Vec<u8>)]) -> Vec<(u8, [u8; 6], u8)> {
+fn parse_rnr_mld(ies: &[Ie]) -> Vec<(u8, [u8; 6], u8)> {
     let mut out = Vec::new();
     for (id, body) in ies {
         if *id != 201 {
