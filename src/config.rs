@@ -178,7 +178,14 @@ pub struct BssConfig {
 #[derive(Clone, Debug)]
 pub struct RadioConfig {
     pub iface: String,
+    /// Radio BSSID. Optional: when not given (`mac_explicit == false`) the
+    /// netlink AP adopts the interface's own MAC, which is what a kernel-offload
+    /// BSSID must be anyway, so most configs can omit it.
     pub mac: [u8; 6],
+    pub mac_explicit: bool,
+    /// Per-radio SSID override. `None` inherits the shared top-level `ssid`, so
+    /// a DBDC config can give 2.4 and 5 GHz the same or different network names.
+    pub ssid: Option<String>,
     pub band: Band,
     pub channel: u8,
     pub width: u16,
@@ -338,6 +345,7 @@ fn parse_radio(
             key.as_str(),
             "iface"
                 | "interface"
+                | "ssid"
                 | "mac"
                 | "bssid"
                 | "band"
@@ -368,7 +376,6 @@ fn parse_radio(
     }
 
     let iface_value = radio_field(object, &["iface", "interface"], "iface", true)?.unwrap();
-    let mac_value = radio_field(object, &["mac", "bssid"], "mac", true)?.unwrap();
     let band_value = radio_field(object, &["band"], "band", true)?.unwrap();
     let channel_value = radio_field(object, &["channel"], "channel", true)?.unwrap();
     let width_value = radio_field(object, &["width", "channel_width"], "width", true)?.unwrap();
@@ -377,9 +384,20 @@ fn parse_radio(
     let ctrl_value =
         radio_field(object, &["ctrl_path", "ctrl_interface"], "ctrl_path", true)?.unwrap();
 
-    let mac_text = as_str("mac", mac_value)?;
-    let mac =
-        try_mac_to_bytes(mac_text).ok_or_else(|| format!("invalid radio mac {mac_text:?}"))?;
+    // MAC is optional: a non-MLD netlink AP adopts the interface's own MAC as
+    // the BSSID regardless, so a config need not repeat it. When omitted, use
+    // the placeholder default (it will be adopted at bring-up).
+    let (mac, mac_explicit) = match radio_field(object, &["mac", "bssid"], "mac", false)? {
+        Some(value) => {
+            let text = as_str("mac", value)?;
+            let m = try_mac_to_bytes(text).ok_or_else(|| format!("invalid radio mac {text:?}"))?;
+            (m, true)
+        }
+        None => (mac_to_bytes("02:00:00:00:00:00"), false),
+    };
+    let ssid = radio_field(object, &["ssid"], "ssid", false)?
+        .map(|value| as_str("ssid", value).map(str::to_string))
+        .transpose()?;
     let width_number = width_value
         .as_u64()
         .ok_or("radio width must be an integer")?;
@@ -442,6 +460,8 @@ fn parse_radio(
     Ok(RadioConfig {
         iface: as_str("iface", iface_value)?.to_string(),
         mac,
+        mac_explicit,
+        ssid,
         band: parse_band("band", band_value)?,
         channel: as_u8("channel", channel_value)?,
         width,
@@ -655,7 +675,14 @@ impl Config {
                     return Err(format!("duplicate radio iface {:?}", radio.iface));
                 }
                 ifaces.push(radio.iface.clone());
-                for mac in std::iter::once(&radio.mac).chain(radio.bss.iter().map(|bss| &bss.mac)) {
+                // Only dup-check explicit BSSIDs. An adopted (implicit) radio MAC
+                // comes from its interface, which is already unique per radio.
+                let radio_macs = radio
+                    .mac_explicit
+                    .then_some(&radio.mac)
+                    .into_iter()
+                    .chain(radio.bss.iter().map(|bss| &bss.mac));
+                for mac in radio_macs {
                     if macs.contains(mac) {
                         return Err(format!(
                             "duplicate BSSID {} across radios",
@@ -684,6 +711,9 @@ impl Config {
         resolved.radios.clear();
         resolved.iface = radio.iface.clone();
         resolved.mac = radio.mac;
+        if let Some(ssid) = &radio.ssid {
+            resolved.ssid = ssid.clone();
+        }
         resolved.band = radio.band;
         resolved.channel = radio.channel;
         resolved.width = radio.width;
@@ -1765,6 +1795,49 @@ mod tests {
     }
 
     #[test]
+    fn radios_allow_optional_mac_and_per_radio_ssid() {
+        // No `mac` on either radio (adopted from the interface), and a per-radio
+        // SSID override on 2.4 GHz while 5 GHz inherits the shared SSID.
+        let cfg = Config::from_json(
+            r#"{
+                "ssid": "shared-net",
+                "key_mgmt": "sae",
+                "passphrase": "password1234",
+                "mode": "netlink",
+                "radios": [
+                    { "iface": "wlan1", "ssid": "net-2g", "band": 2.4, "channel": 6,
+                      "width": 20, "phy": "ax", "ctrl_path": "/run/w1" },
+                    { "iface": "wlan2", "band": 5, "channel": 36,
+                      "width": 80, "phy": "ax", "ctrl_path": "/run/w2" }
+                ]
+            }"#,
+        )
+        .expect("parses without a radio mac");
+        // Two macless radios must NOT collide on the placeholder default BSSID.
+        cfg.validate()
+            .expect("validates with adopted (implicit) BSSIDs");
+
+        assert!(!cfg.radios[0].mac_explicit);
+        assert!(!cfg.radios[1].mac_explicit);
+        // Per-radio SSID override vs inherited shared SSID.
+        assert_eq!(cfg.radios[0].ssid.as_deref(), Some("net-2g"));
+        assert!(cfg.radios[1].ssid.is_none());
+        assert_eq!(cfg.for_radio(&cfg.radios[0]).ssid, "net-2g");
+        assert_eq!(cfg.for_radio(&cfg.radios[1]).ssid, "shared-net");
+
+        // An explicit mac still parses and is dup-checked.
+        assert!(Config::from_json(
+            r#"{ "ssid": "s", "passphrase": "password1234", "mode": "netlink", "radios": [
+                { "iface": "w1", "mac": "02:00:00:00:00:aa", "band": 5, "channel": 36,
+                  "width": 20, "phy": "ax", "ctrl_path": "/run/a" },
+                { "iface": "w2", "mac": "02:00:00:00:00:aa", "band": 5, "channel": 40,
+                  "width": 20, "phy": "ax", "ctrl_path": "/run/b" } ] }"#
+        )
+        .and_then(|c| c.validate())
+        .is_err());
+    }
+
+    #[test]
     fn shipped_json_examples_parse_and_validate() {
         for (name, text) in [
             (
@@ -1850,12 +1923,15 @@ mod tests {
         )
         .unwrap_err()
         .contains("explicit phy"));
+        // Genuinely-shared policy (auth/credentials/station policy) is still
+        // rejected inside a radio entry. `ssid` is intentionally NOT here — it is
+        // an allowed per-radio override (see radios_allow_optional_mac_and_per_radio_ssid).
         assert!(Config::from_json(
             r#"{"radios":[{
                 "iface":"wlan1", "mac":"02:00:00:00:00:01",
                 "band":2.4, "channel":1, "width":20, "phy":"ax",
                 "ctrl_path":"/run/barely-ap/wlan1",
-                "ssid":"must-be-shared"
+                "per_sta_vif": true
             }]}"#
         )
         .unwrap_err()

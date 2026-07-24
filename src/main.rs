@@ -132,7 +132,6 @@ fn parse_args() -> Config {
                 eprintln!("          [--spr-api-socket PATH] (direct SPR HTTP over a Unix socket; no action-script exec)");
                 eprintln!("          [--spr-dhcp-helper PATH] (invoke SPR DHCP/XDP helper for AP_VLAN clients)");
                 eprintln!("          [--country CC]  (2-letter regulatory code for the Country IE; default US)");
-                eprintln!("          DBDC uses the canonical radios[] array in the JSON config");
                 std::process::exit(0);
             }
             other => {

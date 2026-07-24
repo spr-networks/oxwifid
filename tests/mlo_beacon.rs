@@ -259,11 +259,8 @@ fn non_inheritance_lists_reporting_only_elements() {
     // When the reported partner has every element the reporting link has (a
     // superset), there is nothing to exclude.
     assert!(
-        dot11::non_inheritance_element(
-            (&[1u8, 48], &[35u8]),
-            (&[1u8, 48, 61], &[35u8, 36]),
-        )
-        .is_empty(),
+        dot11::non_inheritance_element((&[1u8, 48], &[35u8]), (&[1u8, 48, 61], &[35u8, 36]),)
+            .is_empty(),
         "no non-inheritance when the partner is a superset"
     );
 }
@@ -280,8 +277,20 @@ fn assoc_per_sta_profile_carries_bss_param_change_count() {
     // Subelement: id(1) + len(1) + STA Control(2) ...
     let beacon_ctrl = u16::from_le_bytes([beacon[2], beacon[3]]);
     let assoc_ctrl = u16::from_le_bytes([assoc[2], assoc[3]]);
-    assert_eq!(beacon_ctrl & (1 << 11), 0, "beacon profile omits BSS param count");
-    assert_ne!(assoc_ctrl & (1 << 11), 0, "assoc profile sets BSS param count bit");
+    assert_eq!(
+        beacon_ctrl & (1 << 11),
+        0,
+        "beacon profile omits BSS param count"
+    );
+    assert_ne!(
+        assoc_ctrl & (1 << 11),
+        0,
+        "assoc profile sets BSS param count bit"
+    );
     // STA Info Length is one octet larger in the assoc profile (the extra count).
-    assert_eq!(assoc[4], beacon[4] + 1, "assoc STA Info carries the extra octet");
+    assert_eq!(
+        assoc[4],
+        beacon[4] + 1,
+        "assoc STA Info carries the extra octet"
+    );
 }

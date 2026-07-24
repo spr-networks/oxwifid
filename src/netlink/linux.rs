@@ -1984,7 +1984,9 @@ fn nl_set_regulatory(alpha2: &[u8; 2]) {
         eprintln!("netlink AP: regulatory domain already {cc_str}");
         return;
     }
-    let subscribed = reg_group.map(|g| sock.join_multicast(g).is_ok()).unwrap_or(false);
+    let subscribed = reg_group
+        .map(|g| sock.join_multicast(g).is_ok())
+        .unwrap_or(false);
 
     // Send the hint. NUL-terminated alpha-2, matching iw's 3-byte attribute. We
     // don't use `request_ack` here: it would consume (and discard) the

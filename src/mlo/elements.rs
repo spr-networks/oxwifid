@@ -345,10 +345,7 @@ pub fn element_id_sets(ies: &[u8]) -> (Vec<u8>, Vec<u8>) {
 /// the reporting-link element IDs (base + extension) that the reported link does
 /// NOT have, so they are not inherited. Empty when the reported link is a
 /// superset (e.g. a 5 GHz partner of a 2.4 GHz association link).
-pub fn non_inheritance_element(
-    reporting: (&[u8], &[u8]),
-    reported: (&[u8], &[u8]),
-) -> Vec<u8> {
+pub fn non_inheritance_element(reporting: (&[u8], &[u8]), reported: (&[u8], &[u8])) -> Vec<u8> {
     let base: Vec<u8> = reporting
         .0
         .iter()
