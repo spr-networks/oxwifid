@@ -221,15 +221,14 @@ fn log_startup(cfg: &Config) {
         KeyMgmt::SaeTransition => "WPA3-SAE/WPA2 transition",
         KeyMgmt::Owe => "OWE",
     };
+    // Note: no `ip=` here. The fakenet gateway address (`cfg.ip`) only applies
+    // to the stdio/iface fakenet backend; in netlink mode the kernel data plane
+    // plus SPR's DHCP own addressing, so printing it there was misleading.
     eprintln!(
-        "barely-ap: ssid={:?} channel={} mac={} ip={}.{}.{}.{} mode={} {} cipher={}",
+        "barely-ap: ssid={:?} channel={} mac={} mode={} {} cipher={}",
         cfg.ssid,
         cfg.channel,
         barely_ap::util::bytes_to_mac(&cfg.mac),
-        cfg.ip[0],
-        cfg.ip[1],
-        cfg.ip[2],
-        cfg.ip[3],
         cfg.mode,
         security,
         cfg.pairwise_cipher.config_name(),
