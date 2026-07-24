@@ -1,6 +1,6 @@
 # barely-ap (Rust)
 
-Auto-coded (vibe) wifi 7 userland access point for linux.
+Auto-coded wifi 7 userland access point for linux.
 
 > This remains experimental software. Its WPA state machines include replay,
 > cache-lifetime, anti-clogging, and key-erasure hardening, but it has not had
