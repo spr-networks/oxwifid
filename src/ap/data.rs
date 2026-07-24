@@ -61,6 +61,17 @@ impl Ap {
                 if let Some(s) = self.stations.get_mut(&sta) {
                     s.last_rx_pn = pn;
                 }
+                // Guest BSS client isolation: a frame addressed to another of
+                // this AP's stations must not be carried. It still counts for
+                // replay state (last_rx_pn above) — it was a valid frame from
+                // the station, just not one the AP will forward.
+                if self.guest {
+                    let mut dst = [0u8; 6];
+                    dst.copy_from_slice(&eth[0..6]);
+                    if matches!(self.stations.get(&dst), Some(d) if d.associated) {
+                        return;
+                    }
+                }
                 out.to_network.push(eth);
             }
             Some(_) => {} // decrypted, but spoofed source MAC — drop quietly
@@ -84,6 +95,14 @@ impl Ap {
         src.copy_from_slice(&eth[6..12]);
         let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
         let inner = &eth[14..];
+
+        // Guest BSS client isolation: a frame whose source is one of this AP's
+        // own stations is station-to-station traffic reflected back by an
+        // external bridge (the direct path is already dropped on uplink).
+        // Covers hairpinned unicast and re-broadcast alike.
+        if self.guest && matches!(self.stations.get(&src), Some(s) if s.associated) {
+            return frames;
+        }
 
         let (cipher, key_id, pn, tk, a1, qos_tid, sec_addrs) =
             if is_multicast(&dst) || is_broadcast(&dst) {

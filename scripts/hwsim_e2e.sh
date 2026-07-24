@@ -2,7 +2,7 @@
 # Complete Linux mac80211_hwsim E2E matrix.
 #
 # This is the audit/release entry point: one command resets hwsim, runs both
-# protocol directions, prints a single 27-cell summary, and exits nonzero when
+# protocol directions plus DBDC, prints a single 28-cell summary, and exits nonzero when
 # any cell fails. Individual scenario scripts remain useful only for debugging.
 #
 # Usage:
@@ -15,13 +15,20 @@
 set -uo pipefail
 
 if [ "$EUID" -ne 0 ]; then
-    exec sudo -n bash "$0" "$@"
+    SUDO_ENV=()
+    for name in WPAS REFERENCE_AP REFERENCE_AP_CLI CLIENT_CONFIG WRONG_CONFIG RUN_LOG_DIR AP_IF STA_IF; do
+        if [ -n "${!name:-}" ]; then
+            SUDO_ENV+=("$name=${!name}")
+        fi
+    done
+    exec sudo -n env "${SUDO_ENV[@]}" bash "$0" "$@"
 fi
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BINDIR=${1:-"$ROOT/target/release"}
 AP_MATRIX="$ROOT/scripts/hwsim_interop.sh"
 CLIENT_CELL="$ROOT/tools/hwsim/scen_client_reference_ap.sh"
+DBDC_CELL="$ROOT/scripts/hwsim_dbdc.sh"
 CLIENT_CONFIG=${CLIENT_CONFIG:-"$ROOT/tests/interop-config.json"}
 WRONG_CONFIG=${WRONG_CONFIG:-"$ROOT/tools/hwsim/client-wrong-password.json"}
 RUN_LOG_DIR=${RUN_LOG_DIR:-"/tmp/barely-hwsim-e2e-$$"}
@@ -39,7 +46,7 @@ for binary in barely-ap barely-cli; do
         exit 2
     fi
 done
-for path in "$AP_MATRIX" "$CLIENT_CELL" "$CLIENT_CONFIG" "$WRONG_CONFIG"; do
+for path in "$AP_MATRIX" "$CLIENT_CELL" "$DBDC_CELL" "$CLIENT_CONFIG" "$WRONG_CONFIG"; do
     if [ ! -e "$path" ]; then
         echo "FATAL: missing E2E input $path" >&2
         exit 2
@@ -111,6 +118,18 @@ if [ "$AP_RC" -ne 0 ] && [ "$AP_FAIL" -eq 0 ]; then
     FAIL=$((FAIL + 1))
 fi
 
+echo
+echo "## DBDC: one Rust AP process -> two SAE stations"
+DBDC_LOG="$RUN_LOG_DIR/dbdc.log"
+if WPAS="$WPAS" RUN_LOG_DIR="$RUN_LOG_DIR/dbdc-state" \
+    bash "$DBDC_CELL" "$BINDIR" 2>&1 | tee "$DBDC_LOG"; then
+    PASS=$((PASS + 1))
+    print_cell "DBDC simultaneous 2.4/5 GHz SAE" PASS
+else
+    FAIL=$((FAIL + 1))
+    print_cell "DBDC simultaneous 2.4/5 GHz SAE" FAIL
+fi
+
 # Direction B covers authentication, encrypted data, externally visible state,
 # AP restart recovery, group-key rotation, and credential rejection.
 wait_for_hwsim_interface "$CLIENT_AP_IF" || exit 2
@@ -133,7 +152,7 @@ TOTAL=$((PASS + FAIL))
 echo
 echo "# RESULT: $PASS pass / $FAIL fail ($TOTAL cells)"
 echo "# Detailed logs: $RUN_LOG_DIR"
-if [ "$FAIL" -eq 0 ] && [ "$TOTAL" -eq 27 ]; then
+if [ "$FAIL" -eq 0 ] && [ "$TOTAL" -eq 28 ]; then
     echo "# Complete Linux hwsim E2E: ALL PASS"
     exit 0
 fi

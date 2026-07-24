@@ -693,6 +693,7 @@ fn nl_set_bss(
     ifindex: u32,
     link_id: Option<u8>,
     ht_enabled: bool,
+    isolate: bool,
 ) -> io::Result<()> {
     // 6, 12 and 24 Mbps in nl80211's 500-kbps units, matching reference AP's
     // mandatory OFDM basic-rate set on 5/6 GHz.
@@ -702,7 +703,9 @@ fn nl_set_bss(
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
         .attr(Attr::u8(NL80211_ATTR_BSS_CTS_PROT, 0))
         .attr(Attr::u8(NL80211_ATTR_BSS_SHORT_PREAMBLE, 1))
-        .attr(Attr::u8(NL80211_ATTR_AP_ISOLATE, 0))
+        // Guest BSS: mac80211 stops intra-BSS station-to-station bridging
+        // (reference AP `ap_isolate`).
+        .attr(Attr::u8(NL80211_ATTR_AP_ISOLATE, isolate as u8))
         .attr(Attr::bytes(NL80211_ATTR_BSS_BASIC_RATES, &AP_BASIC_RATES));
     if ht_enabled {
         m = m.attr(Attr::u16v(NL80211_ATTR_BSS_HT_OPMODE, 0));
@@ -2221,6 +2224,7 @@ pub fn run_offload_ap(
             ifindex,
             ap.mld.then_some(link.link_id),
             !link.band6,
+            ap.guest(),
         )?;
         eprintln!(
             "netlink AP: START_AP + SET_BSS ok — kernel beaconing {:?} link_id={} on {} MHz (ifindex {ifindex})",
@@ -2278,6 +2282,7 @@ pub fn run_offload_ap(
                 ifindex,
                 Some(link.link_id),
                 !link.band6,
+                ap.guest(),
             )?;
             eprintln!(
                 "netlink AP: SET_BEACON + SET_BSS link_id={} with MLE partner_info={} bytes",
@@ -2405,6 +2410,22 @@ pub fn run_offload_ap(
                     continue;
                 }
                 let attrs = msg::parse_attrs(parsed.genl_attrs());
+                // Multiple independently-running radios subscribe to the same
+                // nl80211 multicast groups. Never let a management, TX-status,
+                // control-port, or radar event for another netdev reach this
+                // radio's AP state machine. Events from this radio's own
+                // AP_VLAN children still belong to it: mac80211 delivers a
+                // control-port EAPOL from a per-STA-VIF station (group-rekey
+                // m2, rejoin) with the AP_VLAN's ifindex, not the AP's.
+                if msg::find_attr(&attrs, NL80211_ATTR_IFINDEX)
+                    .and_then(read_u32)
+                    .is_some_and(|event_ifindex| {
+                        event_ifindex != ifindex
+                            && !vlan.map.values().any(|v| v.ifindex == event_ifindex)
+                    })
+                {
+                    continue;
+                }
                 if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
                     if let Some(c) = parsed.genl_cmd() {
                         if c == NL80211_CMD_FRAME || c == NL80211_CMD_CONTROL_PORT_FRAME {
@@ -2618,6 +2639,7 @@ pub fn run_offload_ap(
                         // fall back to the link BSSID and event frequency instead
                         // of silently dropping a valid Authentication request.
                         let mut fbytes = f.to_vec();
+                        ap.set_mgmt_rx_link(None);
                         if ap.mld {
                             if fbytes.len() < 22 {
                                 continue;
@@ -2657,6 +2679,10 @@ pub fn run_offload_ap(
                                     crate::util::bytes_to_mac(&ra),
                                 );
                             }
+                            // The state machine builds link-addressed responses
+                            // (probe responses in particular) for the link the
+                            // frame arrived on.
+                            ap.set_mgmt_rx_link(Some(lid));
                             let mut client = [0u8; 6];
                             client.copy_from_slice(&fbytes[10..16]);
                             // reference AP translates every address belonging to the
@@ -3662,9 +3688,17 @@ fn route_outputs(
                 let listen_interval = ap.station_listen_interval(&sta_addr).unwrap_or(0);
                 let capability = ap.station_capability(&sta_addr).unwrap_or(0);
                 // An AP MLD must scope every station add/modify request to its
-                // association link. A legacy station has no MLD_ADDR, but it
-                // still requires MLO_LINK_ID or cfg80211 rejects NEW_STATION.
-                let link_id = ap.mld.then_some(ap.link_id);
+                // association link — the link the (re)assoc frame arrived on,
+                // which a client may freely choose (wpa_supplicant routinely
+                // picks the 5/6 GHz link, not link 0). `link_route` records that
+                // per-station RX link and already drives the response/EAPOL TX,
+                // so the kernel station's primary link must match it; otherwise
+                // m1 is sent on the association link while the station only
+                // exists on link 0, and the 4-way times out. A legacy station
+                // has no MLD_ADDR, but still needs MLO_LINK_ID or cfg80211
+                // rejects NEW_STATION.
+                let assoc_link_id = link_route.get(&sta_addr).copied().unwrap_or(ap.link_id);
+                let link_id = ap.mld.then_some(assoc_link_id);
                 let eml_capability = sta_caps.and_then(dot11::parse_mld_eml_capability);
                 let mld_capability = sta_caps.and_then(dot11::parse_mld_capability);
                 if let Some(mld) = mld_mac {
@@ -3694,7 +3728,9 @@ fn route_outputs(
                         .map(dot11::parse_mld_link_profiles)
                         .unwrap_or_default();
                     for (peer_link_id, peer_link_mac) in ap.station_mld_link_macs(&sta_addr) {
-                        if peer_link_id == ap.link_id {
+                        // The association link is already created by NEW_STATION;
+                        // only the *other* negotiated links get ADD_LINK_STA.
+                        if peer_link_id == assoc_link_id {
                             continue;
                         }
                         let profile = link_profiles.iter().find(|profile| {

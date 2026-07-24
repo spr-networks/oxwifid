@@ -491,6 +491,11 @@ mod server {
                         self.attached.retain(|p| p != &peer);
                         "OK\n".to_string()
                     }
+                    // A static-credential (guest) BSS keeps its static password:
+                    // reloading the device credential database must not touch it
+                    // (the set_psk_file guard would ignore it anyway; answer
+                    // without reading the file).
+                    "RELOAD_WPA_PSK" | "RELOAD" if ap.static_credential() => "OK\n".to_string(),
                     "RELOAD_WPA_PSK" | "RELOAD" => match self.psk_file.as_deref() {
                         Some(path) => {
                             match crate::config::parse_psk_file(path.to_string_lossy().as_ref()) {

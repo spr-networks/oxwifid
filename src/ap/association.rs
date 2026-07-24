@@ -113,6 +113,9 @@ impl Ap {
         // after the fixed fields: 4 bytes for Assoc, 10 for Reassoc).
         let ap_wmm = self.wmm;
         let client_wmm = frame.body.len() > ie_off && dot11::has_wmm_ie(&frame.body[ie_off..]);
+        // The link this station associated on (borrowed before the mutable
+        // station borrow below), stored so the m3 can key every held link.
+        let assoc_link_for_station = self.association_link_id();
         {
             let s = self
                 .stations
@@ -130,6 +133,7 @@ impl Ap {
             if let Some((client_mld, links)) = mld_assoc.as_ref() {
                 s.client_mld_mac = Some(*client_mld);
                 s.client_mld_links = links.clone();
+                s.assoc_link_id = Some(assoc_link_for_station);
             }
         }
         if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
@@ -304,17 +308,25 @@ impl Ap {
 
         let aid = self.next_aid();
         let sc = self.next_sc();
+        // Build the response in the association link's context (its channel,
+        // band, and width), like hostapd's per-link `hapd`. For a non-MLD AP or
+        // the anchor link this is identical to `self`'s parameters. The netlink
+        // TX path rewrites addr2/addr3 to the association link's BSSID.
+        let (resp_mac, resp_channel, resp_width, resp_band6) = match self.association_link() {
+            Some(link) => (link.mac, link.channel, link.width, link.band6),
+            None => (self.mac, self.channel, self.channel_width, self.band6),
+        };
         let mut assoc = dot11::build_assoc_resp(
-            &self.mac,
+            &resp_mac,
             &sta,
             &self.ssid,
-            self.channel,
+            resp_channel,
             aid,
             sc,
             resp_subtype,
             &self.country,
-            self.channel_width,
-            self.band6,
+            resp_width,
+            resp_band6,
             self.wmm,
             self.phy_mode,
             self.punct,
@@ -340,7 +352,9 @@ impl Ap {
                 .map(|s| s.client_mld_links.as_slice())
                 .unwrap_or(&[]);
             let info = self.mld_assoc_link_info_for(requested);
-            assoc.extend_from_slice(&self.mld_basic_element(self.link_id, &info));
+            // The MLE must claim the link the client associated on as its own
+            // Link ID; the Per-STA Profiles then describe the partner links.
+            assoc.extend_from_slice(&self.mld_basic_element(self.association_link_id(), &info));
             assoc.extend_from_slice(&self.mld_tid_to_link_element());
         }
         if let Some(dh) = owe_dh_resp {

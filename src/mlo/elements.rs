@@ -212,20 +212,53 @@ pub fn basic_mle_link_info_len(ies: &[u8]) -> Option<usize> {
 /// body (`inner`). This is how a beacon on one link advertises the parameters of
 /// the AP's other link(s) so a client can set up all links from one scan.
 pub fn per_sta_profile(link_id: u8, link_mac: &[u8; 6], inner: &[u8]) -> Vec<u8> {
+    per_sta_profile_inner(link_id, link_mac, inner, None)
+}
+
+/// (Re)Association Response variant of [`per_sta_profile`]: in addition to the
+/// beacon timing fields, a per-STA profile in an association response carries a
+/// BSS Parameters Change Count (STA Control bit 11 `PRES_BSS_PARAM_COUNT` + one
+/// STA Info octet). hostapd sets this for `(Re)Assoc Response` frames only
+/// (`include_bpcc`); a client that requested multi-link association rejects the
+/// response when the partner profile is in the beacon shape without it.
+pub fn per_sta_profile_assoc(
+    link_id: u8,
+    link_mac: &[u8; 6],
+    inner: &[u8],
+    bss_param_change_count: u8,
+) -> Vec<u8> {
+    per_sta_profile_inner(link_id, link_mac, inner, Some(bss_param_change_count))
+}
+
+fn per_sta_profile_inner(
+    link_id: u8,
+    link_mac: &[u8; 6],
+    inner: &[u8],
+    bss_param_change_count: Option<u8>,
+) -> Vec<u8> {
     // STA Control (2 octets, LE): bits 0-3 Link ID, bit 4 Complete Profile,
     // bit 5 MAC Address Present, plus Beacon Interval, TSF Offset, and DTIM
-    // Info. reference AP includes all four AP-link timing fields in beacon profiles.
-    let sta_control: u16 =
+    // Info. hostapd includes all four AP-link timing fields; a (Re)Assoc
+    // Response additionally sets bit 11 (BSS Parameters Change Count present).
+    let mut sta_control: u16 =
         (link_id as u16 & 0x0f) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
+    if bss_param_change_count.is_some() {
+        sta_control |= 1 << 11;
+    }
     let mut body = Vec::new();
     body.extend_from_slice(&sta_control.to_le_bytes());
     // STA Info: Length (incl. itself) + MAC Address + Beacon Interval + TSF
-    // Offset + DTIM Count/Period. RustAP uses a 100-TU beacon and DTIM period 2.
-    body.push(1 + 6 + 2 + 8 + 2);
+    // Offset + DTIM Count/Period (+ BSS Params Change Count for assoc). RustAP
+    // uses a 100-TU beacon and DTIM period 2.
+    let info_len = 1 + 6 + 2 + 8 + 2 + bss_param_change_count.map_or(0, |_| 1);
+    body.push(info_len as u8);
     body.extend_from_slice(link_mac);
     body.extend_from_slice(&BEACON_INTERVAL_TU.to_le_bytes());
     body.extend_from_slice(&0u64.to_le_bytes());
     body.extend_from_slice(&[0, 2]);
+    if let Some(count) = bss_param_change_count {
+        body.push(count);
+    }
     // STA Profile: the link's link-specific (inheritable) element bytes.
     body.extend_from_slice(inner);
     // Per-STA Profile subelement (id 0), fragmented (id 254 fragments) when the
@@ -274,6 +307,72 @@ fn append_mld_profile_ies(v: &mut Vec<u8>, ies: &[u8]) {
         }
         i += 2 + len;
     }
+}
+
+/// The (base element IDs, extension element IDs) present in an IE block, in
+/// order. Used to diff a reporting link against a reported partner link for the
+/// Non-Inheritance element.
+pub fn element_id_sets(ies: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut base = Vec::new();
+    let mut ext = Vec::new();
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let id = ies[i];
+        let len = ies[i + 1] as usize;
+        if i + 2 + len > ies.len() {
+            break;
+        }
+        if id == 255 {
+            if len >= 1 {
+                ext.push(ies[i + 2]);
+            }
+        } else {
+            base.push(id);
+        }
+        i += 2 + len;
+    }
+    (base, ext)
+}
+
+/// Non-Inheritance element (element 255, ext id 56) for an MLO Per-STA Profile.
+///
+/// A non-AP MLD interprets a reported link's Per-STA Profile relative to the
+/// reporting link (the frame's main body): any element present in the reporting
+/// link but absent from the profile is *inherited*. When a 5 GHz association
+/// link reports a 2.4 GHz partner, band-specific elements (VHT Capabilities /
+/// Operation) would be wrongly inherited onto the 2.4 GHz link — mac80211
+/// rejects the association with "VHT capabilities mismatch". This element lists
+/// the reporting-link element IDs (base + extension) that the reported link does
+/// NOT have, so they are not inherited. Empty when the reported link is a
+/// superset (e.g. a 5 GHz partner of a 2.4 GHz association link).
+pub fn non_inheritance_element(
+    reporting: (&[u8], &[u8]),
+    reported: (&[u8], &[u8]),
+) -> Vec<u8> {
+    let base: Vec<u8> = reporting
+        .0
+        .iter()
+        .copied()
+        .filter(|id| !reported.0.contains(id))
+        .collect();
+    let ext: Vec<u8> = reporting
+        .1
+        .iter()
+        .copied()
+        .filter(|id| !reported.1.contains(id))
+        .collect();
+    if base.is_empty() && ext.is_empty() {
+        return Vec::new();
+    }
+    let mut body = Vec::with_capacity(3 + base.len() + ext.len());
+    body.push(56); // WLAN_EID_EXT_NON_INHERITANCE
+    body.push(base.len() as u8);
+    body.extend_from_slice(&base);
+    body.push(ext.len() as u8);
+    body.extend_from_slice(&ext);
+    let mut out = vec![255u8, body.len() as u8];
+    out.extend_from_slice(&body);
+    out
 }
 
 /// STA Profile body for a partner link in an AP's (Re)Association Response.

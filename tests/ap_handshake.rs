@@ -325,3 +325,113 @@ fn unacked_assoc_response_cancels_speculative_eapol() {
     ap.test_expire_eapol();
     assert!(ap.tick().frames.is_empty());
 }
+
+/// Complete the golden handshake against a fresh AP, optionally in guest mode.
+fn connected_ap(guest: bool) -> Ap {
+    let v = vectors();
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = fixtured_ap();
+    if guest {
+        ap.enable_guest();
+    }
+    ap.handle_incoming(&from_hex(
+        v["incoming"]["assoc_req"]["bytes"].as_str().unwrap(),
+    ));
+    ap.handle_incoming(&from_hex(
+        v["frames"]["eapol_m2_incoming"]["bytes"].as_str().unwrap(),
+    ));
+    send_m4(&mut ap, &v);
+    assert!(ap.is_associated(&sta));
+    ap
+}
+
+/// An encrypted uplink data frame addressed to an associated station of this
+/// BSS (self-addressed — the minimal station-to-station case).
+fn sta_to_sta_uplink(pn: u64) -> Vec<u8> {
+    let v = vectors();
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let tk: Vec<u8> = from_hex(v["crypto"]["tk"].as_str().unwrap());
+    let frame = dot11::build_protected_data_sec(
+        dot11::DataCipher::Ccmp128,
+        &ap_mac, // a1: BSSID
+        &sta,    // a2: transmitting station
+        &sta,    // a3: destination — an associated station
+        &ap_mac,
+        &sta,
+        &sta,
+        dot11::FC_TODS | dot11::FC_PROTECTED,
+        0x10,
+        pn,
+        0,
+        &tk,
+        0x0800,
+        b"guest isolation probe",
+        None,
+    );
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.extend_from_slice(&frame);
+    framed
+}
+
+#[test]
+fn guest_ap_drops_station_to_station_uplink() {
+    let v = vectors();
+
+    // Control: a non-guest AP forwards a station-addressed uplink frame.
+    let mut open = connected_ap(false);
+    let out = open.handle_incoming(&sta_to_sta_uplink(1));
+    assert_eq!(
+        out.to_network.len(),
+        1,
+        "non-guest AP forwards station-addressed uplink"
+    );
+
+    // Guest: upstream (gateway-bound) traffic still flows...
+    let mut guest = connected_ap(true);
+    let uplink = from_hex(v["frames"]["data_uplink"]["bytes"].as_str().unwrap());
+    let out = guest.handle_incoming(&uplink);
+    assert_eq!(
+        out.to_network.len(),
+        1,
+        "guest AP must still forward gateway-bound uplink"
+    );
+    // ...but a frame addressed to another associated station is dropped.
+    let out = guest.handle_incoming(&sta_to_sta_uplink(0x1000));
+    assert!(
+        out.to_network.is_empty(),
+        "guest AP must not carry station-to-station traffic"
+    );
+    assert!(out.frames.is_empty(), "isolation drop must be silent");
+}
+
+#[test]
+fn guest_ap_drops_hairpinned_downlink() {
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let mut guest = connected_ap(true);
+
+    // A frame whose source is the AP's own station: station-to-station traffic
+    // reflected back by an external bridge. Must not be delivered.
+    let mut hairpin = Vec::new();
+    hairpin.extend_from_slice(&sta); // dst
+    hairpin.extend_from_slice(&sta); // src: our own associated station
+    hairpin.extend_from_slice(&[0x08, 0x00]);
+    hairpin.extend_from_slice(b"reflected by an external bridge");
+    assert!(
+        guest.deliver_to_station(&hairpin).is_empty(),
+        "guest AP must drop downlink sourced from its own station"
+    );
+
+    // Gateway-sourced downlink still delivers.
+    let mut downlink = Vec::new();
+    downlink.extend_from_slice(&sta); // dst
+    downlink.extend_from_slice(&ap_mac); // src: the gateway
+    downlink.extend_from_slice(&[0x08, 0x00]);
+    downlink.extend_from_slice(b"hello station this is the access point");
+    assert_eq!(
+        guest.deliver_to_station(&downlink).len(),
+        1,
+        "guest AP still delivers gateway-sourced downlink"
+    );
+}

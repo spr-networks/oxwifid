@@ -62,6 +62,9 @@ impl Ap {
             rnr_6ghz: None,
             band6: false,
             per_sta_vif: false,
+            guest: false,
+            static_credential: false,
+            mgmt_rx_link: None,
             wmm: true,
             ocv: false,
             owe: false,
@@ -284,6 +287,11 @@ impl Ap {
     /// into a PMK against this AP's SSID. Once called, this file is authoritative:
     /// the BSS passphrase is no longer an authentication fallback.
     pub fn set_psk_file(&mut self, entries: &[(Option<[u8; 6]>, String)]) {
+        // A static-credential (guest) BSS never adopts the device credential
+        // database — not at startup and not via a control-socket RELOAD.
+        if self.static_credential {
+            return;
+        }
         // Reload is a revocation boundary: cached SAE PMKs were authenticated
         // under the old credential database and must not survive replacement.
         self.pmksa_cache.clear();
@@ -340,6 +348,35 @@ impl Ap {
     /// Whether per-station-VIF mode is enabled.
     pub fn per_sta_vif(&self) -> bool {
         self.per_sta_vif
+    }
+
+    /// Guest BSS: block all station-to-station traffic (client isolation).
+    /// In netlink mode this also sets `NL80211_ATTR_AP_ISOLATE` so the kernel
+    /// data path stops intra-BSS bridging.
+    pub fn enable_guest(&mut self) {
+        self.guest = true;
+    }
+
+    /// Whether this BSS is a guest network (client isolation on).
+    pub fn guest(&self) -> bool {
+        self.guest
+    }
+
+    /// Pin this BSS to its static (guest) passphrase: the device credential
+    /// database no longer applies, so `set_psk_file` becomes a no-op.
+    pub fn set_static_credential(&mut self) {
+        self.static_credential = true;
+    }
+
+    /// Whether this BSS authenticates only its static (guest) passphrase.
+    pub fn static_credential(&self) -> bool {
+        self.static_credential
+    }
+
+    /// Record which affiliated link the management frame about to be handled
+    /// arrived on (netlink MLD path). `None` outside an MLD frame context.
+    pub fn set_mgmt_rx_link(&mut self, link_id: Option<u8>) {
+        self.mgmt_rx_link = link_id;
     }
 
     /// The group key handed to `sta` in its 4-way handshake — the station's own
