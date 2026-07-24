@@ -41,6 +41,23 @@ impl Ap {
         if !self.mld {
             return info;
         }
+        // The reporting link (the one the response is sent on): its element set
+        // is what a reported partner profile inherits from. Diffing against it
+        // yields the Non-Inheritance list so a cross-band partner does not
+        // inherit the reporting link's band-specific elements.
+        let reporting_ids = self.association_link().map(|link| {
+            dot11::element_id_sets(&dot11::resp_ies(
+                &self.ssid,
+                link.channel,
+                &self.country,
+                link.width,
+                link.band6,
+                self.wmm,
+                self.phy_mode,
+                &[],
+                self.punct,
+            ))
+        });
         for link in self.active_mld_links() {
             if !requested
                 .iter()
@@ -63,7 +80,33 @@ impl Ap {
                 // bytes of an association-response Per-STA Profile.
                 dot11::apply_phy_capabilities(&mut inner, 4, caps);
             }
-            info.extend_from_slice(&dot11::per_sta_profile(link.link_id, &link.mac, &inner));
+            // Append a Non-Inheritance element for elements the reporting link
+            // has but this partner does not (e.g. 5 GHz VHT reported to a 2.4
+            // GHz partner), so the client does not inherit them onto this link.
+            if let Some((rep_base, rep_ext)) = &reporting_ids {
+                let partner = dot11::resp_ies(
+                    &self.ssid,
+                    link.channel,
+                    &self.country,
+                    link.width,
+                    link.band6,
+                    self.wmm,
+                    self.phy_mode,
+                    &[],
+                    self.punct,
+                );
+                let (p_base, p_ext) = dot11::element_id_sets(&partner);
+                inner.extend_from_slice(&dot11::non_inheritance_element(
+                    (rep_base, rep_ext),
+                    (&p_base, &p_ext),
+                ));
+            }
+            info.extend_from_slice(&dot11::per_sta_profile_assoc(
+                link.link_id,
+                &link.mac,
+                &inner,
+                self.bss_change_count,
+            ));
         }
         info
     }
@@ -194,6 +237,32 @@ impl Ap {
         })
     }
 
+    /// The affiliated link a station actually associated on. A client may
+    /// (re)associate on ANY of the AP's links — wpa_supplicant routinely picks
+    /// the 5/6 GHz link even when link 0 is 2.4 GHz — so the association link is
+    /// the one the (re)assoc frame arrived on (`mgmt_rx_link`, set by the
+    /// netlink RX path), not the fixed `self.link_id`. Falls back to `link_id`
+    /// outside an MLD frame context (e.g. the raw/stdio transports).
+    pub(super) fn association_link_id(&self) -> u8 {
+        self.mgmt_rx_link.unwrap_or(self.link_id)
+    }
+
+    /// The affiliated link a station associated on, as an [`MldLink`] carrying
+    /// that link's channel/band/width/address. Like hostapd, the (re)association
+    /// response must be built entirely in the association link's BSS context —
+    /// its operating channel and HT/VHT/HE/EHT operation elements — not the
+    /// fixed anchor link's, or a client that associated on the 5/6 GHz link
+    /// rejects a response describing the 2.4 GHz anchor. `None` when not an MLD.
+    pub(super) fn association_link(&self) -> Option<MldLink> {
+        if !self.mld {
+            return None;
+        }
+        let want = self.association_link_id();
+        self.active_mld_links()
+            .into_iter()
+            .find(|link| link.link_id == want)
+    }
+
     pub(super) fn validate_mld_assoc_links(
         &self,
         sta: &[u8; 6],
@@ -201,6 +270,9 @@ impl Ap {
         assoc_ies: &[u8],
     ) -> Option<Vec<(u8, [u8; 6])>> {
         let active_links = self.active_mld_links();
+        // The link the client associated on is carried by the main frame body,
+        // never as a Per-STA Profile — exclude that link, not the fixed one.
+        let assoc_link = self.association_link_id();
         let configured: HashSet<u8> = active_links.iter().map(|l| l.link_id).collect();
         let mut ap_addrs: HashSet<[u8; 6]> = active_links.iter().map(|l| l.mac).collect();
         ap_addrs.insert(self.mld_mac);
@@ -223,7 +295,7 @@ impl Ap {
         let mut links = Vec::new();
         for (link_id, link_mac) in dot11::parse_mld_link_macs_checked(assoc_ies)? {
             if !configured.contains(&link_id)
-                || link_id == self.link_id
+                || link_id == assoc_link
                 || !Self::is_valid_peer_mac(&link_mac)
                 || ap_addrs.contains(&link_mac)
                 || peer_addrs.contains(&link_mac)

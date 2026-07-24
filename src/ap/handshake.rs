@@ -463,7 +463,17 @@ impl Ap {
         let group_rsc = self.current_group_rsc();
         let mld_station = self.mld && client_mld.is_some();
         let m3 = if mld_station {
-            let negotiated = self.station_mld_link_ids(&sta);
+            // Every link the station holds needs its group keys: the partner
+            // links from its association request PLUS the association link
+            // itself (which is not in `client_mld_links`). Missing the
+            // association link's MLO GTK/IGTK leaves the client unable to key
+            // that link, so it never sends m4.
+            let mut negotiated = self.station_mld_link_ids(&sta);
+            if let Some(assoc_link) = self.stations.get(&sta).and_then(|s| s.assoc_link_id) {
+                if !negotiated.contains(&assoc_link) {
+                    negotiated.push(assoc_link);
+                }
+            }
             let configured = self.active_mld_links();
             let link_kdes: Vec<(u8, [u8; 6], &[u8])> = configured
                 .iter()

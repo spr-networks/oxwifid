@@ -211,6 +211,12 @@ pub struct Station {
     /// association request, keyed by Link ID. The association-link address is
     /// still `mac`.
     pub client_mld_links: Vec<(u8, [u8; 6])>,
+    /// The affiliated link this MLD station associated on. A client may
+    /// associate on any of the AP's links; the m3 must key every link the
+    /// station holds — the association link plus its `client_mld_links`
+    /// partners — so this is stored at association time (m2/m3 arrive over the
+    /// control port, where the per-frame RX link is not available).
+    pub assoc_link_id: Option<u8>,
     /// Cached SAE commit+confirm auth-response frames, resent verbatim when the
     /// STA retries an identical commit (a lost response on a flaky medium), so
     /// the exchange recovers instead of resetting our scalar and desyncing into
@@ -235,6 +241,7 @@ impl Station {
             pairwise_tk: [0; 32],
             client_mld_mac: None,
             client_mld_links: Vec::new(),
+            assoc_link_id: None,
             sae_resp: Vec::new(),
             sae_commit: Vec::new(),
             client_pn: 1, // CCMP PN starts at 1
@@ -531,6 +538,22 @@ pub struct Ap {
     /// Per-station VIF: each station gets its own GTK (for an nl80211 AP_VLAN),
     /// isolating broadcast/multicast traffic between stations.
     per_sta_vif: bool,
+    /// Guest BSS: client isolation. The AP never carries traffic between its
+    /// own stations — the kernel data path gets `NL80211_ATTR_AP_ISOLATE` and
+    /// the userspace data path drops station-to-station deliveries.
+    guest: bool,
+    /// The BSS credential is a static guest password (SPR `GuestPassword`):
+    /// the device credential database never applies to this BSS, so
+    /// `set_psk_file` — including a control-socket RELOAD — is a no-op. The
+    /// reference AP equivalent is `wpa_psk_file=/dev/null` + `wpa_passphrase`.
+    static_credential: bool,
+    /// The affiliated link the management frame being processed arrived on
+    /// (netlink MLD path; set per frame by the driver loop). A probe response
+    /// must be built entirely for THIS link — its channel/band IEs, its own
+    /// MLE Link ID, and an RNR naming its partners — otherwise an MLO client
+    /// sees the response contradict the link's beacon and quietly falls back
+    /// to a single-link association.
+    mgmt_rx_link: Option<u8>,
     /// WMM/WME QoS: advertise the WMM parameter element and send QoS Data frames
     /// to stations that negotiated WMM.
     wmm: bool,

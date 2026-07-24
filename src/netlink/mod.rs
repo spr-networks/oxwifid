@@ -46,10 +46,20 @@ pub const NL80211_CMD_SET_STATION: u8 = 18;
 pub const NL80211_CMD_NEW_STATION: u8 = 19;
 pub const NL80211_CMD_DEL_STATION: u8 = 20;
 pub const NL80211_CMD_SET_BSS: u8 = 25;
+/// User-space regulatory hint: request the given ISO/IEC 3166-1 alpha-2 country
+/// so the kernel applies that regdomain (enabling 5 GHz AP channels that are
+/// no-IR under the default world domain). Equivalent to `iw reg set <CC>`.
+pub const NL80211_CMD_REQ_SET_REG: u8 = 27;
+/// Query the current regulatory domain; the reply carries [`NL80211_ATTR_REG_ALPHA2`].
+pub const NL80211_CMD_GET_REG: u8 = 31;
 pub const NL80211_CMD_GET_SCAN: u8 = 32;
 pub const NL80211_CMD_TRIGGER_SCAN: u8 = 33;
 pub const NL80211_CMD_NEW_SCAN_RESULTS: u8 = 34;
 pub const NL80211_CMD_SCAN_ABORTED: u8 = 35;
+/// Broadcast on the `regulatory` multicast group when the kernel applies a new
+/// regulatory domain. Waiting for it (rather than sleeping) confirms the
+/// requested country actually took effect and the 5/6 GHz no-IR flags cleared.
+pub const NL80211_CMD_REG_CHANGE: u8 = 36;
 pub const NL80211_CMD_REGISTER_FRAME: u8 = 58;
 pub const NL80211_CMD_FRAME: u8 = 59;
 pub const NL80211_CMD_FRAME_TX_STATUS: u8 = 60;
@@ -164,6 +174,8 @@ pub const NL80211_ATTR_STA_WME: u16 = 129;
 pub const NL80211_STA_WME_UAPSD_QUEUES: u16 = 1;
 pub const NL80211_STA_WME_MAX_SP: u16 = 2;
 pub const NL80211_ATTR_WIPHY_FREQ: u16 = 38;
+/// ISO/IEC 3166-1 alpha-2 country code for [`NL80211_CMD_REQ_SET_REG`].
+pub const NL80211_ATTR_REG_ALPHA2: u16 = 33;
 pub const NL80211_ATTR_FRAME: u16 = 51;
 pub const NL80211_ATTR_SSID: u16 = 52;
 pub const NL80211_ATTR_AUTH_TYPE: u16 = 53;

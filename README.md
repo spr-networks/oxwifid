@@ -2,7 +2,7 @@
 
 Auto-coded wifi 7 userland access point for linux.
 
-> This remains experimental software. Its WPA state machines include replay,
+> This is experimental software. Its WPA state machines include replay,
 > cache-lifetime, anti-clogging, and key-erasure hardening, but it has not had
 > the independent review expected for production authentication software.
 
@@ -24,30 +24,22 @@ barely-ap --config FILE.json [--ssid NAME] [--mac AA:BB:CC:DD:EE:FF]
           [--channel N] [--ip 10.10.10.1] [--mode stdio|iface|netlink] [--iface wlanN]
           [--cipher ccmp-128|gcmp-128|ccmp-256|gcmp-256]
           [--band 2.4|5|6] [--sae|--owe|--transition] [--ocv] [--btm] [--rnr] [--per-sta-vif]
+          [--guest]
 ```
 
-The config file (see `barely-ap.example.json`) sets `ssid`, `passphrase`,
-`key_mgmt` (`psk`/`sae`/`sae-transition`/`owe`), `pairwise_cipher`
-(`ccmp-128`/`gcmp-128`/`ccmp-256`/`gcmp-256`), `channel`, `interface`, `mode`,
-`mac`, `ip`, explicit `band` (`2.4`, `5`, or `6`), and the feature toggles
-`ocv`, `btm`, `rnr`, `per_sta_vif`.
+The config file (see `barely-ap.example.json`) keeps shared settings such as
+`ssid`, credentials, `key_mgmt`, `pairwise_cipher`, country, and policy toggles
+at the top level. Per-radoi settings (`interface`, `mac`, `band`, `channel`,
+`width`, `phy`, and `ctrl_path`)
 
 For the AP, non-default pairwise ciphers use Linux/mac80211
 authenticated-encryption offload and therefore require `mode: "netlink"`.
 `barely-cli` also implements WPA2 single-link CCMP/GCMP protection in userspace
-(GCMP uses RustCrypto `aes-gcm`) for reverse-direction interop. The group cipher
-remains CCMP-128. The 256-bit suites derive and install a 32-byte pairwise TK.
+(GCMP uses RustCrypto `aes-gcm`) for reverse-direction interop. 
 
 Unknown keys and type mismatches are hard errors. See [`src/config.rs`](src/config.rs).
 Passwords are accepted only through the JSON `passphrase` or `psk_file`
-settings; command-line password arguments are deliberately rejected because
-process arguments are commonly visible to other users and diagnostic tools.
-
-For an 802.11be MLD, `mld_default_links: [1]` advertises that every QoS TID
-uses Link ID 1 in both directions. The array may contain multiple configured
-Link IDs (for example `[0, 1]`); omitting it leaves link selection to the client
-and driver. This is the all-TIDs/same-link-set advertised-TTLM form supported by
-current mac80211 and reference AP.
+settings;
 
 ### stdio mode (default, all platforms)
 
@@ -80,34 +72,23 @@ barely-cli --spr-config /configs/wifi_uplink/wpa.json --spr-iface wlan0 \
 ```
 
 The logical `--spr-iface` selects the entry in SPR's existing `wpa.json`.
-`--scan-iface` is its managed physical VIF and `--iface` is a monitor VIF on the
+`--scan-iface` is its managed VIF and `--iface` is a monitor VIF on the
 same PHY. If SPR needs the TAP to retain the logical name (normally `wlan0`),
-the startup wrapper can rename the physical VIF to `wlan0-phy` first. The
+the startup wrapper can rename the VIF to `wlan0-phy` first. The
 supervisor must create the monitor VIF and retain the managed sibling for ACKs;
 barely-ap brings the scan VIF up and tunes the monitor after selection.
 `--tap` creates and brings up only the Ethernet netdev. Credentials are read
 directly from SPR JSON; command-line passwords are rejected.
 
-The production loop validates SSID/BSSID/RSN/AKM/PMF before authenticating,
+The client validates SSID/BSSID/RSN/AKM/PMF before authenticating,
 supports WPA2-PSK, WPA-PSK-SHA256, WPA3-SAE, and OWE, and handles protected
-reference AP group rekeys. Native nl80211 scanning matches every enabled SPR network,
-honors optional BSSID pins and highest `Priority`, uses directed probes for
-manually entered/hidden SSIDs, and chooses the strongest compatible BSS within
-that priority. While disconnected it rescans and retunes every ten seconds, so
-an AP channel change does not strand the uplink.
-
-The same scanner can feed SPR's scan UI as JSON without `iw | jc`:
+reference AP group rekeys. 
 
 ```bash
 barely-cli --scan --scan-iface wlan0-phy
 # Optional directed probe:
 barely-cli --scan --scan-iface wlan0-phy --scan-ssid hidden-network
 ```
-
-Each result includes `ssid`, `bssid`, `frequency`, `channel`, `band` (`2.4`,
-`5`, or `6`), signal, AKMs, and MLO link metadata when the driver supplies it.
-Scanning and association never assign an IP, run DHCP, or modify a route; SPR
-continues to act only after the authenticated `CONNECTED` state file appears.
 
 ## Architecture
 
@@ -124,9 +105,6 @@ continues to act only after the authenticated `CONNECTED` state file appears.
 | `structures` | Shared wire/security/PHY definitions plus the runtime-type discovery surface |
 | `ap` / `client` | AP and station state-machine orchestration |
 | `raw_frames` / `netlink` | Frame transports and Linux nl80211 integration |
-
-The former `dot11`, `crypto`, and `sae` paths remain public compatibility
-aliases. New code should use the narrow domain paths above.
 
 ### Transports (`--mode`)
 
@@ -155,9 +133,9 @@ network, and re-encrypts its replies via `Ap::deliver_to_station`.
 
 ## Testing — how Rust output is checked against the Python
 
-`tools/gen_vectors.py` drives the **actual reference Python** (`ccmp.py`,
-`ap.py` via scapy, with small shims for modern scapy) and emits golden vectors
-into `tests/vectors.json`. The Rust tests assert byte-for-byte equality.
+`tools/gen_vectors.py` drives the ** reference Python** (`ccmp.py`,
+`ap.py` via scapy, with small shims for modern scapy) and emits test vectors
+into `tests/vectors.json`. The Rust tests assert equality.
 
 | Test file                 | What it proves                                                                 |
 |---------------------------|--------------------------------------------------------------------------------|
@@ -274,19 +252,13 @@ flowing (ICMP ping replies through the AP's fakenet):
 | Rust client → reference AP (2.4 / 5 GHz) | ✅ | ✅ | ✅ |
 | Rust AP ← wpa_supplicant (2.4 / 5 GHz) | ✅ | ✅ | ✅ |
 
-The AP also serves **multiple simultaneous clients** (verified with two
+The AP also serves **multiple clients** (verified with two
 wpa_supplicant stations, WPA2 + WPA3).
 
 **NAN USD** interoperates with wpa_supplicant v2.12's NAN Discovery Engine both
 ways: the Rust subscriber discovers a wpa_supplicant publish, and wpa_supplicant
 discovers a Rust publish (`NAN-DISCOVERY-RESULT`), service IDs and service info
 matching. The `barely-nan` binary runs the engine on a monitor interface.
-
-This interop pass surfaced eight protocol bugs invisible to the self-consistent
-Rust/Python tests, each now fixed: SAE assoc-req AKM, SAE EAPOL MIC (AES-CMAC),
-m2/m3 RSN echo, m3 RSNXE, OWE bare-X public key, OWE EAPOL MIC (HMAC-SHA256),
-key-data padding (single `0xDD` + zeros), and an OWE beacon mode. The MIC
-algorithm is selected per-AKM via `dot11::KeyMic`.
 
 Hwsim ACK note: a userspace monitor-injection endpoint has no vif address for
 mac80211_hwsim to ACK, so an active co-located vif (an `ibss`/`mesh` vif on the
@@ -348,7 +320,7 @@ and passes data again. Reliability properties borrowed from reference AP:
 - **Duplicate (re)Association tolerance** — a retried Assoc for a handshake
   already in progress re-sends the assoc-response and the **same** m1 (the ANonce
   is reused *only* while still awaiting that station's m2, which stays KRACK-safe
-  because a genuine reassociation still gets a fresh ANonce).
+  because a reassociation still gets a fresh ANonce).
 - **Idempotent Authentication re-answer** — a retransmitted Auth within the
   backoff window is re-answered instead of dropped, so a lost auth-response
   doesn't stall a client over a lossy link, without restarting the session.
@@ -428,6 +400,81 @@ own 4-way, keys, and stations — so each BSS reuses the verified single-BSS pat
 unchanged. BSSIDs must be distinct; multi-BSS is netlink-only. Config parsing +
 radio-parameter inheritance are unit-tested; the live netdev bring-up is pending
 hwsim verification.
+
+#### DBDC / multiple independent radios (`radios` config array)
+
+A single process can operate multiple independent radios concurrently. This is
+intended for DBDC cards that expose one netdev per band, such as 2.4 GHz on
+`wlan1` and 5 GHz on `wlan2`. Put settings shared by every radio at the top
+level, then override the identity and channel settings in each
+`radios` entry:
+
+```json
+{
+  "ssid": "s5210",
+  "country": "US",
+  "mode": "netlink",
+  "key_mgmt": "sae",
+  "psk_file": "/configs/wifi/sae_passwords",
+  "per_sta_vif": true,
+  "ocv": false,
+  "spr_api_socket": "/state/wifi/apisock",
+  "spr_dhcp_helper": "/hostap_dhcp_helper",
+  "radios": [
+    {
+      "iface": "wlan1",
+      "mac": "02:00:00:00:00:01",
+      "band": 2.4,
+      "channel": 1,
+      "width": 20,
+      "phy": "ax",
+      "ctrl_path": "/state/wifi/control_wlan1/wlan1"
+    },
+    {
+      "iface": "wlan2",
+      "mac": "04:f0:21:c9:1e:ff",
+      "band": 5,
+      "channel": 36,
+      "width": 80,
+      "phy": "ax",
+      "ctrl_path": "/state/wifi/control_wlan2/wlan2"
+    }
+  ]
+}
+```
+
+Replace each example MAC with that netdev's real MAC. Every entry uses the
+top-level SSID, credentials, security, station-VIF policy, and SPR integration.
+Radio entries deliberately cannot override those shared settings. Interfaces,
+BSSIDs, and control paths must be unique, and multi-radio operation is
+netlink-only. All seven fields are required in every radio entry so a
+missing value cannot silently fall back to another radio's defaults. The
+complete Linux runner includes a DBDC cell that associates SAE stations to the
+2.4 GHz and 5 GHz radios simultaneously from one AP process. Radio-specific
+CLI overrides are rejected when `radios` is present; edit the intended array
+entry instead.
+
+#### Guest network (`guest` / `ap_isolate`)
+
+Client isolation, reference AP's `ap_isolate`: a guest BSS never carries traffic
+between its own stations — upstream (gateway/uplink) traffic is unaffected. Set
+`"guest": true` on a `bss` entry to isolate that SSID only, or top-level
+(`--guest`) to isolate the primary BSS. Enforced in both data planes:
+
+- **netlink mode** — `SET_BSS` sets `NL80211_ATTR_AP_ISOLATE`, so mac80211
+  stops intra-BSS station-to-station bridging in the kernel.
+- **userspace modes** — the AP drops a decrypted uplink frame addressed to
+  another associated station, and drops a downlink frame whose *source* is one
+  of its own stations (station traffic hairpinned back by an external bridge),
+  so isolation holds even when `to_network` feeds a real bridge/TAP.
+
+Unicast isolation only, like reference AP: stations still share the BSS group
+key, so combine with `per_sta_vif` (per-station GTK on an AP_VLAN) when guests
+must also be unable to read each other's broadcast/multicast. Network-level
+segregation (separate subnet/VLAN, firewalling guest→LAN) remains the
+supervisor's job — e.g. SPR policies keyed on the guest BSS's own netdev.
+Tested in `tests/ap_handshake.rs` (isolation drops + gateway traffic control
+cases) and config parsing unit tests.
 
 #### DFS — 5 GHz radar channels (CAC + radar response)
 

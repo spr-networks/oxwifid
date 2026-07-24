@@ -693,6 +693,7 @@ fn nl_set_bss(
     ifindex: u32,
     link_id: Option<u8>,
     ht_enabled: bool,
+    isolate: bool,
 ) -> io::Result<()> {
     // 6, 12 and 24 Mbps in nl80211's 500-kbps units, matching reference AP's
     // mandatory OFDM basic-rate set on 5/6 GHz.
@@ -702,7 +703,9 @@ fn nl_set_bss(
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
         .attr(Attr::u8(NL80211_ATTR_BSS_CTS_PROT, 0))
         .attr(Attr::u8(NL80211_ATTR_BSS_SHORT_PREAMBLE, 1))
-        .attr(Attr::u8(NL80211_ATTR_AP_ISOLATE, 0))
+        // Guest BSS: mac80211 stops intra-BSS station-to-station bridging
+        // (reference AP `ap_isolate`).
+        .attr(Attr::u8(NL80211_ATTR_AP_ISOLATE, isolate as u8))
         .attr(Attr::bytes(NL80211_ATTR_BSS_BASIC_RATES, &AP_BASIC_RATES));
     if ht_enabled {
         m = m.attr(Attr::u16v(NL80211_ATTR_BSS_HT_OPMODE, 0));
@@ -1917,6 +1920,139 @@ fn nl_get_station_telemetry(
     None
 }
 
+/// The kernel's current global regulatory domain as an ISO alpha-2, via
+/// `GET_REG`. `None` if it can't be read (treated as "unknown, set it anyway").
+fn nl_current_reg_alpha2(sock: &mut NetlinkSocket, family: u16) -> Option<[u8; 2]> {
+    let seq = sock.next_seq();
+    let m = GenlMessage::new(family, NL80211_CMD_GET_REG, 0, seq);
+    sock.send(&m.to_bytes(sock.pid)).ok()?;
+    for _ in 0..10 {
+        let buf = sock.recv(Duration::from_millis(300))?;
+        for parsed in msg::parse_messages(&buf) {
+            if parsed.seq != seq {
+                continue;
+            }
+            let attrs = msg::parse_attrs(parsed.genl_attrs());
+            if let Some(a) = msg::find_attr(&attrs, NL80211_ATTR_REG_ALPHA2) {
+                if a.len() >= 2 {
+                    return Some([a[0], a[1]]);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Apply the configured regulatory domain (`iw reg set <CC>`) so the kernel
+/// enables that country's channels. Without it the radio stays on the default
+/// world regdomain, under which 5/6 GHz AP channels are flagged no-IR ("no
+/// initiating radiation") — `START_AP` then fails with `EINVAL`, often
+/// intermittently depending on whether a beacon hint has arrived. barely-ap
+/// previously used `country` only for the beacon Country IE and never set the
+/// kernel regdomain, so a real 5 GHz AP could not reliably start.
+///
+/// This subscribes to the `regulatory` multicast group and waits for the
+/// `REG_CHANGE` event confirming the domain applied (like reference AP), rather
+/// than sleeping a fixed interval — the no-IR flags clear only once the change
+/// lands. Best-effort throughout: an unset/invalid code is skipped, a duplicate
+/// request for the current domain is harmless, and a bounded timeout keeps a
+/// self-managed-reg driver (which emits no global `REG_CHANGE`) from stalling
+/// startup.
+fn nl_set_regulatory(alpha2: &[u8; 2]) {
+    if !alpha2.iter().all(u8::is_ascii_uppercase) {
+        return;
+    }
+    let cc_str = format!("{}{}", alpha2[0] as char, alpha2[1] as char);
+    let mut sock = match NetlinkSocket::open() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("netlink AP: reg socket open failed (continuing): {e}");
+            return;
+        }
+    };
+    let (family, reg_group) = match resolve_family(&mut sock, "nl80211", "regulatory") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("netlink AP: reg family resolve failed (continuing): {e}");
+            return;
+        }
+    };
+    // Already the requested domain? Then REQ_SET_REG would emit no REG_CHANGE and
+    // we'd wait out the whole timeout for nothing (common: a box that boots into
+    // the right country). Skip cleanly.
+    if nl_current_reg_alpha2(&mut sock, family) == Some(*alpha2) {
+        eprintln!("netlink AP: regulatory domain already {cc_str}");
+        return;
+    }
+    let subscribed = reg_group
+        .map(|g| sock.join_multicast(g).is_ok())
+        .unwrap_or(false);
+
+    // Send the hint. NUL-terminated alpha-2, matching iw's 3-byte attribute. We
+    // don't use `request_ack` here: it would consume (and discard) the
+    // REG_CHANGE broadcast while waiting for the ACK. Instead handle both the
+    // ACK and the event in one recv loop below.
+    let seq = sock.next_seq();
+    let cc = [alpha2[0], alpha2[1], 0];
+    let mut m = GenlMessage::new(family, NL80211_CMD_REQ_SET_REG, 0, seq)
+        .attr(Attr::bytes(NL80211_ATTR_REG_ALPHA2, &cc));
+    m.flags |= msg::NLM_F_ACK;
+    if let Err(e) = sock.send(&m.to_bytes(sock.pid)) {
+        eprintln!("netlink AP: REQ_SET_REG {cc_str} send failed (continuing): {e}");
+        return;
+    }
+
+    // Without the multicast subscription there is no event to wait for; fall
+    // back to a short settle so the async hint still lands before START_AP.
+    if !subscribed {
+        std::thread::sleep(Duration::from_millis(600));
+        eprintln!("netlink AP: requested regulatory domain {cc_str} (no reg group; settled)");
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut acked = false;
+    while Instant::now() < deadline {
+        let Some(buf) = sock.recv(Duration::from_millis(300)) else {
+            continue;
+        };
+        for parsed in msg::parse_messages(&buf) {
+            // ACK / error for our own request.
+            if parsed.seq == seq {
+                if let Some(code) = parsed.error_code() {
+                    if code != 0 {
+                        eprintln!(
+                            "netlink AP: REQ_SET_REG {cc_str} rejected (continuing): {}",
+                            io::Error::from_raw_os_error(-code)
+                        );
+                        return;
+                    }
+                    acked = true;
+                }
+                continue;
+            }
+            // REG_CHANGE broadcast — done once the domain matches the request.
+            if parsed.typ == family && parsed.genl_cmd() == Some(NL80211_CMD_REG_CHANGE) {
+                let attrs = msg::parse_attrs(parsed.genl_attrs());
+                let matched = msg::find_attr(&attrs, NL80211_ATTR_REG_ALPHA2)
+                    .map(|a| a.len() >= 2 && a[0] == alpha2[0] && a[1] == alpha2[1])
+                    .unwrap_or(false);
+                if matched {
+                    eprintln!("netlink AP: regulatory domain {cc_str} applied");
+                    return;
+                }
+            }
+        }
+    }
+    if acked {
+        eprintln!(
+            "netlink AP: regulatory domain {cc_str} requested (no REG_CHANGE within 3s; continuing)"
+        );
+    } else {
+        eprintln!("netlink AP: regulatory domain {cc_str} not acknowledged (continuing)");
+    }
+}
+
 pub fn run_offload_ap(
     mut ap: crate::ap::Ap,
     iface: &str,
@@ -1935,6 +2071,9 @@ pub fn run_offload_ap(
     if ifindex == 0 {
         return Err(io::Error::last_os_error());
     }
+    // Set the regulatory domain BEFORE touching channels/START_AP, and wait for
+    // the change to land so the 5/6 GHz no-IR flags clear before beaconing.
+    nl_set_regulatory(&ap.country);
     let mld_links = ap.active_mld_links();
     // Primary frequency: 6 GHz is 5950 + 5*chan, otherwise the 2.4/5 GHz table.
     let band6 = ap.band6();
@@ -2221,6 +2360,7 @@ pub fn run_offload_ap(
             ifindex,
             ap.mld.then_some(link.link_id),
             !link.band6,
+            ap.guest(),
         )?;
         eprintln!(
             "netlink AP: START_AP + SET_BSS ok — kernel beaconing {:?} link_id={} on {} MHz (ifindex {ifindex})",
@@ -2278,6 +2418,7 @@ pub fn run_offload_ap(
                 ifindex,
                 Some(link.link_id),
                 !link.band6,
+                ap.guest(),
             )?;
             eprintln!(
                 "netlink AP: SET_BEACON + SET_BSS link_id={} with MLE partner_info={} bytes",
@@ -2405,6 +2546,22 @@ pub fn run_offload_ap(
                     continue;
                 }
                 let attrs = msg::parse_attrs(parsed.genl_attrs());
+                // Multiple independently-running radios subscribe to the same
+                // nl80211 multicast groups. Never let a management, TX-status,
+                // control-port, or radar event for another netdev reach this
+                // radio's AP state machine. Events from this radio's own
+                // AP_VLAN children still belong to it: mac80211 delivers a
+                // control-port EAPOL from a per-STA-VIF station (group-rekey
+                // m2, rejoin) with the AP_VLAN's ifindex, not the AP's.
+                if msg::find_attr(&attrs, NL80211_ATTR_IFINDEX)
+                    .and_then(read_u32)
+                    .is_some_and(|event_ifindex| {
+                        event_ifindex != ifindex
+                            && !vlan.map.values().any(|v| v.ifindex == event_ifindex)
+                    })
+                {
+                    continue;
+                }
                 if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
                     if let Some(c) = parsed.genl_cmd() {
                         if c == NL80211_CMD_FRAME || c == NL80211_CMD_CONTROL_PORT_FRAME {
@@ -2618,6 +2775,7 @@ pub fn run_offload_ap(
                         // fall back to the link BSSID and event frequency instead
                         // of silently dropping a valid Authentication request.
                         let mut fbytes = f.to_vec();
+                        ap.set_mgmt_rx_link(None);
                         if ap.mld {
                             if fbytes.len() < 22 {
                                 continue;
@@ -2657,6 +2815,10 @@ pub fn run_offload_ap(
                                     crate::util::bytes_to_mac(&ra),
                                 );
                             }
+                            // The state machine builds link-addressed responses
+                            // (probe responses in particular) for the link the
+                            // frame arrived on.
+                            ap.set_mgmt_rx_link(Some(lid));
                             let mut client = [0u8; 6];
                             client.copy_from_slice(&fbytes[10..16]);
                             // reference AP translates every address belonging to the
@@ -3662,9 +3824,17 @@ fn route_outputs(
                 let listen_interval = ap.station_listen_interval(&sta_addr).unwrap_or(0);
                 let capability = ap.station_capability(&sta_addr).unwrap_or(0);
                 // An AP MLD must scope every station add/modify request to its
-                // association link. A legacy station has no MLD_ADDR, but it
-                // still requires MLO_LINK_ID or cfg80211 rejects NEW_STATION.
-                let link_id = ap.mld.then_some(ap.link_id);
+                // association link — the link the (re)assoc frame arrived on,
+                // which a client may freely choose (wpa_supplicant routinely
+                // picks the 5/6 GHz link, not link 0). `link_route` records that
+                // per-station RX link and already drives the response/EAPOL TX,
+                // so the kernel station's primary link must match it; otherwise
+                // m1 is sent on the association link while the station only
+                // exists on link 0, and the 4-way times out. A legacy station
+                // has no MLD_ADDR, but still needs MLO_LINK_ID or cfg80211
+                // rejects NEW_STATION.
+                let assoc_link_id = link_route.get(&sta_addr).copied().unwrap_or(ap.link_id);
+                let link_id = ap.mld.then_some(assoc_link_id);
                 let eml_capability = sta_caps.and_then(dot11::parse_mld_eml_capability);
                 let mld_capability = sta_caps.and_then(dot11::parse_mld_capability);
                 if let Some(mld) = mld_mac {
@@ -3694,7 +3864,9 @@ fn route_outputs(
                         .map(dot11::parse_mld_link_profiles)
                         .unwrap_or_default();
                     for (peer_link_id, peer_link_mac) in ap.station_mld_link_macs(&sta_addr) {
-                        if peer_link_id == ap.link_id {
+                        // The association link is already created by NEW_STATION;
+                        // only the *other* negotiated links get ADD_LINK_STA.
+                        if peer_link_id == assoc_link_id {
                             continue;
                         }
                         let profile = link_profiles.iter().find(|profile| {

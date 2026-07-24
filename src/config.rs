@@ -5,24 +5,29 @@
 //! across ad-hoc CLI flags. [`Config::from_json`] parses a file; [`Config::build_ap`]
 //! turns the configuration into a fully wired [`Ap`].
 //!
-//! Example config:
+//! A DBDC device puts policy shared by all radios at the top level and the
+//! physical configuration of each independently operating radio in `radios`:
 //! ```json
 //! {
 //!   "ssid": "turtlenet",
 //!   "psk_file": "/run/secrets/wifi-credentials",
 //!   "key_mgmt": "sae",
-//!   "band": 5,
-//!   "channel": 36,
-//!   "interface": "wlan0",
 //!   "mode": "netlink",
-//!   "per_sta_vif": true
+//!   "radios": [
+//!     { "iface": "wlan1", "mac": "02:00:00:00:00:01",
+//!       "band": 2.4, "channel": 1, "width": 20, "phy": "ax",
+//!       "ctrl_path": "/run/barely-ap/wlan1" },
+//!     { "iface": "wlan2", "mac": "02:00:00:00:00:02",
+//!       "band": 5, "channel": 36, "width": 80, "phy": "ax",
+//!       "ctrl_path": "/run/barely-ap/wlan2" }
+//!   ]
 //! }
 //! ```
 
 use crate::ap::{Ap, MldLink};
 use crate::structures::DataCipher;
 use crate::util::{mac_to_bytes, try_mac_to_bytes};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use zeroize::{Zeroize, Zeroizing};
 
 /// How stations authenticate to the AP.
@@ -94,6 +99,9 @@ pub struct Config {
     pub band: Band,
     /// Per-station VIF: each station gets its own AP_VLAN + GTK (netlink mode).
     pub per_sta_vif: bool,
+    /// Guest network: client isolation (reference AP `ap_isolate`). The AP never
+    /// carries traffic between its own stations, in any mode.
+    pub guest: bool,
     /// 802.11be preamble-puncturing bitmap (EHT Operation Disabled Subchannel
     /// Bitmap): one bit per 20 MHz subchannel, 1 = punctured. 0 = none.
     pub punct_bitmap: u16,
@@ -131,6 +139,9 @@ pub struct Config {
     /// Additional co-hosted BSSes (extra SSIDs) on the same radio. Each gets its
     /// own netdev/BSSID and 4-way. netlink mode only.
     pub bss: Vec<BssConfig>,
+    /// Independent physical radios. Security, SSID, credentials, and policy are
+    /// shared from this top-level configuration.
+    pub radios: Vec<RadioConfig>,
     /// GTK rekey period in seconds (reference AP `wpa_group_rekey`, default 600; 0
     /// disables periodic group rekeying).
     pub group_rekey: u64,
@@ -147,6 +158,45 @@ pub struct BssConfig {
     pub passphrase: String,
     pub key_mgmt: KeyMgmt,
     pub mac: [u8; 6],
+    /// The entry supplied its own passphrase — a static guest password (SPR
+    /// `GuestPassword`). The device credential database (`psk_file`) then never
+    /// applies to this BSS. When false, the BSS authenticates against the
+    /// primary's `psk_file` (or its inherited passphrase if none is set).
+    pub own_passphrase: bool,
+    /// Opt out of the default guest isolation (SPR `DisableIsolation`):
+    /// extra BSSes otherwise get `ap_isolate` + `per_sta_vif`.
+    pub disable_isolation: bool,
+    /// Whether this extra BSS applies guest/client isolation. Extra BSSes
+    /// default to isolated; `guest: false` or `disable_isolation: true` opts out.
+    pub guest: bool,
+}
+
+/// Physical and radio-local settings for one independently operating radio.
+///
+/// Keeping this separate from [`Config`] prevents a radio entry from silently
+/// overriding shared authentication, credentials, or station policy.
+#[derive(Clone, Debug)]
+pub struct RadioConfig {
+    pub iface: String,
+    /// Radio BSSID. Optional: when not given (`mac_explicit == false`) the
+    /// netlink AP adopts the interface's own MAC, which is what a kernel-offload
+    /// BSSID must be anyway, so most configs can omit it.
+    pub mac: [u8; 6],
+    pub mac_explicit: bool,
+    /// Per-radio SSID override. `None` inherits the shared top-level `ssid`, so
+    /// a DBDC config can give 2.4 and 5 GHz the same or different network names.
+    pub ssid: Option<String>,
+    pub band: Band,
+    pub channel: u8,
+    pub width: u16,
+    pub phy: crate::frames::PhyMode,
+    pub ctrl_path: String,
+    pub punct_bitmap: u16,
+    pub mld: bool,
+    pub link_id: u8,
+    pub mld_links: Vec<MldLinkConfig>,
+    pub mld_default_links: Option<Vec<u8>>,
+    pub bss: Vec<BssConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,11 +241,12 @@ impl Default for Config {
             ip: [10, 10, 10, 1],
             mode: "stdio".to_string(),
             iface: "wlan0".to_string(),
-            ocv: true,
+            ocv: false,
             btm: false,
             rnr: false,
             band: Band::Ghz2_4,
             per_sta_vif: false,
+            guest: false,
             punct_bitmap: 0,
             mld: false,
             link_id: 0,
@@ -209,6 +260,7 @@ impl Default for Config {
             // when `spr_api_socket` enables the SPR event worker.
             spr_dhcp_helper: Some("/spr_dhcp_helper".to_string()),
             bss: Vec::new(),
+            radios: Vec::new(),
             group_rekey: 600,
             strict_rekey: true,
         }
@@ -239,6 +291,191 @@ fn zeroize_json_credentials(value: &mut Value) {
     }
 }
 
+/// Apply scalar settings before parsing BSS entries so BSS inheritance is
+/// independent of JSON object key order. `radios` itself is parsed separately.
+fn apply_config_object(cfg: &mut Config, object: &Map<String, Value>) -> Result<(), String> {
+    for (key, value) in object {
+        if key == "bss" || key == "radios" {
+            continue;
+        }
+        cfg.set(key, value)?;
+    }
+    if let Some(bss) = object.get("bss") {
+        cfg.set("bss", bss)?;
+    }
+    Ok(())
+}
+
+fn radio_field<'a>(
+    object: &'a Map<String, Value>,
+    aliases: &[&str],
+    label: &str,
+    required: bool,
+) -> Result<Option<&'a Value>, String> {
+    let present: Vec<&&str> = aliases
+        .iter()
+        .filter(|key| object.contains_key(**key))
+        .collect();
+    if present.len() > 1 {
+        return Err(format!(
+            "{label} was supplied more than once ({})",
+            present
+                .iter()
+                .map(|key| format!("{key:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(key) = present.first() {
+        return Ok(object.get(**key));
+    }
+    if required {
+        return Err(format!("requires an explicit {label}"));
+    }
+    Ok(None)
+}
+
+fn parse_radio(
+    object: &Map<String, Value>,
+    default_passphrase: &str,
+    default_key_mgmt: KeyMgmt,
+) -> Result<RadioConfig, String> {
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "iface"
+                | "interface"
+                | "ssid"
+                | "mac"
+                | "bssid"
+                | "band"
+                | "channel"
+                | "width"
+                | "channel_width"
+                | "phy"
+                | "phy_mode"
+                | "ieee80211_mode"
+                | "ctrl_path"
+                | "ctrl_interface"
+                | "punct_bitmap"
+                | "ru_puncturing_bitmap"
+                | "mld"
+                | "mld_ap"
+                | "link_id"
+                | "mld_link_id"
+                | "mld_links"
+                | "links"
+                | "mld_default_links"
+                | "mld_tid_to_link"
+                | "bss"
+        ) {
+            return Err(format!(
+                "unknown radio key {key:?}; shared settings belong at the top level"
+            ));
+        }
+    }
+
+    let iface_value = radio_field(object, &["iface", "interface"], "iface", true)?.unwrap();
+    let band_value = radio_field(object, &["band"], "band", true)?.unwrap();
+    let channel_value = radio_field(object, &["channel"], "channel", true)?.unwrap();
+    let width_value = radio_field(object, &["width", "channel_width"], "width", true)?.unwrap();
+    let phy_value =
+        radio_field(object, &["phy", "phy_mode", "ieee80211_mode"], "phy", true)?.unwrap();
+    let ctrl_value =
+        radio_field(object, &["ctrl_path", "ctrl_interface"], "ctrl_path", true)?.unwrap();
+
+    // MAC is optional: a non-MLD netlink AP adopts the interface's own MAC as
+    // the BSSID regardless, so a config need not repeat it. When omitted, use
+    // the placeholder default (it will be adopted at bring-up).
+    let (mac, mac_explicit) = match radio_field(object, &["mac", "bssid"], "mac", false)? {
+        Some(value) => {
+            let text = as_str("mac", value)?;
+            let m = try_mac_to_bytes(text).ok_or_else(|| format!("invalid radio mac {text:?}"))?;
+            (m, true)
+        }
+        None => (mac_to_bytes("02:00:00:00:00:00"), false),
+    };
+    let ssid = radio_field(object, &["ssid"], "ssid", false)?
+        .map(|value| as_str("ssid", value).map(str::to_string))
+        .transpose()?;
+    let width_number = width_value
+        .as_u64()
+        .ok_or("radio width must be an integer")?;
+    let width = u16::try_from(width_number).map_err(|_| "radio width out of range".to_string())?;
+
+    let punct_bitmap = match radio_field(
+        object,
+        &["punct_bitmap", "ru_puncturing_bitmap"],
+        "punct_bitmap",
+        false,
+    )? {
+        Some(value) => {
+            let number = value
+                .as_u64()
+                .ok_or("radio punct_bitmap must be an integer")?;
+            u16::try_from(number).map_err(|_| "radio punct_bitmap out of range".to_string())?
+        }
+        None => 0,
+    };
+    let mld = radio_field(object, &["mld", "mld_ap"], "mld", false)?
+        .map(|value| as_bool("mld", value))
+        .transpose()?
+        .unwrap_or(false);
+    let link_id = radio_field(object, &["link_id", "mld_link_id"], "link_id", false)?
+        .map(|value| as_u8("link_id", value))
+        .transpose()?
+        .unwrap_or(0);
+
+    let mut mld_links = Vec::new();
+    if let Some(value) = radio_field(object, &["mld_links", "links"], "mld_links", false)? {
+        for item in value.as_array().ok_or("radio mld_links must be an array")? {
+            mld_links.push(parse_mld_link(item, width)?);
+        }
+    }
+    let mld_default_links = if let Some(value) = radio_field(
+        object,
+        &["mld_default_links", "mld_tid_to_link"],
+        "mld_default_links",
+        false,
+    )? {
+        let mut links = Vec::new();
+        for item in value
+            .as_array()
+            .ok_or("radio mld_default_links must be an array")?
+        {
+            links.push(as_u8("mld_default_links", item)?);
+        }
+        Some(links)
+    } else {
+        None
+    };
+
+    let mut bss = Vec::new();
+    if let Some(value) = object.get("bss") {
+        for item in value.as_array().ok_or("radio bss must be an array")? {
+            bss.push(parse_bss(item, default_passphrase, default_key_mgmt)?);
+        }
+    }
+
+    Ok(RadioConfig {
+        iface: as_str("iface", iface_value)?.to_string(),
+        mac,
+        mac_explicit,
+        ssid,
+        band: parse_band("band", band_value)?,
+        channel: as_u8("channel", channel_value)?,
+        width,
+        phy: parse_phy(as_str("phy", phy_value)?)?,
+        ctrl_path: as_str("ctrl_path", ctrl_value)?.to_string(),
+        punct_bitmap,
+        mld,
+        link_id,
+        mld_links,
+        mld_default_links,
+        bss,
+    })
+}
+
 impl Config {
     /// Parse a JSON config document, starting from the defaults and overriding
     /// each present key. Unknown keys and type mismatches are hard errors so a
@@ -249,8 +486,57 @@ impl Config {
         let result = (|| {
             let obj = value.as_object().ok_or("config must be a JSON object")?;
             let mut cfg = Config::default();
-            for (key, val) in obj {
-                cfg.set(key, val)?;
+            if obj.contains_key("radios") {
+                for key in [
+                    "band",
+                    "channel",
+                    "width",
+                    "channel_width",
+                    "phy",
+                    "phy_mode",
+                    "ieee80211_mode",
+                    "interface",
+                    "iface",
+                    "mac",
+                    "bssid",
+                    "ctrl_path",
+                    "ctrl_interface",
+                    "bss",
+                    "punct_bitmap",
+                    "ru_puncturing_bitmap",
+                    "mld",
+                    "mld_ap",
+                    "link_id",
+                    "mld_link_id",
+                    "mld_links",
+                    "links",
+                    "mld_default_links",
+                    "mld_tid_to_link",
+                ] {
+                    if obj.contains_key(key) {
+                        return Err(format!("{key:?} belongs inside each radios[] entry"));
+                    }
+                }
+            }
+            apply_config_object(&mut cfg, obj)?;
+
+            if let Some(radios) = obj.get("radios") {
+                let entries = radios
+                    .as_array()
+                    .ok_or("radios must be a non-empty array")?;
+                if entries.is_empty() {
+                    return Err("radios must be a non-empty array".to_string());
+                }
+                cfg.radios.clear();
+                for (index, entry) in entries.iter().enumerate() {
+                    let radio_obj = entry
+                        .as_object()
+                        .ok_or_else(|| format!("radios[{index}] must be an object"))?;
+                    cfg.radios.push(
+                        parse_radio(radio_obj, &cfg.passphrase, cfg.key_mgmt)
+                            .map_err(|e| format!("radios[{index}]: {e}"))?,
+                    );
+                }
             }
             Ok(cfg)
         })();
@@ -289,6 +575,7 @@ impl Config {
             "rnr" => self.rnr = as_bool(key, val)?,
             "band" => self.band = parse_band(key, val)?,
             "per_sta_vif" => self.per_sta_vif = as_bool(key, val)?,
+            "guest" | "ap_isolate" => self.guest = as_bool(key, val)?,
             "punct_bitmap" | "ru_puncturing_bitmap" => {
                 let n = val
                     .as_u64()
@@ -348,9 +635,13 @@ impl Config {
                     .ok_or_else(|| format!("{key} must be an array"))?;
                 let default_pass = Zeroizing::new(self.passphrase.clone());
                 let default_km = self.key_mgmt;
+                self.bss.clear();
                 for item in arr {
                     self.bss.push(parse_bss(item, &default_pass, default_km)?);
                 }
+            }
+            "radios" => {
+                return Err("radios is only valid at the top level".to_string());
             }
             _ => return Err(format!("unknown config key {key:?}")),
         }
@@ -362,6 +653,82 @@ impl Config {
     /// still derive a (weak) PMK, and security modes the chosen transport can't
     /// actually deliver.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.radios.is_empty() {
+            let mut ifaces = Vec::new();
+            let mut macs = Vec::new();
+            let mut control_paths: Vec<&str> = Vec::new();
+            for (index, radio) in self.radios.iter().enumerate() {
+                if self.mode != "netlink" {
+                    return Err(format!(
+                        "radios[{index}] ({}) requires top-level mode \"netlink\"",
+                        radio.iface,
+                    ));
+                }
+                let resolved = self.for_radio(radio);
+                resolved
+                    .validate_radio()
+                    .map_err(|e| format!("radios[{index}] ({}): {e}", radio.iface))?;
+                if radio.iface.is_empty() {
+                    return Err(format!("radios[{index}] requires iface"));
+                }
+                if ifaces.contains(&radio.iface) {
+                    return Err(format!("duplicate radio iface {:?}", radio.iface));
+                }
+                ifaces.push(radio.iface.clone());
+                // Only dup-check explicit BSSIDs. An adopted (implicit) radio MAC
+                // comes from its interface, which is already unique per radio.
+                let radio_macs = radio
+                    .mac_explicit
+                    .then_some(&radio.mac)
+                    .into_iter()
+                    .chain(radio.bss.iter().map(|bss| &bss.mac));
+                for mac in radio_macs {
+                    if macs.contains(mac) {
+                        return Err(format!(
+                            "duplicate BSSID {} across radios",
+                            crate::util::bytes_to_mac(mac)
+                        ));
+                    }
+                    macs.push(*mac);
+                }
+                if radio.ctrl_path.is_empty() {
+                    return Err(format!("radios[{index}] requires a non-empty ctrl_path"));
+                }
+                if control_paths.contains(&radio.ctrl_path.as_str()) {
+                    return Err(format!("duplicate radio ctrl_path {:?}", radio.ctrl_path));
+                }
+                control_paths.push(&radio.ctrl_path);
+            }
+            return Ok(());
+        }
+        self.validate_radio()
+    }
+
+    /// Resolve shared policy plus one physical radio into the existing
+    /// single-radio runtime representation.
+    pub fn for_radio(&self, radio: &RadioConfig) -> Config {
+        let mut resolved = self.clone();
+        resolved.radios.clear();
+        resolved.iface = radio.iface.clone();
+        resolved.mac = radio.mac;
+        if let Some(ssid) = &radio.ssid {
+            resolved.ssid = ssid.clone();
+        }
+        resolved.band = radio.band;
+        resolved.channel = radio.channel;
+        resolved.width = radio.width;
+        resolved.phy = radio.phy;
+        resolved.ctrl_path = Some(radio.ctrl_path.clone());
+        resolved.punct_bitmap = radio.punct_bitmap;
+        resolved.mld = radio.mld;
+        resolved.link_id = radio.link_id;
+        resolved.mld_links = radio.mld_links.clone();
+        resolved.mld_default_links = radio.mld_default_links.clone();
+        resolved.bss = radio.bss.clone();
+        resolved
+    }
+
+    fn validate_radio(&self) -> Result<(), String> {
         // WPA2-PSK / WPA3-SAE passphrases are 8..=63 characters; OWE has none.
         if self.key_mgmt != KeyMgmt::Owe && !(self.passphrase.is_empty() && self.psk_file.is_some())
         {
@@ -485,7 +852,13 @@ impl Config {
         // distinct from the primary and every other BSS (one radio, many MACs).
         let mut macs = vec![self.mac];
         for b in &self.bss {
-            if b.key_mgmt != KeyMgmt::Owe && !(8..=63).contains(&b.passphrase.len()) {
+            // A BSS without its own (static guest) passphrase may instead ride
+            // on the primary's authoritative credential file.
+            let uses_device_db = !b.own_passphrase && self.psk_file.is_some();
+            if b.key_mgmt != KeyMgmt::Owe
+                && !uses_device_db
+                && !(8..=63).contains(&b.passphrase.len())
+            {
                 return Err(format!(
                     "bss {:?} passphrase must be 8..=63 characters",
                     b.ssid
@@ -588,6 +961,9 @@ impl Config {
         if self.per_sta_vif {
             ap.enable_per_sta_vif();
         }
+        if self.guest {
+            ap.enable_guest();
+        }
         if let Some(path) = &self.psk_file {
             // A configured credential file is authoritative even when startup
             // cannot read it. Mark it active with an empty set first so an I/O
@@ -662,6 +1038,35 @@ impl Config {
             ap.enable_band6();
             ap.enable_sae();
         }
+        // SPR ExtraBSS semantics: extra BSSes are guest networks by default —
+        // client isolation (ap_isolate) + a per-station VIF/GTK — unless the
+        // entry opts out with `disable_isolation`.
+        if bss.guest && !bss.disable_isolation {
+            ap.enable_guest();
+            ap.enable_per_sta_vif();
+        }
+        // Credentials, SPR ExtraBSS semantics: an entry with its own passphrase
+        // is a static guest password the device credential database must never
+        // override (reference AP: `wpa_psk_file=/dev/null` + `wpa_passphrase`).
+        // Without one, the BSS authenticates against the same `psk_file` as the
+        // primary (or its inherited passphrase when none is configured).
+        if bss.own_passphrase {
+            ap.set_static_credential();
+        } else if let Some(path) = &self.psk_file {
+            // Same fail-closed order as `build_ap`: mark the file authoritative
+            // before reading it, so an I/O or parse error cannot fall back to
+            // the inherited JSON passphrase.
+            ap.set_psk_file(&[]);
+            match parse_psk_file(path) {
+                Ok(mut entries) => {
+                    ap.set_psk_file(&entries);
+                    for (_, password) in &mut entries {
+                        password.zeroize();
+                    }
+                }
+                Err(e) => eprintln!("barely-ap: psk_file {path:?}: {e}"),
+            }
+        }
         ap
     }
 }
@@ -688,20 +1093,26 @@ fn parse_bss(item: &Value, default_pass: &str, default_km: KeyMgmt) -> Result<Bs
         passphrase: default_pass.to_string(),
         key_mgmt: default_km,
         mac: [0u8; 6],
+        own_passphrase: false,
+        disable_isolation: false,
+        guest: true,
     };
     let mut have_mac = false;
     for (k, v) in o {
         match k.as_str() {
             "ssid" => b.ssid = as_str(k, v)?.to_string(),
-            "passphrase" | "wpa_passphrase" | "sae_password" | "psk" => {
+            "passphrase" | "wpa_passphrase" | "sae_password" | "psk" | "guest_password" => {
                 b.passphrase.zeroize();
-                b.passphrase = as_str(k, v)?.to_string()
+                b.passphrase = as_str(k, v)?.to_string();
+                b.own_passphrase = true;
             }
             "key_mgmt" | "security" => b.key_mgmt = parse_key_mgmt(as_str(k, v)?)?,
             "mac" | "bssid" => {
                 b.mac = mac_to_bytes(as_str(k, v)?);
                 have_mac = true;
             }
+            "disable_isolation" => b.disable_isolation = as_bool(k, v)?,
+            "guest" | "ap_isolate" => b.guest = as_bool(k, v)?,
             _ => return Err(format!("unknown bss key {k:?}")),
         }
     }
@@ -937,10 +1348,10 @@ mod tests {
     use crate::frames as dot11;
 
     #[test]
-    fn defaults_are_wpa3_sae_with_ocv() {
+    fn defaults_are_wpa3_sae_with_ocv_opt_in() {
         let c = Config::default();
         assert_eq!(c.key_mgmt, KeyMgmt::Sae);
-        assert!(c.ocv);
+        assert!(!c.ocv);
         assert_eq!(c.ssid, "turtlenet");
         assert!(!c.per_sta_vif);
         assert!(c.bss.is_empty());
@@ -1227,6 +1638,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_guest_flag() {
+        // Per-BSS guest: isolation applies to that SSID only.
+        let json = r#"{
+            "ssid": "main", "passphrase": "password1234", "mode": "netlink",
+            "bss": [
+                { "ssid": "guests", "psk": "guestpass123", "mac": "02:00:00:00:00:10", "guest": true }
+            ]
+        }"#;
+        let cfg = Config::from_json(json).expect("parses");
+        cfg.validate().expect("valid");
+        assert!(!cfg.guest, "primary stays non-guest");
+        assert!(cfg.bss[0].guest);
+        assert!(cfg.build_bss_ap(&cfg.bss[0]).guest());
+        assert!(!cfg.build_ap().guest());
+
+        // Top-level guest (reference AP `ap_isolate` spelling accepted).
+        let cfg = Config::from_json(r#"{ "passphrase": "password1234", "ap_isolate": true }"#)
+            .expect("parses");
+        assert!(cfg.guest);
+        assert!(cfg.build_ap().guest());
+
+        // Type mismatches stay hard errors.
+        assert!(Config::from_json(r#"{"guest": 1}"#).is_err());
+        assert!(Config::from_json(
+            r#"{ "passphrase": "password1234", "mode": "netlink",
+                 "bss": [ { "ssid": "g", "psk": "guestpass123", "mac": "02:00:00:00:00:10", "guest": "yes" } ] }"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn rejects_duplicate_bssid() {
         let json = r#"{ "ssid": "main", "passphrase": "password1234", "mac": "02:00:00:00:00:10", "mode": "netlink",
             "bss": [ { "ssid": "guest", "psk": "guestpass123", "mac": "02:00:00:00:00:10" } ] }"#;
@@ -1293,6 +1735,207 @@ mod tests {
         assert_eq!(c.channel, 1); // default preserved
         assert_eq!(c.key_mgmt, KeyMgmt::Sae);
         assert_eq!(c.band, Band::Ghz2_4);
+        assert!(!c.ocv, "OCV must be explicitly enabled and negotiated");
+    }
+
+    #[test]
+    fn parses_dbdc_radios_with_shared_security_and_per_radio_overrides() {
+        let cfg = Config::from_json(
+            r#"{
+                "ssid": "s5210",
+                "key_mgmt": "sae",
+                "mode": "netlink",
+                "psk_file": "/configs/wifi/sae_passwords",
+                "per_sta_vif": true,
+                "ocv": false,
+                "spr_api_socket": "/state/wifi/apisock",
+                "spr_dhcp_helper": "/hostap_dhcp_helper",
+                "radios": [
+                    {
+                        "iface": "wlan1",
+                        "mac": "02:00:00:00:00:01",
+                        "band": 2.4,
+                        "channel": 1,
+                        "width": 20,
+                        "phy": "ax",
+                        "ctrl_path": "/state/wifi/control_wlan1/wlan1"
+                    },
+                    {
+                        "iface": "wlan2",
+                        "mac": "04:f0:21:c9:1e:ff",
+                        "band": 5,
+                        "channel": 36,
+                        "width": 80,
+                        "phy": "ax",
+                        "ctrl_path": "/state/wifi/control_wlan2/wlan2"
+                    }
+                ]
+            }"#,
+        )
+        .expect("DBDC config parses");
+
+        cfg.validate().expect("DBDC config validates");
+        assert_eq!(cfg.radios.len(), 2);
+        let low = cfg.for_radio(&cfg.radios[0]);
+        let high = cfg.for_radio(&cfg.radios[1]);
+        assert_eq!(low.ssid, "s5210");
+        assert_eq!(low.psk_file.as_deref(), Some("/configs/wifi/sae_passwords"));
+        assert_eq!(low.spr_api_socket.as_deref(), Some("/state/wifi/apisock"));
+        assert_eq!(low.iface, "wlan1");
+        assert_eq!(low.band, Band::Ghz2_4);
+        assert_eq!(low.channel, 1);
+        assert_eq!(low.width, 20);
+        assert!(low.per_sta_vif);
+        assert!(!low.ocv);
+        assert_eq!(high.iface, "wlan2");
+        assert_eq!(high.band, Band::Ghz5);
+        assert_eq!(high.channel, 36);
+        assert_eq!(high.width, 80);
+        assert_eq!(high.mac, mac_to_bytes("04:f0:21:c9:1e:ff"));
+    }
+
+    #[test]
+    fn radios_allow_optional_mac_and_per_radio_ssid() {
+        // No `mac` on either radio (adopted from the interface), and a per-radio
+        // SSID override on 2.4 GHz while 5 GHz inherits the shared SSID.
+        let cfg = Config::from_json(
+            r#"{
+                "ssid": "shared-net",
+                "key_mgmt": "sae",
+                "passphrase": "password1234",
+                "mode": "netlink",
+                "radios": [
+                    { "iface": "wlan1", "ssid": "net-2g", "band": 2.4, "channel": 6,
+                      "width": 20, "phy": "ax", "ctrl_path": "/run/w1" },
+                    { "iface": "wlan2", "band": 5, "channel": 36,
+                      "width": 80, "phy": "ax", "ctrl_path": "/run/w2" }
+                ]
+            }"#,
+        )
+        .expect("parses without a radio mac");
+        // Two macless radios must NOT collide on the placeholder default BSSID.
+        cfg.validate()
+            .expect("validates with adopted (implicit) BSSIDs");
+
+        assert!(!cfg.radios[0].mac_explicit);
+        assert!(!cfg.radios[1].mac_explicit);
+        // Per-radio SSID override vs inherited shared SSID.
+        assert_eq!(cfg.radios[0].ssid.as_deref(), Some("net-2g"));
+        assert!(cfg.radios[1].ssid.is_none());
+        assert_eq!(cfg.for_radio(&cfg.radios[0]).ssid, "net-2g");
+        assert_eq!(cfg.for_radio(&cfg.radios[1]).ssid, "shared-net");
+
+        // An explicit mac still parses and is dup-checked.
+        assert!(Config::from_json(
+            r#"{ "ssid": "s", "passphrase": "password1234", "mode": "netlink", "radios": [
+                { "iface": "w1", "mac": "02:00:00:00:00:aa", "band": 5, "channel": 36,
+                  "width": 20, "phy": "ax", "ctrl_path": "/run/a" },
+                { "iface": "w2", "mac": "02:00:00:00:00:aa", "band": 5, "channel": 40,
+                  "width": 20, "phy": "ax", "ctrl_path": "/run/b" } ] }"#
+        )
+        .and_then(|c| c.validate())
+        .is_err());
+    }
+
+    #[test]
+    fn shipped_json_examples_parse_and_validate() {
+        for (name, text) in [
+            (
+                "barely-ap.example.json",
+                include_str!("../barely-ap.example.json"),
+            ),
+            (
+                "configs/rustap.json",
+                include_str!("../configs/rustap.json"),
+            ),
+        ] {
+            let cfg = Config::from_json(text)
+                .unwrap_or_else(|error| panic!("{name} must parse: {error}"));
+            cfg.validate()
+                .unwrap_or_else(|error| panic!("{name} must validate: {error}"));
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_unsafe_multi_radio_configs() {
+        let base = r#"{
+            "passphrase": "password1234",
+            "mode": "netlink",
+            "radios": [
+                {
+                    "iface":"wlan1", "mac":"02:00:00:00:00:01",
+                    "band":2.4, "channel":1, "width":20, "phy":"ax",
+                    "ctrl_path":"/run/barely-ap/wlan1"
+                },
+                {
+                    "iface":"wlan2", "mac":"02:00:00:00:00:02",
+                    "band":5, "channel":36, "width":80, "phy":"ax",
+                    "ctrl_path":"/run/barely-ap/wlan2"
+                }
+            ]
+        }"#;
+        let mut cfg = Config::from_json(base).unwrap();
+        cfg.radios[1].iface = "wlan1".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("duplicate radio iface"));
+
+        let mut cfg = Config::from_json(base).unwrap();
+        cfg.radios[1].mac = cfg.radios[0].mac;
+        assert!(cfg.validate().unwrap_err().contains("duplicate BSSID"));
+
+        let mut cfg = Config::from_json(base).unwrap();
+        cfg.radios[1].ctrl_path = "/run/rustap".to_string();
+        cfg.radios[0].ctrl_path = cfg.radios[1].ctrl_path.clone();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("duplicate radio ctrl_path"));
+
+        let mut cfg = Config::from_json(base).unwrap();
+        cfg.mode = "iface".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("requires top-level mode"));
+
+        assert!(Config::from_json(r#"{"radios":[]}"#).is_err());
+        assert!(Config::from_json(r#"{"radios":[{"radios":[{"iface":"wlan1"}]}]}"#).is_err());
+        assert!(Config::from_json(
+            r#"{
+                "band": 5,
+                "radios":[{
+                    "iface":"wlan1", "mac":"02:00:00:00:00:01",
+                    "band":2.4, "channel":1, "width":20, "phy":"ax",
+                    "ctrl_path":"/run/barely-ap/wlan1"
+                }]
+            }"#
+        )
+        .unwrap_err()
+        .contains("belongs inside"));
+        assert!(Config::from_json(
+            r#"{"radios":[{
+                "iface":"wlan1", "mac":"02:00:00:00:00:01",
+                "band":2.4, "channel":1, "width":20,
+                "ctrl_path":"/run/barely-ap/wlan1"
+            }]}"#
+        )
+        .unwrap_err()
+        .contains("explicit phy"));
+        // Genuinely-shared policy (auth/credentials/station policy) is still
+        // rejected inside a radio entry. `ssid` is intentionally NOT here — it is
+        // an allowed per-radio override (see radios_allow_optional_mac_and_per_radio_ssid).
+        assert!(Config::from_json(
+            r#"{"radios":[{
+                "iface":"wlan1", "mac":"02:00:00:00:00:01",
+                "band":2.4, "channel":1, "width":20, "phy":"ax",
+                "ctrl_path":"/run/barely-ap/wlan1",
+                "per_sta_vif": true
+            }]}"#
+        )
+        .unwrap_err()
+        .contains("shared settings belong at the top level"));
     }
 
     #[test]

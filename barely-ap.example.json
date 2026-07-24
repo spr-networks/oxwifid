@@ -3,15 +3,29 @@
   "psk_file": "/run/secrets/wifi-credentials",
   "key_mgmt": "sae",
   "country_code": "US",
-  "band": 5,
-  "channel": 36,
   "mode": "netlink",
-  "interface": "wlan0",
-  "mac": "02:00:00:00:00:00",
   "ip": "10.10.10.1",
-  "ocv": true,
+  "ocv": false,
   "btm": false,
   "per_sta_vif": true,
-  "width": 80,
-  "wmm": true
+  "wmm": true,
+  "radios": [
+    {
+      "interface": "wlan0",
+      "mac": "02:00:00:00:00:00",
+      "band": 5,
+      "channel": 36,
+      "width": 80,
+      "phy": "ax",
+      "ctrl_path": "/run/barely-ap/wlan0",
+      "bss": [
+        {
+          "ssid": "turtlenet-guest",
+          "passphrase": "guest-passphrase",
+          "mac": "02:00:00:00:00:10",
+          "guest": true
+        }
+      ]
+    }
+  ]
 }

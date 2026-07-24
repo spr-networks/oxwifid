@@ -1,0 +1,31 @@
+{
+  "ssid": "s5210",
+  "country": "US",
+  "mode": "netlink",
+  "key_mgmt": "sae",
+  "psk_file": "/configs/wifi/sae_passwords",
+  "per_sta_vif": true,
+  "ocv": false,
+  "spr_api_socket": "/state/wifi/apisock",
+  "spr_dhcp_helper": "/hostap_dhcp_helper",
+  "radios": [
+    {
+      "iface": "wlan1",
+      "mac": "02:00:00:00:00:01",
+      "band": 2.4,
+      "channel": 1,
+      "width": 20,
+      "phy": "ax",
+      "ctrl_path": "/state/wifi/control_wlan1/wlan1"
+    },
+    {
+      "iface": "wlan2",
+      "mac": "04:f0:21:c9:1e:ff",
+      "band": 5,
+      "channel": 36,
+      "width": 80,
+      "phy": "ax",
+      "ctrl_path": "/state/wifi/control_wlan2/wlan2"
+    }
+  ]
+}

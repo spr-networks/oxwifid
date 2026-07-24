@@ -83,19 +83,40 @@ impl Ap {
     }
 
     pub(super) fn send_probe_resp(&mut self, dst: &[u8; 6], out: &mut Outgoing) {
+        // The response must describe the link the probe request arrived on: its
+        // channel/band IEs, its own MLE Link ID, and an RNR naming its
+        // PARTNERS. Answering a partner link's probe with the association
+        // link's content contradicts that link's beacon, and an MLO client
+        // (wpa_supplicant "Neighbor has unexpected link ID") then falls back
+        // to a single-link association.
+        let (link_id, link_mac, channel, width, band6) =
+            match self.mgmt_rx_link.filter(|_| self.mld).and_then(|lid| {
+                self.active_mld_links()
+                    .into_iter()
+                    .find(|link| link.link_id == lid)
+            }) {
+                Some(link) => (link.link_id, link.mac, link.channel, link.width, link.band6),
+                None => (
+                    self.link_id,
+                    self.mac,
+                    self.channel,
+                    self.channel_width,
+                    self.band6,
+                ),
+            };
         let sc = self.next_sc();
         let ts = self.current_timestamp();
         let mut frame = dot11::build_probe_resp(
-            &self.mac,
+            &link_mac,
             dst,
             &self.ssid,
-            self.channel,
+            channel,
             ts,
             sc,
             &dot11::security_tail_for_cipher(self.security_mode(), self.pairwise_cipher),
             &self.country,
-            self.channel_width,
-            self.band6,
+            width,
+            band6,
             self.wmm,
             self.phy_mode,
             self.punct,
@@ -104,9 +125,9 @@ impl Ap {
             dot11::enable_beacon_protection_capability(&mut frame[36..]);
         }
         if self.mld {
-            frame.extend_from_slice(&self.mld_rnr_for(self.link_id));
-            let info = self.mld_link_info_for(self.link_id);
-            frame.extend_from_slice(&self.mld_basic_element(self.link_id, &info));
+            frame.extend_from_slice(&self.mld_rnr_for(link_id));
+            let info = self.mld_link_info_for(link_id);
+            frame.extend_from_slice(&self.mld_basic_element(link_id, &info));
             frame.extend_from_slice(&self.mld_tid_to_link_element());
         }
         out.tx(frame);
