@@ -444,16 +444,14 @@ impl Ap {
         let sc = self.next_sc();
         // m3's key data must echo the exact RSNE (+ RSNXE) the AP advertises in
         // its beacon, or the supplicant rejects it as a Beacon/EAPOL IE mismatch.
-        let mut ap_rsn: Vec<u8> = if owe {
-            dot11::RSN_OWE.to_vec()
-        } else if sha256 {
-            let mut r = dot11::RSN_WPA3.to_vec();
-            r.extend_from_slice(&dot11::RSNXE_H2E);
-            r
-        } else {
-            dot11::RSN.to_vec()
-        };
-        ap_rsn[13] = self.pairwise_cipher.suite_type();
+        // Echo the AP's advertised RSNE verbatim — the exact bytes the beacon /
+        // probe response carry (`security_tail_for_cipher`). Selecting it from the
+        // station's own AKM instead breaks transition mode: a WPA2 (PSK) or WPA3
+        // (SAE) station would receive the single-AKM RSNE while the beacon carries
+        // the mixed PSK+SAE `RSN_TRANSITION`, so the supplicant rejects m3 as a
+        // Beacon/EAPOL IE mismatch (reason 17).
+        let ap_rsn: Vec<u8> =
+            dot11::security_tail_for_cipher(self.security_mode(), self.pairwise_cipher);
         // In per-station-VIF mode each station gets its own GTK *value* (broadcast
         // isolation); otherwise all stations share the BSS-wide GTK. Either way the
         // GTK *index* is the single BSS-wide `gtk_key_id` (what the RSNE advertises

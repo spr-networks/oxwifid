@@ -211,6 +211,31 @@ impl Ap {
         self.mld_links = links;
     }
 
+    /// Fill in affiliated-link BSSIDs that were left unspecified in the config
+    /// (sentinel `00:00:00:00:00:00`) by deriving them from the MLD MAC: set the
+    /// locally-administered bit on the first octet and fold the Link ID into the
+    /// last octet. Every link then has a distinct, valid unicast BSSID that is
+    /// also distinct from the MLD MAC, without the operator hand-picking any.
+    pub fn derive_missing_mld_link_macs(&mut self) {
+        let base = self.mld_mac;
+        for link in &mut self.mld_links {
+            if link.mac == [0u8; 6] {
+                let mut mac = base;
+                mac[0] = (mac[0] | 0x02) & 0xfe;
+                mac[5] ^= 0x10u8.wrapping_add(link.link_id);
+                link.mac = mac;
+            }
+        }
+    }
+
+    /// BSSID of the affiliated link with the given Link ID, if present.
+    pub fn mld_link_mac(&self, link_id: u8) -> Option<[u8; 6]> {
+        self.mld_links
+            .iter()
+            .find(|l| l.link_id == link_id)
+            .map(|l| l.mac)
+    }
+
     /// Advertise one active-link set for every QoS TID in both directions.
     pub fn set_mld_default_link_mask(&mut self, link_mask: u16) {
         self.mld_default_link_mask = Some(link_mask);

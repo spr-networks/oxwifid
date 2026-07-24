@@ -2146,6 +2146,19 @@ pub fn run_offload_ap(
                 ap.mld_mac = hw;
             }
         }
+    } else if let Some(hw) = read_iface_mac(iface) {
+        if hw != ap.mld_mac {
+            eprintln!(
+                "netlink AP: adopting interface MAC {} as MLD address (config was {})",
+                crate::util::bytes_to_mac(&hw),
+                crate::util::bytes_to_mac(&ap.mld_mac)
+            );
+            ap.mld_mac = hw;
+        }
+        ap.derive_missing_mld_link_macs();
+        if let Some(assoc) = ap.mld_link_mac(ap.link_id) {
+            ap.mac = assoc;
+        }
     }
     let bssid = ap.mac;
 
@@ -2512,6 +2525,15 @@ pub fn run_offload_ap(
     // (auth/assoc/EAPOL) that belongs to the event socket `sock`. Sharing one
     // socket dropped EAPOL frames mid-handshake and made rejoins fail.
     let mut cmd = NetlinkSocket::open()?;
+
+    // A SIGKILL/OOM/container restart can strand this radio's per-station VIFs
+    // from the previous run (the SOCKET_OWNER reap only fires on a clean socket
+    // close). The allocator only knows this process's own live map, so it would
+    // re-propose the same ids and collide. Sweep the radio's leftover
+    // `<iface>.<id>` AP_VLAN netdevs before serving any station.
+    if vlan.enabled {
+        flush_stale_ap_vlans(&mut cmd, family_id, iface);
+    }
 
     // Optional reference AP-style runtime control socket (STATUS / STA-DUMP / DEAUTH /
     // FAILURES / ATTACH) carrying live AP-STA-* events to attached clients.
@@ -3362,12 +3384,51 @@ fn iface_set_up(name: &str) -> io::Result<()> {
 
 /// Create an `AP_VLAN` interface beneath the AP (NEW_INTERFACE), bring it up,
 /// and return its ifindex. Each per-station VIF gets its own such interface.
+/// Delete every stranded per-station VIF belonging to this radio: netdevs named
+/// `<iface>.<id>` with `id >= PER_STA_VLAN_ID_START`, matching the allocator's
+/// own naming (`per_sta_vif_name`). Best-effort — a name that has already gone
+/// away between the scan and the delete just no-ops.
+fn flush_stale_ap_vlans(sock: &mut NetlinkSocket, family: u16, iface: &str) {
+    let prefix = format!("{iface}.");
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name
+            .strip_prefix(&prefix)
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if id < PER_STA_VLAN_ID_START {
+            continue;
+        }
+        let cname = format!("{name}\0");
+        let idx = unsafe { libc::if_nametoindex(cname.as_ptr() as *const libc::c_char) };
+        if idx != 0 {
+            eprintln!("netlink AP: flushing stale per-station VIF {name} (ifindex {idx})");
+            nl_del_iface(sock, family, idx);
+        }
+    }
+}
+
 fn nl_create_ap_vlan(
     sock: &mut NetlinkSocket,
     family: u16,
     ap_ifindex: u32,
     name: &str,
 ) -> io::Result<u32> {
+    // A prior run (or a prior failed attempt this run) may have left a netdev of
+    // this name behind — the allocator only tracks this process's own live map,
+    // so it re-proposes the same id/name. Delete any stale namesake first, making
+    // creation idempotent instead of failing with EEXIST.
+    let cname = format!("{name}\0");
+    let existing = unsafe { libc::if_nametoindex(cname.as_ptr() as *const libc::c_char) };
+    if existing != 0 {
+        nl_del_iface(sock, family, existing);
+    }
     let seq = sock.next_seq();
     let m = GenlMessage::new(family, NL80211_CMD_NEW_INTERFACE, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ap_ifindex))
@@ -3378,7 +3439,6 @@ fn nl_create_ap_vlan(
         // stale interfaces from exhausting the radio's interface limit.
         .attr(Attr::bytes(NL80211_ATTR_SOCKET_OWNER, &[]));
     sock.request_ack(m)?;
-    let cname = format!("{name}\0");
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr() as *const libc::c_char) };
     if idx == 0 {
         return Err(io::Error::new(
@@ -3386,7 +3446,13 @@ fn nl_create_ap_vlan(
             "AP_VLAN ifindex lookup failed",
         ));
     }
-    iface_set_up(name)?;
+    // NEW_INTERFACE already committed the netdev; if bringing it up fails (e.g.
+    // ENOLINK when the parent BSS addressing is unusable) it must be torn down
+    // here, otherwise the dead vdev leaks and the next attempt piles another on.
+    if let Err(e) = iface_set_up(name) {
+        nl_del_iface(sock, family, idx);
+        return Err(e);
+    }
     Ok(idx)
 }
 

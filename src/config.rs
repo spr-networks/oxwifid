@@ -202,7 +202,7 @@ pub struct RadioConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MldLinkConfig {
     pub link_id: u8,
-    pub mac: [u8; 6],
+    pub mac: Option<[u8; 6]>,
     pub channel: u8,
     pub width: Option<u16>,
     /// Explicit RF band for this link. Channel numbers overlap between bands,
@@ -777,11 +777,14 @@ impl Config {
                 if ids.contains(&link.link_id) {
                     return Err(format!("duplicate mld link_id {}", link.link_id));
                 }
-                if macs.contains(&link.mac) {
-                    return Err(format!(
-                        "duplicate mld link MAC {}",
-                        crate::util::bytes_to_mac(&link.mac)
-                    ));
+                if let Some(mac) = link.mac {
+                    if macs.contains(&mac) {
+                        return Err(format!(
+                            "duplicate mld link MAC {}",
+                            crate::util::bytes_to_mac(&mac)
+                        ));
+                    }
+                    macs.push(mac);
                 }
                 let width = link.width.unwrap_or(self.width);
                 let band = link.band.unwrap_or(self.band);
@@ -806,7 +809,6 @@ impl Config {
                 }
                 validate_band_channel(band, link.channel, &format!("mld link {}", link.link_id))?;
                 ids.push(link.link_id);
-                macs.push(link.mac);
             }
             if !ids.contains(&self.link_id) {
                 return Err(format!(
@@ -997,7 +999,7 @@ impl Config {
                 .iter()
                 .map(|l| MldLink {
                     link_id: l.link_id,
-                    mac: l.mac,
+                    mac: l.mac.unwrap_or([0u8; 6]),
                     channel: l.channel,
                     width: l.width.unwrap_or(self.width),
                     band6: l.band.unwrap_or(self.band).is_6ghz(),
@@ -1151,7 +1153,7 @@ fn parse_mld_link(item: &Value, _default_width: u16) -> Result<MldLinkConfig, St
     }
     Ok(MldLinkConfig {
         link_id: link_id.ok_or("mld link missing link_id")?,
-        mac: mac.ok_or("mld link missing mac")?,
+        mac,
         channel: channel.ok_or("mld link missing channel")?,
         width,
         band,
