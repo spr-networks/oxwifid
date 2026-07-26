@@ -110,17 +110,28 @@ fn encrypt_data_payload(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Inputs are the authenticated cipher operation tuple.
-fn decrypt_data_payload(
+struct DataDecryptParams<'a> {
     cipher: DataCipher,
-    tk: &[u8],
+    tk: &'a [u8],
     priority: u8,
-    transmitter: &[u8; 6],
+    transmitter: &'a [u8; 6],
     pn: u64,
-    aad: &[u8],
-    ciphertext: &[u8],
-    tag: &[u8],
-) -> Option<Vec<u8>> {
+    aad: &'a [u8],
+    ciphertext: &'a [u8],
+    tag: &'a [u8],
+}
+
+fn decrypt_data_payload(params: DataDecryptParams<'_>) -> Option<Vec<u8>> {
+    let DataDecryptParams {
+        cipher,
+        tk,
+        priority,
+        transmitter,
+        pn,
+        aad,
+        ciphertext,
+        tag,
+    } = params;
     if tk.len() != cipher.key_len() {
         return None;
     }
@@ -326,16 +337,16 @@ pub fn decrypt_protected_data_sec(
         return None;
     }
     let (payload, tag) = data.split_at(data.len() - tag_len);
-    let plaintext = decrypt_data_payload(
-        data_cipher,
+    let plaintext = decrypt_data_payload(DataDecryptParams {
+        cipher: data_cipher,
         tk,
-        frame.priority() as u8,
-        &sa2,
+        priority: frame.priority() as u8,
+        transmitter: &sa2,
         pn,
-        &aad,
-        payload,
+        aad: &aad,
+        ciphertext: payload,
         tag,
-    )?;
+    })?;
     if plaintext.len() < 8 {
         return None;
     }
@@ -497,16 +508,16 @@ pub fn decrypt_protected_mgmt_sec(
         return None;
     }
     let (payload, tag) = data.split_at(data.len() - tag_len);
-    decrypt_data_payload(
-        data_cipher,
+    decrypt_data_payload(DataDecryptParams {
+        cipher: data_cipher,
         tk,
-        frame.priority() as u8,
-        &sa2,
+        priority: frame.priority() as u8,
+        transmitter: &sa2,
         pn,
-        &aad,
-        payload,
+        aad: &aad,
+        ciphertext: payload,
         tag,
-    )
+    })
 }
 
 /// Build a CCMP-protected unicast Deauthentication frame (AP -> STA under PMF).

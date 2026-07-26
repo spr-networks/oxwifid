@@ -102,7 +102,7 @@ impl SprNotifier {
                             Err(e) => eprintln!("SPR DHCP/XDP helper failed: {e}"),
                         }
                     }
-                    match put_event(&path, &event) {
+                    match put_event_with_retry(&path, &event) {
                         Ok(()) if std::env::var_os("RUSTAP_SPR_DEBUG").is_some() => {
                             eprintln!("SPR event delivered: {}", event.request().0)
                         }
@@ -152,6 +152,21 @@ fn run_dhcp_helper(helper: &PathBuf, event: &SprEvent) -> io::Result<bool> {
     )))
 }
 
+fn put_event_with_retry(socket_path: &PathBuf, event: &SprEvent) -> io::Result<()> {
+    const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(250)];
+    let mut last_error = None;
+    for attempt in 0..=RETRY_DELAYS.len() {
+        match put_event(socket_path, event) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if let Some(delay) = RETRY_DELAYS.get(attempt) {
+            std::thread::sleep(*delay);
+        }
+    }
+    Err(last_error.expect("at least one SPR delivery attempt"))
+}
+
 fn put_event(socket_path: &PathBuf, event: &SprEvent) -> io::Result<()> {
     let (endpoint, value) = event.request();
     let body = serde_json::to_vec(&value).map_err(io::Error::other)?;
@@ -171,8 +186,15 @@ fn put_event(socket_path: &PathBuf, event: &SprEvent) -> io::Result<()> {
     let status = String::from_utf8_lossy(&response[..n]);
     let first_line = status.lines().next().unwrap_or("");
     if !(first_line.starts_with("HTTP/1.1 2") || first_line.starts_with("HTTP/1.0 2")) {
+        let detail: String = status
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.trim())
+            .unwrap_or("")
+            .chars()
+            .take(256)
+            .collect();
         return Err(io::Error::other(format!(
-            "{endpoint} returned {first_line:?}"
+            "{endpoint} returned {first_line:?}: {detail}"
         )));
     }
     Ok(())
@@ -242,6 +264,79 @@ mod tests {
         assert!(request.contains("\"Iface\":\"wlan3.4096\""));
         assert!(request.contains("\"Event\":\"AP-STA-CONNECTED\""));
         assert!(request.contains("\"Mac\":\"02:00:00:00:00:01\""));
+    }
+
+    #[test]
+    fn retries_mesh_delivery_failures_and_preserves_error_details() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "barely-ap-spr-retry-{}-{unique}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            for status in [
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\nmesh nft failed"
+                    .as_slice(),
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 15\r\nConnection: close\r\n\r\nmesh nft failed"
+                    .as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                stream.write_all(status).unwrap();
+            }
+        });
+
+        put_event_with_retry(
+            &path,
+            &SprEvent::Connected {
+                iface: "wlan3.4096".to_string(),
+                mac: "02:00:00:00:00:01".to_string(),
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reports_api_error_body() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "barely-ap-spr-error-{}-{unique}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 14\r\nConnection: close\r\n\r\nnft add failed",
+                )
+                .unwrap();
+        });
+
+        let error = put_event(
+            &path,
+            &SprEvent::Connected {
+                iface: "wlan3.4096".to_string(),
+                mac: "02:00:00:00:00:01".to_string(),
+            },
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(error.to_string().contains("nft add failed"), "{error}");
     }
 
     #[test]

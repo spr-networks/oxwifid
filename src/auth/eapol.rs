@@ -82,18 +82,30 @@ pub(crate) fn eapol_data_header_tods(bssid: &[u8; 6], sta: &[u8; 6], sc: u16) ->
 // Station-side management & EAPOL frames (uplink / to-DS)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields.
-pub fn build_eapol_m2(
-    bssid: &[u8; 6],
-    sta: &[u8; 6],
-    snonce: &[u8; 32],
-    kck: &[u8],
-    supp_rsn: &[u8],
-    replay_counter: u64,
-    sc: u16,
-    mic: KeyMic,
-    oci: Option<(u8, u8)>,
-) -> Vec<u8> {
+pub struct EapolM2Params<'a> {
+    pub bssid: &'a [u8; 6],
+    pub sta: &'a [u8; 6],
+    pub snonce: &'a [u8; 32],
+    pub kck: &'a [u8],
+    pub supp_rsn: &'a [u8],
+    pub replay_counter: u64,
+    pub sc: u16,
+    pub mic: KeyMic,
+    pub oci: Option<(u8, u8)>,
+}
+
+pub fn build_eapol_m2(params: EapolM2Params<'_>) -> Vec<u8> {
+    let EapolM2Params {
+        bssid,
+        sta,
+        snonce,
+        kck,
+        supp_rsn,
+        replay_counter,
+        sc,
+        mic,
+        oci,
+    } = params;
     let ki = KeyInfo {
         has_key_mic: true,
         key_type: true,
@@ -192,7 +204,16 @@ pub fn build_eapol_m1_for_key_length(
     mic: KeyMic,
     key_length: u16,
 ) -> Vec<u8> {
-    build_eapol_m1_with_key_data(bssid, sta, anonce, replay_counter, sc, mic, key_length, &[])
+    build_eapol_m1_with_key_data(EapolM1KeyData {
+        bssid,
+        sta,
+        anonce,
+        replay_counter,
+        sc,
+        mic,
+        key_length,
+        key_data: &[],
+    })
 }
 
 /// EAPOL message 1 for an MLD association: carries the AP MLD MAC Address KDE
@@ -206,29 +227,41 @@ pub fn build_eapol_m1_mld(
     mic: KeyMic,
     ap_mld_mac: &[u8; 6],
 ) -> Vec<u8> {
-    build_eapol_m1_with_key_data(
+    let key_data = mac_addr_kde(ap_mld_mac);
+    build_eapol_m1_with_key_data(EapolM1KeyData {
         bssid,
         sta,
         anonce,
         replay_counter,
         sc,
         mic,
-        16,
-        &mac_addr_kde(ap_mld_mac),
-    )
+        key_length: 16,
+        key_data: &key_data,
+    })
 }
 
-#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields.
-fn build_eapol_m1_with_key_data(
-    bssid: &[u8; 6],
-    sta: &[u8; 6],
-    anonce: &[u8; 32],
+struct EapolM1KeyData<'a> {
+    bssid: &'a [u8; 6],
+    sta: &'a [u8; 6],
+    anonce: &'a [u8; 32],
     replay_counter: u64,
     sc: u16,
     mic: KeyMic,
     key_length: u16,
-    key_data: &[u8],
-) -> Vec<u8> {
+    key_data: &'a [u8],
+}
+
+fn build_eapol_m1_with_key_data(params: EapolM1KeyData<'_>) -> Vec<u8> {
+    let EapolM1KeyData {
+        bssid,
+        sta,
+        anonce,
+        replay_counter,
+        sc,
+        mic,
+        key_length,
+        key_data,
+    } = params;
     let ki = KeyInfo {
         key_ack: true,
         key_type: true,
@@ -243,23 +276,40 @@ fn build_eapol_m1_with_key_data(
 
 /// MAC Address KDE (00-0F-AC:3), used by 802.11be MLD EAPOL-Key messages to
 /// carry the AP or STA MLD MAC address.
-#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields/KDEs.
-pub fn build_eapol_m3(
-    bssid: &[u8; 6],
-    sta: &[u8; 6],
-    anonce: &[u8; 32],
-    kck: &[u8],
-    kek: &[u8],
-    ap_rsn: &[u8],
-    gtk_key_id: u8,
-    gtk: &[u8],
-    igtk: Option<(u16, [u8; 6], [u8; 16])>,
-    bigtk: Option<(u16, [u8; 6], [u8; 16])>,
-    oci: Option<(u8, u8)>,
-    replay_counter: u64,
-    sc: u16,
-    mic: KeyMic,
-) -> Vec<u8> {
+pub struct EapolM3Params<'a> {
+    pub bssid: &'a [u8; 6],
+    pub sta: &'a [u8; 6],
+    pub anonce: &'a [u8; 32],
+    pub kck: &'a [u8],
+    pub kek: &'a [u8],
+    pub ap_rsn: &'a [u8],
+    pub gtk_key_id: u8,
+    pub gtk: &'a [u8],
+    pub igtk: Option<(u16, [u8; 6], [u8; 16])>,
+    pub bigtk: Option<(u16, [u8; 6], [u8; 16])>,
+    pub oci: Option<(u8, u8)>,
+    pub replay_counter: u64,
+    pub sc: u16,
+    pub mic: KeyMic,
+}
+
+pub fn build_eapol_m3(params: EapolM3Params<'_>) -> Vec<u8> {
+    let EapolM3Params {
+        bssid,
+        sta,
+        anonce,
+        kck,
+        kek,
+        ap_rsn,
+        gtk_key_id,
+        gtk,
+        igtk,
+        bigtk,
+        oci,
+        replay_counter,
+        sc,
+        mic,
+    } = params;
     build_eapol_m3_for_key_length(
         bssid,
         sta,

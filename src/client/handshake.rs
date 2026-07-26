@@ -98,9 +98,17 @@ impl Client {
             }
         }
         let mic = self.key_mic();
-        let message_2 = dot11::build_eapol_m2(
-            &bssid, &self.mac, &snonce, &kck, &supp_rsn, replay, sc, mic, oci,
-        );
+        let message_2 = dot11::build_eapol_m2(dot11::EapolM2Params {
+            bssid: &bssid,
+            sta: &self.mac,
+            snonce: &snonce,
+            kck: &kck,
+            supp_rsn: &supp_rsn,
+            replay_counter: replay,
+            sc,
+            mic,
+            oci,
+        });
         self.tx_eapol(message_2, protected, out);
         self.eapol_state = 1;
     }
