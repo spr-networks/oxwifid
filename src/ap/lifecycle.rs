@@ -40,10 +40,18 @@ impl Ap {
             s.eapol_ready = false;
             s.awaiting_m4 = false;
             s.ptk_candidates.clear();
-            s.kck.zeroize();
-            s.kek.zeroize();
-            s.tk.zeroize();
-            s.pairwise_tk.zeroize();
+            // An initial association has no installed PTK to preserve. A
+            // suppressed reassociation can, however, belong to a station whose
+            // old association is still authorized until transport cleanup
+            // completes. Cancelling the unsent *new* M1 must not erase that
+            // established session's data key or turn cancellation into a
+            // premature disconnect.
+            if !s.associated {
+                s.kck.zeroize();
+                s.kek.zeroize();
+                s.tk.zeroize();
+                s.pairwise_tk.zeroize();
+            }
             s.eapol_retries = 0;
             s.eapol_acked = false;
         }
