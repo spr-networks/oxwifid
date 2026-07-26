@@ -13,6 +13,7 @@ impl Ap {
                 s.eapol_tx = Instant::now();
             }
         }
+        self.arm_eapol_timer(sta);
     }
 
     /// The transport held the first EAPOL-Key frame until the successful
@@ -25,6 +26,7 @@ impl Ap {
             s.eapol_retries = 0;
             s.eapol_acked = false;
         }
+        self.arm_eapol_timer(sta);
     }
 
     /// The successful Association Response was not acknowledged. The netlink
@@ -45,6 +47,7 @@ impl Ap {
             s.eapol_retries = 0;
             s.eapol_acked = false;
         }
+        self.cancel_eapol_timer(sta);
     }
 
     /// Whether a station has completed the handshake.
@@ -63,8 +66,128 @@ impl Ap {
     pub fn tick(&mut self) -> Outgoing {
         let mut out = Outgoing::default();
         let now = Instant::now();
+        self.poll_sae_work(&mut out);
+        if self
+            .maintenance_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.run_deadline_maintenance(now);
+        }
+
+        // Key lifecycle: a queued strict rekey (a station left) or the periodic
+        // `wpa_group_rekey` interval triggers a Group Key Handshake. rekey_gtk()
+        // coalesces if one is already in flight, and arms each msg 1 for
+        // retransmit through the loop below.
+        // Keep the group-key timer running while the BSS is idle too, matching
+        // reference AP. Otherwise an AP left idle past the interval starts a
+        // Group Key Handshake immediately after its first station completes the
+        // 4-way. Apart from being needless (M3 already delivered the current
+        // keys), that exposed clients to a second key transition before their
+        // data path had settled.
+        let periodic = self.group_rekey_secs > 0
+            && now.duration_since(self.last_group_rekey)
+                >= Duration::from_secs(self.group_rekey_secs);
+        if self.group_rekey_due || periodic {
+            self.group_rekey_due = false;
+            out.frames.extend(self.rekey_gtk());
+        }
+
+        while self
+            .eapol_deadlines
+            .peek()
+            .is_some_and(|Reverse((deadline, _, _))| *deadline <= now)
+        {
+            let Reverse((_deadline, generation, mac)) =
+                self.eapol_deadlines.pop().expect("peeked deadline");
+            let action = {
+                let Some(s) = self.stations.get_mut(&mac) else {
+                    continue;
+                };
+                if s.eapol_timer_generation != generation || s.pending_eapol.is_none() {
+                    continue;
+                }
+                if s.eapol_retries >= MAX_EAPOL_RETRIES {
+                    Some(Err((s.group_rekeying, s.awaiting_m4, s.eapol_retries)))
+                } else {
+                    let frame = s.pending_eapol.clone().expect("checked above");
+                    s.eapol_tx = now;
+                    s.eapol_retries += 1;
+                    s.eapol_acked = false;
+                    s.eapol_timer_generation = s.eapol_timer_generation.wrapping_add(1);
+                    let next_generation = s.eapol_timer_generation;
+                    Some(Ok((frame, next_generation)))
+                }
+            };
+            match action {
+                Some(Ok((frame, next_generation))) => {
+                    out.frames.push(frame);
+                    self.eapol_deadlines
+                        .push(Reverse((now + EAPOL_TIMEOUT, next_generation, mac)));
+                }
+                Some(Err((group_rekeying, awaiting_m4, retries))) => {
+                    eprintln!(
+                        "AP: {} timeout for {} after {} retries",
+                        if group_rekeying {
+                            "group-key handshake"
+                        } else if awaiting_m4 {
+                            "4-way message 3"
+                        } else {
+                            "4-way message 1"
+                        },
+                        crate::util::bytes_to_mac(&mac),
+                        retries,
+                    );
+                    self.disconnect(&mac, 15);
+                    let deauth = dot11::build_deauth(&self.mac, &mac, 15);
+                    out.tx(deauth);
+                }
+                None => {}
+            }
+        }
+        out
+    }
+
+    pub(super) fn schedule_maintenance(&mut self, deadline: Instant) {
+        if self
+            .maintenance_deadline
+            .is_none_or(|current| deadline < current)
+        {
+            self.maintenance_deadline = Some(deadline);
+        }
+    }
+
+    pub(super) fn arm_eapol_timer(&mut self, sta: &[u8; 6]) {
+        let Some(s) = self.stations.get_mut(sta) else {
+            return;
+        };
+        s.eapol_timer_generation = s.eapol_timer_generation.wrapping_add(1);
+        let generation = s.eapol_timer_generation;
+        let Some(_) = s.pending_eapol else {
+            return;
+        };
+        let timeout = if s.eapol_retries == 0 && !s.eapol_acked {
+            EAPOL_FIRST_TIMEOUT
+        } else {
+            EAPOL_TIMEOUT
+        };
+        self.eapol_deadlines
+            .push(Reverse((s.eapol_tx + timeout, generation, *sta)));
+    }
+
+    pub(super) fn cancel_eapol_timer(&mut self, sta: &[u8; 6]) {
+        if let Some(s) = self.stations.get_mut(sta) {
+            s.eapol_timer_generation = s.eapol_timer_generation.wrapping_add(1);
+        }
+    }
+
+    fn run_deadline_maintenance(&mut self, now: Instant) {
         self.pending_anonce
             .retain(|_, pending| now.duration_since(pending.created_at) < ANONCE_HOLD);
+        if let Some(worker) = self.async_sae.as_mut() {
+            worker
+                .pending
+                .retain(|_, pending| now.duration_since(pending.queued_at) < SAE_AUTH_TIMEOUT);
+        }
         let stale_sae: Vec<[u8; 6]> = self
             .stations
             .iter()
@@ -78,67 +201,50 @@ impl Ap {
         for mac in stale_sae {
             self.disconnect(&mac, 15);
         }
+        let unresponsive: Vec<[u8; 6]> = self
+            .stations
+            .iter()
+            .filter(|(_, s)| {
+                s.sa_query
+                    .is_some_and(|(_, started)| now.duration_since(started) >= SA_QUERY_TIMEOUT)
+            })
+            .map(|(mac, _)| *mac)
+            .collect();
+        for mac in unresponsive {
+            eprintln!(
+                "AP: SA Query unanswered by {}; retiring the association",
+                crate::util::bytes_to_mac(&mac)
+            );
+            self.disconnect(&mac, 15);
+        }
         self.expire_pmksa();
 
-        // Key lifecycle: a queued strict rekey (a station left) or the periodic
-        // `wpa_group_rekey` interval triggers a Group Key Handshake. rekey_gtk()
-        // coalesces if one is already in flight, and arms each msg 1 for
-        // retransmit through the loop below.
-        let periodic = self.group_rekey_secs > 0
-            && now.duration_since(self.last_group_rekey)
-                >= Duration::from_secs(self.group_rekey_secs)
-            && self.stations.values().any(|s| s.associated);
-        if self.group_rekey_due || periodic {
-            self.group_rekey_due = false;
-            out.frames.extend(self.rekey_gtk());
-        }
-
-        let mut timed_out: Vec<[u8; 6]> = Vec::new();
-        for (mac, s) in self.stations.iter_mut() {
-            let Some(frame) = s.pending_eapol.as_ref() else {
-                continue;
-            };
-            // The first message-1 attempt gets the authenticator's short retry
-            // timeout. An ACK stretches that first timeout to the normal interval,
-            // and every later attempt also waits the normal interval. Do not
-            // aggressively enqueue a new copy merely because TX status is still
-            // pending: ath12k can report status late, and the old 40-ms loop filled
-            // its queue with 31 stale m1/m3 copies before the first status arrived.
-            let timeout = if s.eapol_retries == 0 && !s.eapol_acked {
-                EAPOL_FIRST_TIMEOUT
-            } else {
-                EAPOL_TIMEOUT
-            };
-            if now.duration_since(s.eapol_tx) < timeout {
-                continue;
+        let mut next = None;
+        let mut consider = |deadline: Instant| {
+            if deadline > now && next.is_none_or(|current| deadline < current) {
+                next = Some(deadline);
             }
-            if s.eapol_retries >= MAX_EAPOL_RETRIES {
-                eprintln!(
-                    "AP: {} timeout for {} after {} retries",
-                    if s.group_rekeying {
-                        "group-key handshake"
-                    } else if s.awaiting_m4 {
-                        "4-way message 3"
-                    } else {
-                        "4-way message 1"
-                    },
-                    crate::util::bytes_to_mac(mac),
-                    s.eapol_retries,
-                );
-                timed_out.push(*mac);
-            } else {
-                out.frames.push(frame.clone()); // already radiotap-prefixed
-                s.eapol_tx = now;
-                s.eapol_retries += 1;
-                s.eapol_acked = false; // awaiting the ACK for this resend
+        };
+        for pending in self.pending_anonce.values() {
+            consider(pending.created_at + ANONCE_HOLD);
+        }
+        for station in self.stations.values() {
+            if !station.associated && station.sae.is_some() && !station.sae_confirmed {
+                consider(station.last_activity + SAE_AUTH_TIMEOUT);
+            }
+            if let Some((_, started)) = station.sa_query {
+                consider(started + SA_QUERY_TIMEOUT);
             }
         }
-        for mac in timed_out {
-            self.disconnect(&mac, 15);
-            let deauth = dot11::build_deauth(&self.mac, &mac, 15); // 4-way timeout
-            out.tx(deauth);
+        for entry in self.pmksa_cache.values() {
+            consider(entry.expires_at);
         }
-        out
+        if let Some(worker) = self.async_sae.as_ref() {
+            for pending in worker.pending.values() {
+                consider(pending.queued_at + SAE_AUTH_TIMEOUT);
+            }
+        }
+        self.maintenance_deadline = next;
     }
 
     /// Test hook: age the group-rekey clock past `wpa_group_rekey` so the next
@@ -169,11 +275,40 @@ impl Ap {
     #[doc(hidden)]
     pub fn test_expire_eapol(&mut self) {
         let past = Instant::now() - EAPOL_TIMEOUT - Duration::from_millis(1);
-        for s in self.stations.values_mut() {
+        let mut armed = Vec::new();
+        for (mac, s) in self.stations.iter_mut() {
             if s.pending_eapol.is_some() {
                 s.eapol_tx = past;
+                armed.push(*mac);
             }
         }
+        for mac in armed {
+            self.arm_eapol_timer(&mac);
+        }
+    }
+
+    /// Whether a station negotiated the SHA-256 key hierarchy (SAE, OWE, or
+    /// PSK-SHA256). Distinct from PMF — see [`Ap::station_uses_pmf`].
+    pub fn station_uses_sha256(&self, sta: &[u8; 6]) -> bool {
+        self.stations.get(sta).map(|s| s.sha256).unwrap_or(false)
+    }
+
+    /// Whether management frame protection is in force for a station.
+    pub fn station_uses_pmf(&self, sta: &[u8; 6]) -> bool {
+        self.stations.get(sta).map(|s| s.pmf).unwrap_or(false)
+    }
+
+    /// Test hook: age every outstanding SA Query past its timeout so the next
+    /// [`Ap::tick`] retires the unresponsive station.
+    #[doc(hidden)]
+    pub fn test_expire_sa_query(&mut self) {
+        let past = Instant::now() - SA_QUERY_TIMEOUT - Duration::from_millis(1);
+        for station in self.stations.values_mut() {
+            if let Some((trans, _)) = station.sa_query {
+                station.sa_query = Some((trans, past));
+            }
+        }
+        self.maintenance_deadline = Some(Instant::now());
     }
 
     /// Test hook: age every incomplete SAE exchange past its authentication
@@ -186,6 +321,7 @@ impl Ap {
                 station.last_activity = past;
             }
         }
+        self.maintenance_deadline = Some(Instant::now());
     }
 
     /// Test hook: advance the token epoch beyond its accepted lifetime.
@@ -210,15 +346,17 @@ impl Ap {
                 self.pmksa_cache.remove(&victim);
             }
         }
+        let expires_at = Instant::now() + PMKSA_LIFETIME;
         self.pmksa_cache.insert(
             key,
             PmksaEntry {
                 identity,
                 pmk,
                 sha256,
-                expires_at: Instant::now() + PMKSA_LIFETIME,
+                expires_at,
             },
         );
+        self.schedule_maintenance(expires_at);
     }
 
     pub(super) fn expire_pmksa(&mut self) {
@@ -272,6 +410,7 @@ impl Ap {
     /// torn down mid-handshake never connected, so it produces no event.
     pub(super) fn disconnect(&mut self, sta: &[u8; 6], reason: u16) {
         if let Some(s) = self.stations.remove(sta) {
+            self.removed_stations.push(*sta);
             if s.associated {
                 self.events.push(ApEvent::Disconnected {
                     mac: s.client_mld_mac.unwrap_or(*sta),
@@ -286,6 +425,20 @@ impl Ap {
                 }
             }
         }
+    }
+
+    /// Drain station removals for change-driven transport reconciliation.
+    pub fn drain_removed_stations(&mut self) -> Vec<[u8; 6]> {
+        std::mem::take(&mut self.removed_stations)
+    }
+
+    /// Drain stations whose PTK became installable after a verified message 4.
+    pub fn drain_key_ready_stations(&mut self) -> Vec<[u8; 6]> {
+        std::mem::take(&mut self.key_ready_stations)
+    }
+
+    pub fn group_key_epoch(&self) -> u64 {
+        self.group_key_epoch
     }
 
     /// Drain the control events (connect/disconnect/auth-fail) queued since the
@@ -337,7 +490,13 @@ impl Ap {
         if !self.mld || s.client_mld_mac.is_none() {
             return Vec::new();
         }
-        let mut ids = vec![self.link_id];
+        // The anchor configured on the AP is not necessarily the link this
+        // station used. In particular, an iPhone can associate on link 1 and
+        // advertise link 0 as its partner. Seeding this list with `self.link_id`
+        // then collapses the negotiated set to [0], so the kernel never receives
+        // the GTK for the active association link and DHCP/group downlink dies.
+        let association_link = s.assoc_link_id.unwrap_or(self.link_id);
+        let mut ids = vec![association_link];
         for (link_id, _) in &s.client_mld_links {
             if !ids.contains(link_id)
                 && self

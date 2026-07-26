@@ -9,6 +9,13 @@ impl Ap {
         }
         let sta = frame.addr2;
         let reassoc = frame.subtype() == dot11::SUBTYPE_REASSOC_REQ;
+        // File parsing/PBKDF2 for a requested reload runs off-thread. Do not
+        // authenticate a new association against the superseded database while
+        // that work is in progress.
+        if self.credential_reload_pending {
+            self.reject_assoc(&sta, reassoc, out);
+            return;
+        }
         let request_time = Instant::now();
         if !self.allow_assoc_request(sta, request_time) {
             return;
@@ -18,33 +25,10 @@ impl Ap {
         // request: the frame may be spoofed and intentionally malformed. Do not
         // let it overwrite station state or turn the required status-30 comeback
         // into a negotiation error.
-        let (pmf_assoc, tk) = self
-            .stations
-            .get(&sta)
-            .map(|s| (s.associated && s.sha256, s.pairwise_tk))
-            .unwrap_or((false, [0u8; 32]));
-        if pmf_assoc {
+        if self.pmf_session_protected(&sta) {
             let sc = self.next_sc();
             out.tx(dot11::build_assoc_resp_comeback(&self.mac, &sta, 1000, sc));
-            self.sa_query_id = self.sa_query_id.wrapping_add(1);
-            let trans = self.sa_query_id;
-            let Some(pn) = self.stations.get_mut(&sta).unwrap().next_client_pn() else {
-                return;
-            };
-            let sc = self.next_sc();
-            let sec = self.mld_mgmt_tx_sec_addrs(&sta);
-            out.tx(dot11::build_protected_sa_query_for_cipher_sec(
-                self.pairwise_cipher,
-                &self.mac,
-                &sta,
-                false,
-                false,
-                trans,
-                sc,
-                pn,
-                &tk[..self.pairwise_cipher.key_len()],
-                sec,
-            ));
+            self.sa_query_challenge(&sta, out);
             return;
         }
 
@@ -69,6 +53,17 @@ impl Ap {
             return;
         }
         let requests_sae = dot11::rsn_has_akm(assoc_rsn, 8);
+        let requests_pmf = dot11::rsn_has_mfpc(assoc_rsn);
+        let transition_mode = self.security_mode() == dot11::SecurityMode::Transition;
+        // On a BSS offering both PSK AKMs, the station's association RSNE says
+        // which one it selected. AKM 6 (PSK-SHA256) shares WPA3's SHA-256 key
+        // hierarchy but negotiates no management-frame protection, so it sets
+        // `sha256` without setting `pmf`. Computed here (before the station is
+        // mutably borrowed) and applied unconditionally, so a station that
+        // previously selected AKM 6 and now selects AKM 2 is keyed with SHA-1
+        // rather than keeping a stale hierarchy.
+        let selects_psk_sha256 = matches!(self.security_mode(), dot11::SecurityMode::Wpa2PskSha256)
+            .then(|| dot11::rsn_has_akm(assoc_rsn, 6));
         if requests_sae {
             let sae_h2e = self
                 .stations
@@ -130,13 +125,30 @@ impl Ap {
             // Remember the station's capability IEs (HT/VHT/HE/rates) so the
             // netlink station setup can hand them to the driver for rate control.
             s.assoc_ies = frame.body.get(ie_off..).unwrap_or(&[]).to_vec();
+            if let Some(psk_sha256) = selects_psk_sha256 {
+                s.sha256 = psk_sha256;
+                s.psk_sha256 = psk_sha256;
+                s.owe = false;
+                s.pmf = false;
+            }
+            // A transition BSS advertises PMF as optional. A WPA2/PSK station
+            // with ieee80211w=1 selects it by setting MFPC in its Association
+            // RSNE, so remember that per-station negotiation: M3 must carry the
+            // IGTK and the kernel station must be marked MFP. Legacy WPA2
+            // stations omit MFPC and remain non-PMF on the same BSS.
+            if transition_mode {
+                s.pmf = requests_pmf;
+            }
+            // Every station on an AP MLD has an association link, including a
+            // legacy non-MLD WPA2 client. Its PTK uses that link's BSSID rather
+            // than the AP MLD address or the canonical link-0 address.
+            s.assoc_link_id = self.mld.then_some(assoc_link_for_station);
             if let Some((client_mld, links)) = mld_assoc.as_ref() {
                 s.client_mld_mac = Some(*client_mld);
                 s.client_mld_links = links.clone();
-                s.assoc_link_id = Some(assoc_link_for_station);
             }
         }
-        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+        if crate::util::netlink_debug_enabled() {
             let ies = frame.body.get(ie_off..).unwrap_or(&[]);
             let ml = dot11::parse_mld_mac(ies);
             let rsn_hex: String = dot11::find_ie(ies, 48)
@@ -209,6 +221,8 @@ impl Ap {
                 if let Some(s) = self.stations.get_mut(&sta) {
                     s.set_pmk(Some(pmk));
                     s.sha256 = sha256;
+                    // Only SAE/OWE exchanges are cached, and both mandate PMF.
+                    s.pmf = sha256;
                 }
                 break;
             }
@@ -265,6 +279,8 @@ impl Ap {
                         s.set_pmk(Some(pmk));
                         s.sha256 = true;
                         s.owe = true; // OWE uses the HMAC-SHA256 EAPOL MIC
+                        s.psk_sha256 = false;
+                        s.pmf = true; // OWE negotiates mandatory PMF
                     }
                     owe_dh_resp = Some(dot11::build_dh_param_element(group, &ap_pub));
                 }
@@ -308,10 +324,7 @@ impl Ap {
 
         let aid = self.next_aid();
         let sc = self.next_sc();
-        // Build the response in the association link's context (its channel,
-        // band, and width), like hostapd's per-link `hapd`. For a non-MLD AP or
-        // the anchor link this is identical to `self`'s parameters. The netlink
-        // TX path rewrites addr2/addr3 to the association link's BSSID.
+        // Build the response in the association link's context (its channel, band, and width)
         let (resp_mac, resp_channel, resp_width, resp_band6) = match self.association_link() {
             Some(link) => (link.mac, link.channel, link.width, link.band6),
             None => (self.mac, self.channel, self.channel_width, self.band6),
@@ -385,6 +398,7 @@ impl Ap {
                     s.eapol_retries = 0;
                     s.eapol_acked = false;
                 }
+                self.arm_eapol_timer(&sta);
                 out.frames.push(m3); // already radiotap-prefixed
             }
             return;
@@ -428,6 +442,7 @@ impl Ap {
                 created_at: now,
             },
         );
+        self.schedule_maintenance(now + ANONCE_HOLD);
         {
             let entry = self.stations.get_mut(&sta).unwrap();
             entry.anonce = Some(anonce);
@@ -436,11 +451,11 @@ impl Ap {
             entry.m1_replay = m1_replay;
             entry.ptk_candidates.clear();
         }
-        let (sha256, owe) = self
+        let station_mic = self
             .stations
             .get(&sta)
-            .map(|s| (s.sha256, s.owe))
-            .unwrap_or((false, false));
+            .map(|s| s.key_mic())
+            .unwrap_or(dot11::KeyMic::HmacSha1);
         let m1_sc = self.next_sc();
         let mld_station = self.mld
             && self
@@ -455,7 +470,7 @@ impl Ap {
                 &anonce,
                 m1_replay,
                 m1_sc,
-                dot11::KeyMic::select(sha256, owe),
+                station_mic,
                 &self.mld_mac,
             )
         } else {
@@ -465,7 +480,7 @@ impl Ap {
                 &anonce,
                 m1_replay,
                 m1_sc,
-                dot11::KeyMic::select(sha256, owe),
+                station_mic,
                 self.pairwise_cipher.key_len() as u16,
             )
         };
@@ -477,8 +492,9 @@ impl Ap {
             entry.eapol_retries = 0;
             entry.eapol_acked = false;
         }
+        self.arm_eapol_timer(&sta);
 
-        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+        if crate::util::netlink_debug_enabled() {
             eprintln!(
                 "AP: TX m1 anonce={} sc={m1_sc}",
                 anonce

@@ -347,7 +347,7 @@ pub fn build_eapol_m3_for_key_length_with_rsc(
     if let Some((oc, ch)) = oci {
         plain.extend_from_slice(&oci_kde(oc, ch)); // OCV
     }
-    if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+    if crate::util::netlink_debug_enabled() {
         eprintln!(
             "AP: m3 plaintext KDEs ({}B)={}",
             plain.len(),

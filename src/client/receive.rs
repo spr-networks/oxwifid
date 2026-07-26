@@ -3,6 +3,87 @@
 use super::*;
 
 impl Client {
+    /// Dispatch one EAPOL-Key message from the AP, from either transport:
+    /// `protected` distinguishes a bare 802.11 data frame on the uncontrolled
+    /// port from one that arrived CCMP-encapsulated on the controlled port.
+    /// Replies go back the same way.
+    pub(super) fn handle_eapol_key(
+        &mut self,
+        eapol: &[u8],
+        ek: &dot11::EapolKey,
+        protected: bool,
+        out: &mut ClientOut,
+    ) {
+        // Message 1 is the only key message with no MIC, which is what lets a
+        // forged one be injected at all. Once a pairwise key is installed the AP
+        // carries EAPOL inside protected data, so an unprotected, MIC-less
+        // pairwise key message at that point cannot have come from the AP —
+        // drop it rather than let it churn the handshake state of a working
+        // session. Gated on PMF, matching hostapd: without PMF an attacker can
+        // simply deauthenticate instead, so refusing costs interoperability for
+        // no gain.
+        if !protected
+            && self.ptk_installed
+            && self.sae_pmk.is_some()
+            && ek.is_pairwise()
+            && !ek.has_key_mic()
+        {
+            return;
+        }
+
+        let before = out.frames.len();
+        if self.connected >= 4 {
+            // Group Key Handshake message 1 (GTK rekey).
+            if !ek.is_pairwise() {
+                if self.valid_group_m1(ek) {
+                    self.handle_group_rekey(eapol, ek, protected, out);
+                    if out.frames.len() != before {
+                        self.note_ap_activity();
+                    }
+                }
+                return;
+            }
+            // The AP retransmits message 3 if our message 4 was lost.
+            // Verify and re-ACK it, but never reinstall its keys.
+            if self.eapol_state == 2 {
+                if self.valid_m3(ek) {
+                    self.send_eapol4(eapol, ek, protected, out);
+                } else if self.valid_m1(ek) && self.is_m1_fresh(ek) {
+                    // Authenticator-initiated PTK rekey: the AP may start a new
+                    // 4-way at any time on an established link. Answer it, but
+                    // keep the installed PTK carrying traffic — the candidate
+                    // derived here replaces it only once its message 3 verifies,
+                    // so a forged message 1 cannot drop the session or advance
+                    // the replay counter.
+                    self.send_eapol2(ek, protected, out);
+                }
+                if out.frames.len() != before {
+                    self.note_ap_activity();
+                }
+                return;
+            }
+        }
+        if self.eapol_state == 0 {
+            if self.valid_m1(ek) {
+                self.send_eapol2(ek, protected, out);
+            }
+        } else if self.eapol_state == 1 {
+            if self.valid_m3(ek) {
+                self.send_eapol4(eapol, ek, protected, out);
+            } else if self.valid_m1(ek) && self.is_m1_retry(ek) {
+                // Lost M2: reproduce it with the same SNonce/PTK.
+                self.send_eapol2_retry(ek, protected, out);
+            } else if self.valid_m1(ek) && self.is_m1_fresh(ek) {
+                // The AP restarted the 4-way (or a rekey superseded an
+                // unfinished one) with a newer replay counter.
+                self.send_eapol2(ek, protected, out);
+            }
+        }
+        if out.frames.len() != before {
+            self.note_ap_activity();
+        }
+    }
+
     pub fn handle_incoming(&mut self, radiotap_frame: &[u8]) -> ClientOut {
         let mut out = ClientOut::default();
         if dot11::radiotap_bad_fcs(radiotap_frame) {
@@ -131,8 +212,12 @@ impl Client {
                     &bssid, &self.mac, &mld, &l1, &ssid, sc,
                 ));
             } else if self.psk_sha256 {
-                out.tx(self.with_wmm(dot11::build_assoc_req_psk_sha256(
-                    &bssid, &self.mac, &ssid, sc,
+                out.tx(self.with_wmm(dot11::build_assoc_req_psk_sha256_for_cipher(
+                    &bssid,
+                    &self.mac,
+                    &ssid,
+                    sc,
+                    self.pairwise_cipher,
                 )));
             } else {
                 out.tx(self.with_wmm(dot11::build_assoc_req_for_cipher(
@@ -206,59 +291,13 @@ impl Client {
             if !frame.from_ds() || frame.addr1 != self.mac || !self.is_from_selected_ap(&frame) {
                 return out;
             }
-            let Some(ek) = frame.eapol_key_body().and_then(dot11::EapolKey::parse) else {
+            let (Some(eapol), Some(ek)) = (
+                frame.eapol_frame().map(ToOwned::to_owned),
+                frame.eapol_key_body().and_then(dot11::EapolKey::parse),
+            ) else {
                 return out;
             };
-            if self.connected >= 4 {
-                // Group Key Handshake message 1 (GTK rekey).
-                if !ek.is_pairwise() {
-                    if self.valid_group_m1(&ek) {
-                        let Some(eapol) = frame.eapol_frame() else {
-                            return out;
-                        };
-                        self.handle_group_rekey(eapol, &ek, false, &mut out);
-                        if !out.frames.is_empty() {
-                            self.note_ap_activity();
-                        }
-                    }
-                    return out;
-                }
-                // The AP retransmits message 3 if our message 4 was lost.
-                // Verify and re-ACK it, but never reinstall its keys.
-                if self.eapol_state == 2 {
-                    if self.valid_m3(&ek) {
-                        self.send_eapol4(&frame, &mut out);
-                        if !out.frames.is_empty() {
-                            self.note_ap_activity();
-                        }
-                    }
-                    return out;
-                }
-            }
-            if self.eapol_state == 0 {
-                if self.valid_m1(&ek) {
-                    self.send_eapol2(&frame, &mut out);
-                    if !out.frames.is_empty() {
-                        self.note_ap_activity();
-                    }
-                }
-            } else if self.eapol_state == 1 {
-                if self.valid_m3(&ek) {
-                    self.send_eapol4(&frame, &mut out);
-                    if !out.frames.is_empty() {
-                        self.note_ap_activity();
-                    }
-                } else if self.valid_m1(&ek)
-                    && ek.key_replay_counter == self.eapol_replay
-                    && ek.key_nonce == self.anonce
-                {
-                    // Lost M2: reproduce it with the same SNonce/PTK.
-                    self.send_eapol2_retry(&frame, &mut out);
-                    if !out.frames.is_empty() {
-                        self.note_ap_activity();
-                    }
-                }
-            }
+            self.handle_eapol_key(&eapol, &ek, false, &mut out);
             return out;
         }
 
@@ -349,9 +388,8 @@ impl Client {
                 if eth.get(12..14) == Some(&dot11::ETHERTYPE_EAPOL.to_be_bytes()) {
                     if !use_group {
                         if let Some((eapol, ek)) = Self::ethernet_eapol_key(&eth) {
-                            if self.valid_group_m1(&ek) {
-                                self.handle_group_rekey(eapol, &ek, true, &mut out);
-                            }
+                            let eapol = eapol.to_vec();
+                            self.handle_eapol_key(&eapol, &ek, true, &mut out);
                         }
                     }
                     return out;

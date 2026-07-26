@@ -1066,3 +1066,306 @@ fn auth_and_malformed_assoc_requests_are_rate_limited_per_mac() {
         "malformed association floods must also be bounded"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Key/packet-number binding, PMF enforcement, and replay-counter scoping.
+// ---------------------------------------------------------------------------
+
+fn ccmp_pn(radiotap_frame: &[u8]) -> u64 {
+    parse(radiotap_frame).ccmp_pn().expect("CCMP frame")
+}
+
+/// Drive the golden WPA2 fixture through a complete 4-way and return the AP.
+fn fixtured_wpa2_connected() -> (Ap, [u8; 6]) {
+    let v = vectors();
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = fixtured_wpa2_ap();
+    let kck: [u8; 16] = from_hex(v["crypto"]["kck"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    ap.handle_incoming(&from_hex(
+        v["incoming"]["assoc_req"]["bytes"].as_str().unwrap(),
+    ));
+    ap.handle_incoming(&from_hex(
+        v["frames"]["eapol_m2_incoming"]["bytes"].as_str().unwrap(),
+    ));
+    ap.handle_incoming(&framed(dot11::build_eapol_m4(
+        &ap_mac,
+        &sta,
+        &kck,
+        2,
+        0,
+        dot11::KeyMic::select(false, false),
+    )));
+    assert!(ap.is_associated(&sta));
+    (ap, sta)
+}
+
+#[test]
+fn a_second_four_way_does_not_reset_the_packet_number_under_the_old_key() {
+    let v = vectors();
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let (mut ap, sta) = fixtured_wpa2_connected();
+    let kck: [u8; 16] = from_hex(v["crypto"]["kck"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    let snonce: [u8; 32] = from_hex(v["crypto"]["snonce"].as_str().unwrap())
+        .try_into()
+        .unwrap();
+    let old_tk = ap.station_tk(&sta).expect("installed pairwise key");
+
+    let eth = [
+        sta.as_slice(),
+        ap_mac.as_slice(),
+        &[0x08, 0x00],
+        &[0x41; 40][..],
+    ]
+    .concat();
+    let mut pns: Vec<u64> = (0..3)
+        .map(|_| ccmp_pn(&ap.deliver_to_station(&eth)[0]))
+        .collect();
+    assert_eq!(pns, vec![1, 2, 3]);
+
+    // A repeated Association Request — which anyone can forge for a non-PMF
+    // station — makes the AP start a second 4-way. The associated station keeps
+    // its installed PTK and keeps receiving downlink throughout.
+    ap.test_clear_auth_backoff();
+    let out = ap.handle_incoming(&from_hex(
+        v["incoming"]["assoc_req"]["bytes"].as_str().unwrap(),
+    ));
+    let m1_replay = out
+        .frames
+        .iter()
+        .filter_map(|f| {
+            let p = parse(f);
+            p.is_eapol()
+                .then(|| p.eapol_key_body().and_then(dot11::EapolKey::parse))
+                .flatten()
+        })
+        .map(|key| key.key_replay_counter)
+        .next()
+        .expect("the AP sent a fresh message 1");
+
+    // The station answers with a valid message 2 (same ANonce fixture, so the
+    // same KCK verifies). Nothing may be installed from it — and in particular
+    // the transmit packet number must NOT restart while the old TK is still the
+    // transmit key, which would replay CCMP nonces under a key that has already
+    // used them.
+    let m2 = dot11::build_eapol_m2(
+        &ap_mac,
+        &sta,
+        &snonce,
+        &kck,
+        &dot11::RSN,
+        m1_replay,
+        0,
+        dot11::KeyMic::select(false, false),
+        None,
+    );
+    assert_eq!(ap.handle_incoming(&framed(m2)).frames.len(), 1, "m2 -> m3");
+    assert_eq!(
+        ap.station_tk(&sta).expect("still keyed"),
+        old_tk,
+        "the old PTK is still the transmit key until message 4"
+    );
+
+    pns.push(ccmp_pn(&ap.deliver_to_station(&eth)[0]));
+    assert_eq!(
+        pns,
+        vec![1, 2, 3, 4],
+        "the packet number keeps advancing under the unchanged key"
+    );
+}
+
+#[test]
+fn a_group_rekey_never_resets_the_group_packet_number_under_an_unchanged_key() {
+    for per_sta_vif in [false, true] {
+        let mut ap = fixtured_wpa2_ap();
+        if per_sta_vif {
+            ap.enable_per_sta_vif();
+        }
+        let v = vectors();
+        let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+        let sta = mac_to_bytes("02:00:00:00:ab:cd");
+        let kck: [u8; 16] = from_hex(v["crypto"]["kck"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        ap.handle_incoming(&from_hex(
+            v["incoming"]["assoc_req"]["bytes"].as_str().unwrap(),
+        ));
+        ap.handle_incoming(&from_hex(
+            v["frames"]["eapol_m2_incoming"]["bytes"].as_str().unwrap(),
+        ));
+        ap.handle_incoming(&framed(dot11::build_eapol_m4(
+            &ap_mac,
+            &sta,
+            &kck,
+            2,
+            0,
+            dot11::KeyMic::select(false, false),
+        )));
+
+        let eth = [
+            &[0xffu8; 6][..],
+            ap_mac.as_slice(),
+            &[0x08, 0x00],
+            &[0x42; 40][..],
+        ]
+        .concat();
+        for expected in 1..=3u64 {
+            assert_eq!(ccmp_pn(&ap.deliver_to_station(&eth)[0]), expected);
+        }
+
+        let before = ap.gtk();
+        ap.rekey_gtk();
+        let after = ap.gtk();
+        let pn = ccmp_pn(&ap.deliver_to_station(&eth)[0]);
+        // Either the group key rotated (so a restarted PN is a fresh nonce
+        // space) or the PN kept climbing. Resetting the counter while the key
+        // the group transmit path uses stays the same is keystream reuse.
+        assert!(
+            after != before || pn > 3,
+            "per_sta_vif={per_sta_vif}: group PN restarted at {pn} under an unchanged GTK"
+        );
+    }
+}
+
+#[test]
+fn an_unprotected_authentication_cannot_tear_down_a_pmf_association() {
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let (mut ap, _station) = sae_pair(sta);
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+
+    // Spoofed open-system Authentication with the victim's address: no
+    // credential, no protection. It must not disturb the session — the SA Query
+    // the (Re)Association path performs would be worthless otherwise.
+    ap.test_clear_auth_backoff();
+    let out = ap.handle_incoming(&framed(dot11::build_auth_req(&ap_mac, &sta, 0)));
+    assert!(
+        ap.is_associated(&sta),
+        "a spoofed open-auth frame must not deauthenticate a PMF station"
+    );
+    assert_eq!(out.frames.len(), 1, "the AP challenges with an SA Query");
+    assert_eq!(parse(&out.frames[0]).subtype(), dot11::SUBTYPE_ACTION);
+
+    // A spoofed SAE commit is the same attack via the other algorithm: it used
+    // to replace the station's PMK and clear `sae_confirmed`, after which every
+    // future association was refused as "SAE confirm not complete".
+    ap.test_clear_auth_backoff();
+    ap.handle_incoming(&framed(dot11::build_sae_auth(
+        &ap_mac,
+        &sta,
+        &ap_mac,
+        0,
+        0,
+        1,
+        dot11::STATUS_SAE_H2E,
+        &[0x11; 2 + 3 * 32],
+    )));
+    assert!(
+        ap.is_associated(&sta),
+        "a spoofed SAE commit must not disturb a PMF association either"
+    );
+}
+
+#[test]
+fn an_unanswered_sa_query_eventually_retires_the_association() {
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let (mut ap, _station) = sae_pair(sta);
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+
+    ap.test_clear_auth_backoff();
+    ap.handle_incoming(&framed(dot11::build_auth_req(&ap_mac, &sta, 0)));
+    assert!(ap.is_associated(&sta), "session held pending the SA Query");
+
+    // The station never answers, so it really is gone: the AP must retire it
+    // rather than refuse its genuine reconnect forever.
+    ap.test_expire_sa_query();
+    ap.tick();
+    assert!(
+        !ap.is_associated(&sta),
+        "an unanswered SA Query must not become a permanent lockout"
+    );
+}
+
+#[test]
+fn an_open_authentication_resets_the_negotiated_key_hierarchy() {
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let (mut ap, mut station) = sae_pair(sta);
+    assert!(ap.station_uses_sha256(&sta), "SAE negotiated SHA-256 + PMF");
+    disconnect_pair(&mut ap, &mut station, sta);
+
+    // A plain open-system Authentication starts a fresh session. The key
+    // hierarchy belongs to the retired session, not to the MAC address: leaving
+    // it set made the station's next WPA2-PSK 4-way derive with the wrong hash
+    // so every message 2 MIC failed.
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    ap.test_clear_auth_backoff();
+    ap.handle_incoming(&framed(dot11::build_auth_req(&ap_mac, &sta, 0)));
+    assert!(
+        !ap.station_uses_sha256(&sta),
+        "the SHA-256 key hierarchy must not survive a new authentication"
+    );
+}
+
+#[test]
+fn eapol_is_only_recognised_in_an_unprotected_data_frame() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let anonce = [0x33; 32];
+    let m1 = dot11::build_eapol_m1(&ap_mac, &sta, &anonce, 1, 0, dot11::KeyMic::HmacSha1);
+    assert!(dot11::Dot11::parse(&m1).unwrap().is_eapol());
+
+    // Same LLC/SNAP + EAPOL body, but the frame claims to be Management. Only
+    // Data frames carry an LLC/SNAP payload, so this must not be parsed as a
+    // key message on the uncontrolled port.
+    let mut as_mgmt = m1.clone();
+    as_mgmt[0] = (as_mgmt[0] & !0x0c) | (dot11::TYPE_MGMT << 2);
+    let parsed = dot11::Dot11::parse(&as_mgmt).unwrap();
+    assert_eq!(parsed.frame_type(), dot11::TYPE_MGMT);
+    assert!(!parsed.is_eapol(), "a Management frame is never EAPOL");
+
+    // And a frame whose Protected bit is set carries ciphertext by definition.
+    let mut as_protected = m1;
+    as_protected[1] |= dot11::FC_PROTECTED;
+    assert!(!dot11::Dot11::parse(&as_protected).unwrap().is_eapol());
+}
+
+#[test]
+fn uplink_replay_counters_are_kept_per_traffic_identifier() {
+    let (mut ap, sta) = fixtured_wpa2_connected();
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let tk = ap.station_tk(&sta).expect("installed pairwise key");
+
+    let send = |ap: &mut Ap, tid: u8, pn: u64, label: &[u8]| -> bool {
+        let payload = [ap_mac.as_slice(), sta.as_slice(), &[0x08, 0x00], label].concat();
+        let frame = dot11::build_ccmp_data(
+            &ap_mac,
+            &sta,
+            &ap_mac,
+            dot11::FC_TODS | dot11::FC_PROTECTED,
+            0,
+            pn,
+            0,
+            &tk,
+            0x0800,
+            &payload[14..],
+            Some(tid),
+        );
+        !ap.handle_incoming(&framed(frame)).to_network.is_empty()
+    };
+
+    // A transmitter keeps one packet-number sequence per TID, so a voice frame
+    // at PN 1 is perfectly valid after a best-effort frame at PN 9. Sharing one
+    // counter across TIDs would silently discard it.
+    assert!(send(&mut ap, 0, 9, b"best effort"));
+    assert!(
+        send(&mut ap, 6, 1, b"voice"),
+        "a fresh TID has its own replay window"
+    );
+    // Replays within a TID are still rejected.
+    assert!(!send(&mut ap, 6, 1, b"voice replay"));
+    assert!(!send(&mut ap, 0, 9, b"best effort replay"));
+    assert!(send(&mut ap, 6, 2, b"voice next"));
+}

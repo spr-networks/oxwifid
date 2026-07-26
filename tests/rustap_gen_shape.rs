@@ -42,3 +42,49 @@ fn generator_shaped_config_parses() {
         Err(e) => panic!("generator-shaped config rejected: {e}"),
     }
 }
+
+#[test]
+fn spr_single_radio_config_derives_reference_control_socket() {
+    let text = r#"{
+      "ssid": "rustaptest",
+      "mode": "netlink",
+      "key_mgmt": "sae",
+      "passphrase": "password1234",
+      "iface": "wlan3",
+      "band": 5,
+      "channel": 36,
+      "width": 80,
+      "phy": "be",
+      "spr_api_socket": "/state/wifi/apisock",
+      "spr_dhcp_helper": "/hostap_dhcp_helper"
+    }"#;
+    let cfg = Config::from_json(text).expect("SPR single-radio config parses");
+
+    assert_eq!(
+        cfg.effective_ctrl_path().as_deref(),
+        Some("/state/wifi/control_wlan3/wlan3")
+    );
+}
+
+#[test]
+fn explicit_control_socket_wins_over_spr_default() {
+    let text = r#"{
+      "ssid": "rustaptest",
+      "mode": "netlink",
+      "key_mgmt": "sae",
+      "passphrase": "password1234",
+      "iface": "wlan3",
+      "band": 5,
+      "channel": 36,
+      "width": 80,
+      "phy": "be",
+      "ctrl_path": "/run/custom/control",
+      "spr_api_socket": "/state/wifi/apisock"
+    }"#;
+    let cfg = Config::from_json(text).expect("config with explicit control path parses");
+
+    assert_eq!(
+        cfg.effective_ctrl_path().as_deref(),
+        Some("/run/custom/control")
+    );
+}

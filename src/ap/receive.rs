@@ -146,6 +146,21 @@ impl Ap {
             return;
         }
 
+        // An Authentication frame is never integrity-protected — it predates the
+        // keys — so anyone can forge one carrying an associated station's
+        // address. If that station already holds a PMF association, this frame
+        // must not be allowed to disturb it: the open-system path below zeroizes
+        // its PTK and clears `associated`, and the SAE path replaces its PMK and
+        // clears `sae_confirmed` (after which `handle_assoc_req` refuses every
+        // future association). Either one is the deauthentication primitive PMF
+        // is meant to eliminate, and the SA Query the (Re)Association path
+        // already performs is worthless if the same teardown is reachable one
+        // frame type over. Keep the session and challenge the peer instead.
+        if self.pmf_session_protected(&sta) {
+            self.sa_query_challenge(&sta, out);
+            return;
+        }
+
         // WPA3-SAE authentication (algorithm 3)
         if auth.algo == dot11::AUTH_ALG_SAE {
             if self.sae_enabled {
@@ -198,7 +213,7 @@ impl Ap {
             // cleared and the pending pair is consumed before m3 can install a
             // PTK, so any later authentication gets a full reset.
             let mid_handshake = entry.anonce.is_some() && entry.eapol_ready && !entry.awaiting_m4;
-            if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+            if crate::util::netlink_debug_enabled() {
                 eprintln!(
                     "AP: AUTH-REQ sta={} retransmit={retransmit} mid_handshake={mid_handshake} anonce_set={} associated={} eapol_ready={}",
                     crate::util::bytes_to_mac(&sta),
@@ -219,12 +234,33 @@ impl Ap {
                 entry.eapol_replay = 0;
                 entry.m1_replay = 0;
                 entry.ptk_candidates.clear();
+                entry.last_rx_pn = [0; 17];
+                entry.last_rx_mgmt_pn = 0;
+                entry.sa_query = None;
+                // The key hierarchy this station negotiated is part of the
+                // session being retired, not a property of the MAC address.
+                // Leaving `sha256`/`owe` set made a station that once ran SAE
+                // keep SHA-256 + AES-CMAC key descriptors forever: on a
+                // transition-mode BSS its next plain WPA2-PSK reconnect derived
+                // the PTK with the wrong hash and every message 2 MIC failed.
+                // PMKSA fast-reconnect re-establishes both flags from the cache
+                // at association, which happens after this reset.
+                entry.sha256 = false;
+                entry.owe = false;
+                entry.psk_sha256 = false;
+                entry.pmf = false;
+                entry.sae_h2e = false;
                 entry.kck.zeroize();
                 entry.kek.zeroize();
                 entry.tk.zeroize();
                 entry.pairwise_tk.zeroize();
                 entry.gtk.zeroize();
                 entry.gtk = random_bytes::<16>();
+                // A strict GTK rekey may have been queued immediately before
+                // this fresh Authentication arrived. Its Message 1 belongs to
+                // the retired PTK/session; leaving this flag set makes the new
+                // four-way Message 2 enter the group-key parser and get dropped.
+                entry.group_rekeying = false;
                 entry.pending_eapol = None; // no stale m1/m3 to retransmit
                                             // Drop any psk_file PMK pinned by a previous 4-way so the
                                             // candidate trial (per-MAC -> wildcard -> default) re-runs — a

@@ -54,6 +54,10 @@ impl DataCipher {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SecurityMode {
     Wpa2,
+    /// WPA2-Personal offering both the SHA-1 PSK AKM (00-0F-AC:2) and the
+    /// SHA-256 PSK AKM (00-0F-AC:6). A station picks one in its association
+    /// request; the AP keys that station's 4-way accordingly.
+    Wpa2PskSha256,
     Wpa3Sae,
     /// WPA2/WPA3 transition (mixed PSK + SAE).
     Transition,

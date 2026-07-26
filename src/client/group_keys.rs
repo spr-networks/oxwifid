@@ -39,29 +39,46 @@ impl Client {
             return false;
         }
 
-        self.gtk.zeroize();
-        self.gtk.copy_from_slice(&gtk);
-        self.gtk_key_id = gtk_key_id;
-        self.last_rx_gpn = [gtk_rsc; 17];
+        // Key-reinstallation guard, on the key MATERIAL rather than the replay
+        // counter. The counter checks in the callers already reject a replayed
+        // message; what they cannot see is the *same* key arriving again under a
+        // fresh, properly authenticated counter. Installing it would re-seed the
+        // receive replay windows below from that message's RSC/IPN — rolling the
+        // window backwards under a key that is still in use, so group frames an
+        // attacker captured earlier become acceptable again. Leave an unchanged
+        // key, and its window, alone.
+        if self.gtk_set && self.gtk == gtk[..] {
+            // Group traffic keeps flowing under the key already installed.
+        } else {
+            self.gtk.zeroize();
+            self.gtk.copy_from_slice(&gtk);
+            self.gtk_set = true;
+            self.gtk_key_id = gtk_key_id;
+            self.last_rx_gpn = [gtk_rsc; 17];
+        }
 
         if let Some((id, ipn, igtk)) = igtk {
-            if let Some(old) = self.igtk.as_mut() {
-                old.zeroize();
+            if self.igtk != Some(igtk) {
+                if let Some(old) = self.igtk.as_mut() {
+                    old.zeroize();
+                }
+                self.igtk = Some(igtk);
+                self.igtk_key_id = Some(id);
+                self.last_rx_igtk_ipn = packet_number(ipn);
             }
-            self.igtk = Some(igtk);
-            self.igtk_key_id = Some(id);
-            self.last_rx_igtk_ipn = packet_number(ipn);
         }
-        if let Some((_id, _ipn, bigtk)) = dot11::parse_bigtk_kde(unwrapped) {
-            if let Some(old) = self.bigtk.as_mut() {
-                old.zeroize();
+        let bigtk = dot11::parse_bigtk_kde(unwrapped)
+            .map(|(_id, _ipn, bigtk)| bigtk)
+            .or_else(|| {
+                dot11::parse_mlo_bigtk_kde(unwrapped).map(|(_link, _id, _ipn, bigtk)| bigtk)
+            });
+        if let Some(bigtk) = bigtk {
+            if self.bigtk != Some(bigtk) {
+                if let Some(old) = self.bigtk.as_mut() {
+                    old.zeroize();
+                }
+                self.bigtk = Some(bigtk);
             }
-            self.bigtk = Some(bigtk);
-        } else if let Some((_link_id, _id, _ipn, bigtk)) = dot11::parse_mlo_bigtk_kde(unwrapped) {
-            if let Some(old) = self.bigtk.as_mut() {
-                old.zeroize();
-            }
-            self.bigtk = Some(bigtk);
         }
         true
     }
@@ -124,22 +141,6 @@ impl Client {
             sc,
             key_mic,
         );
-        if protected_transport {
-            let Some(eapol) = dot11::Dot11::parse(&message_2)
-                .and_then(|frame| frame.eapol_frame().map(ToOwned::to_owned))
-            else {
-                return;
-            };
-            let mut ethernet = Vec::with_capacity(14 + eapol.len());
-            ethernet.extend_from_slice(&bssid);
-            ethernet.extend_from_slice(&self.mac);
-            ethernet.extend_from_slice(&dot11::ETHERTYPE_EAPOL.to_be_bytes());
-            ethernet.extend_from_slice(&eapol);
-            if let Some(protected) = self.encrypt_uplink(&ethernet) {
-                out.frames.push(protected);
-            }
-        } else {
-            out.tx(message_2);
-        }
+        self.tx_eapol(message_2, protected_transport, out);
     }
 }

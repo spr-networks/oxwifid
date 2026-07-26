@@ -77,12 +77,25 @@ pub fn build_assoc_req_for_cipher(
 
 /// Association request selecting WPA-PSK-SHA256 rather than legacy PSK.
 pub fn build_assoc_req_psk_sha256(bssid: &[u8; 6], sta: &[u8; 6], ssid: &[u8], sc: u16) -> Vec<u8> {
+    build_assoc_req_psk_sha256_for_cipher(bssid, sta, ssid, sc, DataCipher::Ccmp128)
+}
+
+/// WPA-PSK-SHA256 association request selecting an explicit pairwise cipher.
+pub fn build_assoc_req_psk_sha256_for_cipher(
+    bssid: &[u8; 6],
+    sta: &[u8; 6],
+    ssid: &[u8],
+    sc: u16,
+    cipher: DataCipher,
+) -> Vec<u8> {
     let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, FC_TODS, bssid, sta, bssid, sc);
     v.extend_from_slice(&CAP_3101);
     v.extend_from_slice(&STA_LISTEN_INTERVAL.to_le_bytes());
     v.extend_from_slice(&ie(0, ssid));
     v.extend_from_slice(&ie(1, &[0x0c]));
-    v.extend_from_slice(&RSN_PSK_SHA256);
+    let mut rsn = RSN_PSK_SHA256;
+    rsn[13] = cipher.suite_type();
+    v.extend_from_slice(&rsn);
     v
 }
 

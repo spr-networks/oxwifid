@@ -129,6 +129,7 @@ impl Ap {
         self.igtk_key_id = if self.igtk_key_id == 4 { 5 } else { 4 };
         self.igtk_ipn = [0; 6]; // fresh IGTK (new key id) gets a fresh IPN
         self.last_group_rekey = Instant::now();
+        self.group_key_epoch = self.group_key_epoch.wrapping_add(1);
 
         let stations: Vec<[u8; 6]> = self
             .stations
@@ -148,12 +149,12 @@ impl Ap {
         for sta in stations {
             let mld_link_ids = self.station_mld_link_ids(&sta);
             let replay = self.next_eapol_replay();
-            let (kck, kek, sha256, owe, replay) = {
+            let (kck, kek, pmf, station_mic, replay) = {
                 let s = self.stations.get_mut(&sta).unwrap();
                 s.eapol_replay = replay;
-                (s.kck, s.kek, s.sha256, s.owe, s.eapol_replay)
+                (s.kck, s.kek, s.pmf, s.key_mic(), s.eapol_replay)
             };
-            let igtk_kde = if sha256 {
+            let igtk_kde = if pmf {
                 Some((igtk_key_id, igtk_ipn, igtk))
             } else {
                 None
@@ -171,7 +172,7 @@ impl Ap {
                     igtk_kde,
                     replay,
                     sc,
-                    dot11::KeyMic::select(sha256, owe),
+                    station_mic,
                 )
             } else {
                 dot11::build_group_key_msg1_mld_with_rsc(
@@ -187,7 +188,7 @@ impl Ap {
                     None,
                     replay,
                     sc,
-                    dot11::KeyMic::select(sha256, owe),
+                    station_mic,
                 )
             };
             let mut f = dot11::RADIOTAP_TX.to_vec();
@@ -196,8 +197,10 @@ impl Ap {
                 s.pending_eapol = Some(f.clone());
                 s.eapol_tx = Instant::now();
                 s.eapol_retries = 0;
+                s.eapol_acked = false;
                 s.group_rekeying = true;
             }
+            self.arm_eapol_timer(&sta);
             frames.push(f);
         }
         frames
@@ -225,8 +228,18 @@ impl Ap {
         self.igtk = random_bytes::<16>();
         self.igtk_key_id = if self.igtk_key_id == 4 { 5 } else { 4 };
         self.igtk_ipn = [0; 6]; // fresh IGTK (new key id) gets a fresh IPN
+                                // `group_pn` is the packet-number space of `self.gtk`, which the
+                                // userspace group transmit path still uses for this BSS. Resetting the
+                                // counter without rotating that key would replay group CCMP nonces
+                                // under an unchanged GTK on every rekey interval, so the two must move
+                                // together — exactly as they do in the BSS-wide `rekey_gtk` above.
+        let mut gtk_full = random_bytes::<32>();
+        self.gtk.zeroize();
+        self.gtk.copy_from_slice(&gtk_full[..16]);
+        gtk_full.zeroize();
         self.group_pn = 1;
         self.last_group_rekey = Instant::now();
+        self.group_key_epoch = self.group_key_epoch.wrapping_add(1);
         let gtk_key_id: u8 = 1;
         let group_rsc = self.current_group_rsc();
         let igtk = self.igtk;
@@ -244,7 +257,7 @@ impl Ap {
         for sta in stations {
             let mld_link_ids = self.station_mld_link_ids(&sta);
             let replay = self.next_eapol_replay();
-            let (kck, kek, sha256, owe, replay, gtk) = {
+            let (kck, kek, pmf, station_mic, replay, gtk) = {
                 let s = self.stations.get_mut(&sta).unwrap();
                 // Rotate this station's own GTK *value*; it goes in at the shared
                 // (already-toggled) BSS-wide index.
@@ -253,9 +266,9 @@ impl Ap {
                 s.gtk.copy_from_slice(&gtk_full[..16]);
                 gtk_full.zeroize();
                 s.eapol_replay = replay;
-                (s.kck, s.kek, s.sha256, s.owe, s.eapol_replay, s.gtk)
+                (s.kck, s.kek, s.pmf, s.key_mic(), s.eapol_replay, s.gtk)
             };
-            let igtk_kde = if sha256 {
+            let igtk_kde = if pmf {
                 Some((igtk_key_id, igtk_ipn, igtk))
             } else {
                 None
@@ -273,7 +286,7 @@ impl Ap {
                     igtk_kde,
                     replay,
                     sc,
-                    dot11::KeyMic::select(sha256, owe),
+                    station_mic,
                 )
             } else {
                 dot11::build_group_key_msg1_mld_with_rsc(
@@ -289,7 +302,7 @@ impl Ap {
                     None,
                     replay,
                     sc,
-                    dot11::KeyMic::select(sha256, owe),
+                    station_mic,
                 )
             };
             let mut f = dot11::RADIOTAP_TX.to_vec();
@@ -298,8 +311,58 @@ impl Ap {
                 s.pending_eapol = Some(f.clone());
                 s.eapol_tx = Instant::now();
                 s.eapol_retries = 0;
+                s.eapol_acked = false;
                 s.group_rekeying = true;
             }
+            self.arm_eapol_timer(&sta);
+            frames.push(f);
+        }
+        frames
+    }
+
+    /// Test hook: run a Group Key Handshake that re-delivers the CURRENT group
+    /// keys instead of rotating them, under a fresh replay counter and a valid
+    /// MIC. Real authenticators do this (e.g. re-pushing keys after a driver
+    /// reset), and a peer cannot tell it apart from a rotation by the counter
+    /// alone — which is precisely why the supplicant compares key material
+    /// before re-seeding its receive replay windows.
+    #[doc(hidden)]
+    pub fn test_rekey_gtk_without_rotation(&mut self) -> Vec<Vec<u8>> {
+        let stations: Vec<[u8; 6]> = self
+            .stations
+            .iter()
+            .filter(|(_, s)| s.associated)
+            .map(|(m, _)| *m)
+            .collect();
+        let gtk = self.gtk;
+        let gtk_key_id = self.gtk_key_id;
+        let igtk = self.igtk;
+        let igtk_key_id = self.igtk_key_id;
+        let igtk_ipn = self.igtk_ipn;
+        let mut frames = Vec::new();
+        for sta in stations {
+            let replay = self.next_eapol_replay();
+            let (kck, kek, pmf, station_mic) = {
+                let s = self.stations.get_mut(&sta).unwrap();
+                s.eapol_replay = replay;
+                (s.kck, s.kek, s.pmf, s.key_mic())
+            };
+            let sc = self.next_sc();
+            let frame = dot11::build_group_key_msg1_with_rsc(
+                &self.mac,
+                &sta,
+                &kck,
+                &kek,
+                gtk_key_id,
+                &gtk,
+                0, // a stale Key RSC, as a re-push after a reset would carry
+                pmf.then_some((igtk_key_id, igtk_ipn, igtk)),
+                replay,
+                sc,
+                station_mic,
+            );
+            let mut f = dot11::RADIOTAP_TX.to_vec();
+            f.extend_from_slice(&frame);
             frames.push(f);
         }
         frames

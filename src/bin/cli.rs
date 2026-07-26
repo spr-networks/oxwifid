@@ -44,6 +44,14 @@ fn interface_mac(iface: &str) -> Result<[u8; 6], String> {
     Ok(mac)
 }
 
+fn configured_security(key_mgmt: Option<KeyMgmt>) -> (bool, bool, bool) {
+    (
+        matches!(key_mgmt, Some(KeyMgmt::Sae | KeyMgmt::SaeTransition)),
+        key_mgmt == Some(KeyMgmt::PskSha256),
+        key_mgmt == Some(KeyMgmt::Owe),
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut ssid = "turtlenet".to_string();
@@ -95,12 +103,8 @@ fn main() {
     }
     let mut mac: Option<[u8; 6]> = None;
     let mut ping = false;
-    let mut sae = matches!(
-        configured_key_mgmt,
-        Some(KeyMgmt::Sae | KeyMgmt::SaeTransition)
-    );
+    let (mut sae, mut psk_sha256, mut owe) = configured_security(configured_key_mgmt);
     let mut hnp = false;
-    let mut owe = configured_key_mgmt == Some(KeyMgmt::Owe);
     let mut ocv = false;
     let mut wmm = true;
     let mut wmm_tid: Option<u8> = None; // test override for the WMM user priority
@@ -112,7 +116,6 @@ fn main() {
     let mut iface = configured_iface.unwrap_or_else(|| "wlan0".to_string());
     let mut channel: u8 = configured_channel.unwrap_or(1);
     let mut target_bssid = configured_bssid;
-    let mut psk_sha256 = false;
     let mut pairwise_cipher = configured_pairwise_cipher;
     let mut mld_mac: Option<[u8; 6]> = None;
     let mut link1_mac: Option<[u8; 6]> = None;
@@ -158,12 +161,22 @@ fn main() {
             "--src-ip" => src_ip = parse_ip(&next(i)),
             "--gw-ip" => gw_ip = parse_ip(&next(i)),
             "--ping" => ping = true,
-            "--sae" => sae = true,
+            "--sae" => {
+                sae = true;
+                psk_sha256 = false;
+                owe = false;
+            }
             "--sae-hnp" => {
                 sae = true;
+                psk_sha256 = false;
+                owe = false;
                 hnp = true;
             }
-            "--owe" => owe = true,
+            "--owe" => {
+                sae = false;
+                psk_sha256 = false;
+                owe = true;
+            }
             "--ocv" => ocv = true,
             "--no-wmm" => wmm = false,
             "--tid" | "--up" => wmm_tid = next(i).parse().ok().map(|t: u8| t & 0x07),
@@ -315,6 +328,12 @@ fn main() {
         eprintln!("barely-cli: PSK/SAE requires a credential in --config");
         std::process::exit(1);
     }
+    if psk_sha256 && mld_mac.is_some() {
+        eprintln!(
+            "barely-cli: PSK-SHA256 MLO is not enabled until its mandatory PMF/IGTK path is implemented"
+        );
+        std::process::exit(2);
+    }
     if pairwise_cipher != barely_ap::structures::DataCipher::Ccmp128
         && (sae || owe || mld_mac.is_some())
     {
@@ -332,6 +351,8 @@ fn main() {
             "OWE"
         } else if sae {
             "WPA3-SAE"
+        } else if psk_sha256 {
+            "WPA2-PSK-SHA256"
         } else {
             "WPA2-PSK"
         },
@@ -629,4 +650,21 @@ fn run_iface_tap(
 ) {
     eprintln!("TAP client mode is only supported on Linux");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_psk_sha256_selects_akm6_on_the_station() {
+        assert_eq!(
+            configured_security(Some(KeyMgmt::PskSha256)),
+            (false, true, false)
+        );
+        assert_eq!(
+            configured_security(Some(KeyMgmt::SaeTransition)),
+            (true, false, false)
+        );
+    }
 }

@@ -93,8 +93,8 @@ impl NetlinkSocket {
         }
     }
 
-    /// Receive one datagram, waiting up to `timeout`. Returns the raw buffer.
-    fn recv(&self, timeout: Duration) -> Option<Vec<u8>> {
+    /// Receive one datagram into reusable caller-owned storage.
+    fn recv_into(&self, timeout: Duration, buf: &mut [u8]) -> Option<usize> {
         unsafe {
             let mut pfd = libc::pollfd {
                 fd: self.fd,
@@ -114,14 +114,20 @@ impl NetlinkSocket {
             // GET_WIPHY replies can be substantially larger than ordinary MLME
             // events. A short receive buffer silently truncates the datagram and
             // loses the nested HE/EHT capabilities near its tail.
-            let mut buf = vec![0u8; 65536];
             let n = libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
             if n <= 0 {
                 return None;
             }
-            buf.truncate(n as usize);
-            Some(buf)
+            Some(n as usize)
         }
+    }
+
+    /// Receive one datagram into owned storage for infrequent command paths.
+    fn recv(&self, timeout: Duration) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 65536];
+        let len = self.recv_into(timeout, &mut buf)?;
+        buf.truncate(len);
+        Some(buf)
     }
 
     fn join_multicast(&self, group: u32) -> io::Result<()> {
@@ -716,16 +722,22 @@ fn nl_set_bss(
     sock.request_ack(m)
 }
 
-/// Send an EAPOL payload to `dst` over the nl80211 control port (unencrypted,
+/// Queue an EAPOL payload to `dst` over the nl80211 control port (unencrypted,
 /// pre-key). The kernel wraps it into an 802.11 data frame to the station.
-fn nl_send_eapol(
+///
+/// Request an ACK, but do not wait for it here. This socket is owned by the
+/// EAPOL worker, which drains ACK/error responses independently. Waiting in
+/// `request_ack()` serializes every station behind one delayed kernel response;
+/// its normal command timeout can hold the entire radio's EAPOL queue for up to
+/// eight seconds.
+fn nl_queue_eapol(
     sock: &mut NetlinkSocket,
     family: u16,
     ifindex: u32,
     dst: &[u8; 6],
     eapol: &[u8],
     link_id: Option<u8>,
-) {
+) -> io::Result<u32> {
     let seq = sock.next_seq();
     let mut m = GenlMessage::new(family, NL80211_CMD_CONTROL_PORT_FRAME, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
@@ -736,20 +748,9 @@ fn nl_send_eapol(
     if let Some(link_id) = link_id {
         m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
     }
-    // Synchronous send (NLM_F_ACK), like reference AP's send_and_recv: a fire-and-
-    // forget send() never surfaces a kernel rejection — the error lands on the
-    // socket unread and the EAPOL silently vanishes. NOTE: must be called on the
-    // command socket, not the event socket (request_ack drains unrelated
-    // messages while waiting for its ack, which would drop frame events).
-    let r = sock.request_ack(m);
-    if let Err(ref e) = r {
-        eprintln!(
-            "netlink AP: TX EAPOL to {} len={} FAILED: {e}",
-            crate::util::bytes_to_mac(dst),
-            eapol.len(),
-        );
-    }
-    if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+    m.flags |= msg::NLM_F_ACK;
+    sock.send(&m.to_bytes(sock.pid))?;
+    if crate::util::netlink_debug_enabled() {
         let ki = if eapol.len() >= 7 {
             u16::from_be_bytes([eapol[5], eapol[6]])
         } else {
@@ -758,12 +759,12 @@ fn nl_send_eapol(
         // (The TX-STATUS event is multicast to the mlme group — the main recv
         // loop logs it as "EAPOL TX-STATUS acked=..".)
         eprintln!(
-            "netlink AP: TX EAPOL to {} len={} key_info=0x{ki:04x} send={:?}",
+            "netlink AP: TX EAPOL ifindex={ifindex} to {} len={} key_info=0x{ki:04x} queued seq={seq}",
             crate::util::bytes_to_mac(dst),
             eapol.len(),
-            r.as_ref().map(|_| "ok").map_err(|e| e.kind()),
         );
     }
+    Ok(seq)
 }
 
 /// 500-kbps-unit OFDM rates (6..54 Mbps), no basic-rate bit — the format
@@ -788,7 +789,7 @@ fn nl_new_station(
     sta: &[u8; 6],
     mld_mac: Option<&[u8; 6]>,
     link_id: Option<u8>,
-) {
+) -> bool {
     // Add the station UNASSOCIATED (flags cleared). SET_STATION then marks it
     // associated AND carries the HT/VHT caps — rate control only picks caps up
     // from SET_STATION, and applying them to an already-associated station fails
@@ -814,14 +815,20 @@ fn nl_new_station(
         m = m.attr(Attr::bytes(NL80211_ATTR_MLD_ADDR, mld_mac));
     }
     match sock.request_ack(m) {
-        Ok(()) => eprintln!(
-            "netlink AP: NEW_STATION {} ok (unassoc)",
-            crate::util::bytes_to_mac(sta)
-        ),
-        Err(e) => eprintln!(
-            "netlink AP: NEW_STATION {} failed: {e}",
-            crate::util::bytes_to_mac(sta)
-        ),
+        Ok(()) => {
+            eprintln!(
+                "netlink AP: NEW_STATION {} ok (unassoc)",
+                crate::util::bytes_to_mac(sta)
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "netlink AP: NEW_STATION {} failed: {e}",
+                crate::util::bytes_to_mac(sta)
+            );
+            false
+        }
     }
 }
 
@@ -916,7 +923,7 @@ fn nl_set_station_assoc(
     eml_capability: Option<u16>,
     force_wme: bool,
     mfp: bool,
-) {
+) -> bool {
     let seq = sock.next_seq();
     // Real supported rates from the assoc request (Supported Rates id 1 + Extended
     // Rates id 50), basic-rate bits preserved, like reference AP; fall back to OFDM.
@@ -995,11 +1002,15 @@ fn nl_set_station_assoc(
             ],
         ));
     }
-    if let Err(e) = sock.request_ack(m) {
-        eprintln!(
-            "netlink AP: SET_STATION(assoc) {} failed: {e}",
-            crate::util::bytes_to_mac(sta)
-        );
+    match sock.request_ack(m) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "netlink AP: SET_STATION(assoc) {} failed: {e}",
+                crate::util::bytes_to_mac(sta)
+            );
+            false
+        }
     }
 }
 
@@ -1018,7 +1029,7 @@ fn nl_add_link_station(
     link_ies: Option<&[u8]>,
     eml_capability: Option<u16>,
     mfp: bool,
-) {
+) -> bool {
     let mut rates: Vec<u8> = Vec::new();
     if let Some(ies) = assoc_ies {
         if let Some(sr) = station_ie(ies, link_ies, 1) {
@@ -1068,17 +1079,23 @@ fn nl_add_link_station(
         m = m.attr(Attr::u16v(NL80211_ATTR_EML_CAPABILITY, eml));
     }
     match sock.request_ack(m) {
-        Ok(()) => eprintln!(
-            "netlink AP: ADD_LINK_STA link_id={} mld={} link_sta={} ok",
-            link_id,
-            crate::util::bytes_to_mac(mld_mac),
-            crate::util::bytes_to_mac(link_sta)
-        ),
-        Err(e) => eprintln!(
-            "netlink AP: ADD_LINK_STA link_id={} link_sta={} failed: {e}",
-            link_id,
-            crate::util::bytes_to_mac(link_sta)
-        ),
+        Ok(()) => {
+            eprintln!(
+                "netlink AP: ADD_LINK_STA link_id={} mld={} link_sta={} ok",
+                link_id,
+                crate::util::bytes_to_mac(mld_mac),
+                crate::util::bytes_to_mac(link_sta)
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "netlink AP: ADD_LINK_STA link_id={} link_sta={} failed: {e}",
+                link_id,
+                crate::util::bytes_to_mac(link_sta)
+            );
+            false
+        }
     }
 }
 
@@ -1091,7 +1108,7 @@ fn nl_set_default_group_key(
     ifindex: u32,
     idx: u8,
     link_id: Option<u8>,
-) {
+) -> bool {
     let seq = sock.next_seq();
     let mut m = GenlMessage::new(family, NL80211_CMD_SET_KEY, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
@@ -1101,7 +1118,9 @@ fn nl_set_default_group_key(
     }
     if let Err(e) = sock.request_ack(m) {
         eprintln!("netlink AP: SET_KEY multicast default (idx {idx}) failed: {e}");
+        return false;
     }
+    true
 }
 
 /// Install a pairwise CCMP/GCMP key or the BSS-wide CCMP-128 GTK.
@@ -1116,7 +1135,7 @@ fn nl_new_key(
     cipher: u32,
     pairwise: bool,
     link_id: Option<u8>,
-) {
+) -> bool {
     let seq = sock.next_seq();
     let mut m = GenlMessage::new(family, NL80211_CMD_NEW_KEY, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
@@ -1138,12 +1157,11 @@ fn nl_new_key(
         m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
     }
     match sock.request_ack(m) {
-        Ok(()) if !pairwise => {
-            nl_set_default_group_key(sock, family, ifindex, idx, link_id);
-        }
-        Ok(()) => {}
+        Ok(()) if !pairwise => nl_set_default_group_key(sock, family, ifindex, idx, link_id),
+        Ok(()) => true,
         Err(e) => {
             eprintln!("netlink AP: NEW_KEY (idx {idx}, pairwise {pairwise}) failed: {e}");
+            false
         }
     }
 }
@@ -1160,7 +1178,7 @@ fn nl_install_igtk(
     igtk: &[u8; 16],
     ipn: &[u8; 6],
     link_id: Option<u8>,
-) {
+) -> bool {
     let seq = sock.next_seq();
     let mut m = GenlMessage::new(family, NL80211_CMD_NEW_KEY, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
@@ -1176,8 +1194,12 @@ fn nl_install_igtk(
     if let Some(link_id) = link_id {
         m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
     }
-    if let Err(e) = sock.request_ack(m) {
-        eprintln!("netlink AP: NEW_KEY IGTK (idx {idx}) failed: {e}");
+    match sock.request_ack(m) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("netlink AP: NEW_KEY IGTK (idx {idx}) failed: {e}");
+            false
+        }
     }
 }
 
@@ -1224,18 +1246,40 @@ fn nl_install_bigtk(
     }
 }
 
-/// Remove a group/management key index from the kernel (the old GTK/IGTK after a
-/// two-phase rekey, once stations have the new one). Best-effort.
-fn nl_del_key(sock: &mut NetlinkSocket, family: u16, ifindex: u32, idx: u8, link_id: Option<u8>) {
-    let seq = sock.next_seq();
-    let mut m = GenlMessage::new(family, NL80211_CMD_DEL_KEY, 0, seq)
+fn kernel_object_is_absent(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::ENODEV) | Some(libc::ENOLINK)
+    ) || error.to_string().contains("No such")
+}
+
+/// Explicitly remove a station's index-0 PTK from the base BSS. As in the
+/// reference nl80211 backend, the unicast station address makes the key
+/// pairwise; the nested key namespace supplies only `NL80211_KEY_IDX`.
+/// This runs before DEL_STATION so a station-delete timeout cannot leave the
+/// driver/firmware key state behind.
+fn del_pairwise_key_message(family: u16, seq: u32, ifindex: u32, sta: &[u8; 6]) -> GenlMessage {
+    GenlMessage::new(family, NL80211_CMD_DEL_KEY, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
-        .attr(Attr::bytes(NL80211_ATTR_KEY_IDX, &[idx]))
-        .attr(Attr::u32(NL80211_ATTR_KEY_TYPE, NL80211_KEYTYPE_GROUP));
-    if let Some(link_id) = link_id {
-        m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
+        .attr(Attr::bytes(NL80211_ATTR_MAC, sta))
+        .attr(Attr::nested(
+            NL80211_ATTR_KEY,
+            &[Attr::u8(NL80211_KEY_IDX, 0)],
+        ))
+}
+
+fn nl_del_pairwise_key(
+    sock: &mut NetlinkSocket,
+    family: u16,
+    ifindex: u32,
+    sta: &[u8; 6],
+) -> io::Result<()> {
+    let seq = sock.next_seq();
+    let m = del_pairwise_key_message(family, seq, ifindex, sta);
+    match sock.request_ack(m) {
+        Err(error) if kernel_object_is_absent(&error) => Ok(()),
+        result => result,
     }
-    let _ = sock.request_ack(m);
 }
 
 /// Mark a station 802.1X-authorized so the kernel forwards its data frames.
@@ -1249,7 +1293,7 @@ fn authorize_station_message(family: u16, ifindex: u32, sta: &[u8; 6], seq: u32)
         .attr(Attr::bytes(NL80211_ATTR_STA_FLAGS2, &flags))
 }
 
-fn nl_authorize(sock: &mut NetlinkSocket, family: u16, ifindex: u32, sta: &[u8; 6]) {
+fn nl_authorize(sock: &mut NetlinkSocket, family: u16, ifindex: u32, sta: &[u8; 6]) -> bool {
     let seq = sock.next_seq();
     let m = authorize_station_message(family, ifindex, sta, seq);
     if let Err(e) = sock.request_ack(m) {
@@ -1257,7 +1301,9 @@ fn nl_authorize(sock: &mut NetlinkSocket, family: u16, ifindex: u32, sta: &[u8; 
             "netlink AP: SET_STATION(authorize) {} failed: {e}",
             crate::util::bytes_to_mac(sta)
         );
+        return false;
     }
+    true
 }
 
 #[cfg(test)]
@@ -1390,9 +1436,16 @@ fn do_cac(
 }
 
 /// The interface's own MAC as the kernel reports it (`/sys/class/net/<if>/address`).
-fn read_iface_mac(iface: &str) -> Option<[u8; 6]> {
-    let s = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")).ok()?;
-    crate::util::try_mac_to_bytes(s.trim())
+fn read_iface_mac(iface: &str) -> io::Result<[u8; 6]> {
+    let path = format!("/sys/class/net/{iface}/address");
+    let s = std::fs::read_to_string(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("read {path}: {e}")))?;
+    crate::util::try_mac_to_bytes(s.trim()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{path} does not contain a valid MAC address"),
+        )
+    })
 }
 
 /// Capability element payloads derived from this radio's nl80211 GET_WIPHY
@@ -1613,9 +1666,7 @@ fn parse_wiphy_capabilities(attrs: &[(u16, &[u8])], band: u16) -> Option<WiphyCa
         .find_map(|(typ, data)| (typ == band).then_some(data))?;
     let band_attrs = msg::parse_attrs(band_data);
     let types: Vec<u16> = band_attrs.iter().map(|(typ, _)| *typ).collect();
-    if std::env::var_os("RUSTAP_NL_DEBUG").is_some()
-        && (types.len() > 1 || types.first() != Some(&1))
-    {
+    if crate::util::netlink_debug_enabled() && (types.len() > 1 || types.first() != Some(&1)) {
         eprintln!("netlink AP: GET_WIPHY band={band} attr_types={types:?}");
     }
 
@@ -1653,7 +1704,7 @@ fn parse_wiphy_capabilities(attrs: &[(u16, &[u8])], band: u16) -> Option<WiphyCa
     if let Some(iftypes) = msg::find_attr(&band_attrs, NL80211_BAND_ATTR_IFTYPE_DATA) {
         for (_, entry) in msg::parse_attrs(iftypes) {
             let entry_attrs = msg::parse_attrs(entry);
-            if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+            if crate::util::netlink_debug_enabled() {
                 let entry_types: Vec<u16> = entry_attrs.iter().map(|(typ, _)| *typ).collect();
                 let iftype_types: Vec<u16> =
                     msg::find_attr(&entry_attrs, NL80211_BAND_IFTYPE_ATTR_IFTYPES)
@@ -1862,9 +1913,9 @@ fn nl_flush_stations(sock: &mut NetlinkSocket, family: u16, ifindex: u32) -> io:
     )
 }
 
-/// Read the same live station measurements reference AP exposes from `STA` and
-/// `all_sta`. Keeping this on the existing command netlink socket avoids an
-/// `iw`/process spawn for every SPR API poll.
+/// Read the same live station measurements the reference AP exposes from `STA`
+/// and `all_sta`. This runs on the telemetry worker's dedicated netlink socket,
+/// so slow kernel replies cannot stall the radio event socket.
 fn nl_get_station_telemetry(
     sock: &mut NetlinkSocket,
     family: u16,
@@ -1918,6 +1969,351 @@ fn nl_get_station_telemetry(
         }
     }
     None
+}
+
+struct EapolTxJob {
+    ifindex: u32,
+    dst: [u8; 6],
+    eapol: Vec<u8>,
+    link_id: Option<u8>,
+}
+
+struct PendingEapolAck {
+    dst: [u8; 6],
+    len: usize,
+    sent_at: Instant,
+}
+
+struct PendingAssocTx {
+    sc: u16,
+    sent_at: Instant,
+}
+
+/// Drivers normally report Association Response TX status immediately. Keep
+/// reference ordering when they do, but do not let a missing multicast status
+/// event hold message 1 until the authenticator's retry budget expires.
+const ASSOC_TX_STATUS_GRACE: Duration = Duration::from_millis(250);
+
+fn drain_eapol_acks(
+    sock: &NetlinkSocket,
+    pending: &mut std::collections::HashMap<u32, PendingEapolAck>,
+    recv_buf: &mut [u8],
+) {
+    while let Some(len) = sock.recv_into(Duration::ZERO, recv_buf) {
+        for parsed in msg::messages(&recv_buf[..len]) {
+            let Some(code) = parsed.error_code() else {
+                continue;
+            };
+            let Some(sent) = pending.remove(&parsed.seq) else {
+                continue;
+            };
+            if code != 0 {
+                eprintln!(
+                    "netlink AP: TX EAPOL to {} len={} FAILED: {}",
+                    crate::util::bytes_to_mac(&sent.dst),
+                    sent.len,
+                    io::Error::from_raw_os_error(-code),
+                );
+            }
+        }
+    }
+
+    // An ACK is diagnostic, not the on-air delivery signal (the MLME
+    // TX-STATUS event is). Do not retain metadata forever if a driver/kernel
+    // loses one; the AP's normal EAPOL timer handles actual retransmission.
+    let now = Instant::now();
+    pending.retain(|_, sent| now.duration_since(sent.sent_at) < Duration::from_secs(2));
+}
+
+/// The radio loop only performs a bounded, nonblocking enqueue. This worker
+/// submits control-port frames without waiting for each ACK, then drains the
+/// dedicated socket's ACK/error stream asynchronously. Per-station frame order
+/// is retained while a delayed ACK can no longer head-of-line-block unrelated
+/// clients.
+struct EapolTxWorker {
+    requests: std::sync::mpsc::SyncSender<EapolTxJob>,
+}
+
+impl EapolTxWorker {
+    fn start(family: u16) -> io::Result<EapolTxWorker> {
+        let mut sock = NetlinkSocket::open()?;
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<EapolTxJob>(128);
+        std::thread::Builder::new()
+            .name("rustap-eapol-tx".to_string())
+            .spawn(move || {
+                let mut pending = std::collections::HashMap::new();
+                let mut recv_buf = vec![0u8; 65536];
+                loop {
+                    let disconnected = match request_rx.recv_timeout(Duration::from_millis(5)) {
+                        Ok(job) => {
+                            match nl_queue_eapol(
+                                &mut sock,
+                                family,
+                                job.ifindex,
+                                &job.dst,
+                                &job.eapol,
+                                job.link_id,
+                            ) {
+                                Ok(seq) => {
+                                    pending.insert(
+                                        seq,
+                                        PendingEapolAck {
+                                            dst: job.dst,
+                                            len: job.eapol.len(),
+                                            sent_at: Instant::now(),
+                                        },
+                                    );
+                                }
+                                Err(err) => eprintln!(
+                                    "netlink AP: TX EAPOL to {} len={} FAILED: {err}",
+                                    crate::util::bytes_to_mac(&job.dst),
+                                    job.eapol.len(),
+                                ),
+                            }
+                            false
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+                    };
+                    drain_eapol_acks(&sock, &mut pending, &mut recv_buf);
+                    if disconnected {
+                        break;
+                    }
+                }
+            })?;
+        Ok(EapolTxWorker {
+            requests: request_tx,
+        })
+    }
+
+    fn send(&self, ifindex: u32, dst: [u8; 6], eapol: Vec<u8>, link_id: Option<u8>) {
+        let len = eapol.len();
+        match self.requests.try_send(EapolTxJob {
+            ifindex,
+            dst,
+            eapol,
+            link_id,
+        }) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => eprintln!(
+                "netlink AP: EAPOL TX queue full; dropped frame to {} len={len}",
+                crate::util::bytes_to_mac(&dst),
+            ),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => eprintln!(
+                "netlink AP: EAPOL TX worker stopped; dropped frame to {} len={len}",
+                crate::util::bytes_to_mac(&dst),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelCleanupKind {
+    Station,
+    Interface,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KernelCleanupAction {
+    Station {
+        base_ifindex: u32,
+        station_ifindex: u32,
+        kernel_sta: [u8; 6],
+        delete_on_base_too: bool,
+    },
+    Interface {
+        ifindex: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KernelCleanupJob {
+    id: u64,
+    core_sta: [u8; 6],
+    action: KernelCleanupAction,
+}
+
+#[derive(Debug)]
+struct KernelCleanupResult {
+    id: u64,
+    core_sta: [u8; 6],
+    kind: KernelCleanupKind,
+    success: bool,
+    warnings: Vec<String>,
+}
+
+/// Key/station/interface deletion can block waiting for a sick driver's ACK.
+/// Keep those waits off the radio loop, but return a generation-tagged result:
+/// the main thread retains ownership of every station and VIF identifier until
+/// the final matching completion, so a stale worker result can never release a
+/// resource that a newer client owns.
+struct KernelCleanupWorker {
+    requests: std::sync::mpsc::SyncSender<KernelCleanupJob>,
+    results: std::sync::mpsc::Receiver<KernelCleanupResult>,
+}
+
+impl KernelCleanupWorker {
+    fn start(family: u16) -> io::Result<KernelCleanupWorker> {
+        let mut sock = NetlinkSocket::open()?;
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<KernelCleanupJob>(128);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<KernelCleanupResult>(128);
+        std::thread::Builder::new()
+            .name("rustap-kernel-cleanup".to_string())
+            .spawn(move || {
+                while let Ok(job) = request_rx.recv() {
+                    let mut warnings = Vec::new();
+                    let (kind, success) = match job.action {
+                        KernelCleanupAction::Station {
+                            base_ifindex,
+                            station_ifindex,
+                            kernel_sta,
+                            delete_on_base_too,
+                        } => {
+                            if let Err(error) =
+                                nl_del_pairwise_key(&mut sock, family, base_ifindex, &kernel_sta)
+                            {
+                                warnings.push(format!("DEL_KEY PTK failed: {error}"));
+                            }
+                            let mut success = match nl_del_station(
+                                &mut sock,
+                                family,
+                                station_ifindex,
+                                &kernel_sta,
+                            ) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    warnings.push(format!("DEL_STATION failed: {error}"));
+                                    false
+                                }
+                            };
+                            // SET_STA_VLAN can fail after a driver partially
+                            // moves a peer, and drivers disagree about which
+                            // family interface accepts the subsequent delete.
+                            // Deleting on both scopes is idempotent and ensures
+                            // no base-BSS peer survives a successful VIF cleanup.
+                            if delete_on_base_too && station_ifindex != base_ifindex {
+                                if let Err(error) =
+                                    nl_del_station(&mut sock, family, base_ifindex, &kernel_sta)
+                                {
+                                    warnings.push(format!(
+                                        "DEL_STATION on base interface failed: {error}"
+                                    ));
+                                    success = false;
+                                }
+                            }
+                            (KernelCleanupKind::Station, success)
+                        }
+                        KernelCleanupAction::Interface { ifindex } => {
+                            let success = match nl_del_iface(&mut sock, family, ifindex) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    warnings.push(format!("DEL_INTERFACE failed: {error}"));
+                                    false
+                                }
+                            };
+                            (KernelCleanupKind::Interface, success)
+                        }
+                    };
+                    if result_tx
+                        .send(KernelCleanupResult {
+                            id: job.id,
+                            core_sta: job.core_sta,
+                            kind,
+                            success,
+                            warnings,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })?;
+        Ok(KernelCleanupWorker {
+            requests: request_tx,
+            results: result_rx,
+        })
+    }
+
+    fn schedule(&self, job: KernelCleanupJob) -> bool {
+        match self.requests.try_send(job) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => false,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                eprintln!("netlink AP: kernel cleanup worker stopped");
+                false
+            }
+        }
+    }
+}
+
+/// Live station measurements are optional control-plane data, so a slow
+/// `GET_STATION` must never hold up management or EAPOL processing. This worker
+/// owns a separate command socket and feeds a short-lived cache.
+struct StationTelemetryWorker {
+    requests: std::sync::mpsc::SyncSender<[u8; 6]>,
+    results: std::sync::mpsc::Receiver<([u8; 6], Option<crate::control::StationTelemetry>)>,
+    pending: std::collections::HashSet<[u8; 6]>,
+    cache: std::collections::HashMap<[u8; 6], (Instant, Option<crate::control::StationTelemetry>)>,
+}
+
+impl StationTelemetryWorker {
+    fn start(family: u16, ifindex: u32) -> io::Result<StationTelemetryWorker> {
+        let mut sock = NetlinkSocket::open()?;
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<[u8; 6]>(64);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("rustap-station-telemetry".to_string())
+            .spawn(move || {
+                while let Ok(mac) = request_rx.recv() {
+                    let telemetry = nl_get_station_telemetry(&mut sock, family, ifindex, &mac);
+                    if result_tx.send((mac, telemetry)).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(StationTelemetryWorker {
+            requests: request_tx,
+            results: result_rx,
+            pending: std::collections::HashSet::new(),
+            cache: std::collections::HashMap::new(),
+        })
+    }
+
+    fn refresh(&mut self) {
+        while let Ok((mac, telemetry)) = self.results.try_recv() {
+            self.pending.remove(&mac);
+            self.cache.insert(mac, (Instant::now(), telemetry));
+        }
+    }
+
+    fn get(&mut self, mac: [u8; 6]) -> Option<crate::control::StationTelemetry> {
+        const CACHE_AGE: Duration = Duration::from_secs(1);
+        self.refresh();
+        let now = Instant::now();
+        let fresh = self
+            .cache
+            .get(&mac)
+            .is_some_and(|(at, _)| now.duration_since(*at) <= CACHE_AGE);
+        if !fresh && !self.pending.contains(&mac) {
+            match self.requests.try_send(mac) {
+                Ok(()) => {
+                    self.pending.insert(mac);
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    self.pending.clear();
+                }
+            }
+        }
+        self.cache
+            .get(&mac)
+            .and_then(|(_, telemetry)| telemetry.clone())
+    }
+
+    fn forget(&mut self, mac: &[u8; 6]) {
+        self.pending.remove(mac);
+        self.cache.remove(mac);
+    }
 }
 
 /// The kernel's current global regulatory domain as an ISO alpha-2, via
@@ -2074,6 +2470,27 @@ pub fn run_offload_ap(
     // Set the regulatory domain BEFORE touching channels/START_AP, and wait for
     // the change to land so the 5/6 GHz no-IR flags clear before beaconing.
     nl_set_regulatory(&ap.country);
+    // The kernel forces an MLD's AP address to the interface netdev MAC, so adopt
+    // it (a config placeholder would mismatch what the client authenticates
+    // against) and fill in any affiliated-link BSSIDs left unspecified. Both must
+    // happen before the links are snapshotted below for the beacon and ADD_LINK.
+    if ap.mld {
+        let configured_mld_mac = ap.mld_mac;
+        let hw = read_iface_mac(iface).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot resolve required MLD address for {iface}: {e}"),
+            )
+        })?;
+        if hw != configured_mld_mac {
+            eprintln!(
+                "netlink AP: adopting interface MAC {} as MLD address (config was {})",
+                crate::util::bytes_to_mac(&hw),
+                crate::util::bytes_to_mac(&configured_mld_mac)
+            );
+        }
+        resolve_mld_addresses(&mut ap, hw)?;
+    }
     let mld_links = ap.active_mld_links();
     // Primary frequency: 6 GHz is 5950 + 5*chan, otherwise the 2.4/5 GHz table.
     let band6 = ap.band6();
@@ -2135,7 +2552,7 @@ pub fn run_offload_ap(
     // `ap.mac` is deliberately the association-link MAC (set via ADD_LINK) and
     // `ap.mld_mac` is the interface MAC, so leave the addressing untouched.
     if !ap.mld {
-        if let Some(hw) = read_iface_mac(iface) {
+        if let Ok(hw) = read_iface_mac(iface) {
             if hw != ap.mac {
                 eprintln!(
                     "netlink AP: adopting interface MAC {} as BSSID (config was {})",
@@ -2146,21 +2563,12 @@ pub fn run_offload_ap(
                 ap.mld_mac = hw;
             }
         }
-    } else if let Some(hw) = read_iface_mac(iface) {
-        if hw != ap.mld_mac {
-            eprintln!(
-                "netlink AP: adopting interface MAC {} as MLD address (config was {})",
-                crate::util::bytes_to_mac(&hw),
-                crate::util::bytes_to_mac(&ap.mld_mac)
-            );
-            ap.mld_mac = hw;
-        }
-        ap.derive_missing_mld_link_macs();
-        if let Some(assoc) = ap.mld_link_mac(ap.link_id) {
-            ap.mac = assoc;
-        }
     }
     let bssid = ap.mac;
+    // SAE PWE derivation and scalar multiplication are CPU-heavy. Keep them on
+    // a bounded worker so a burst of commits cannot delay management/EAPOL
+    // reception on this radio.
+    ap.enable_async_sae();
 
     // NL80211_CMD_SET_INTERFACE is not a best-effort hint: START_AP requires an
     // NL80211_IFTYPE_AP netdev. Linux rejects a type change while the interface
@@ -2220,6 +2628,15 @@ pub fn run_offload_ap(
             NL80211_AUTHTYPE_OPEN_SYSTEM,
             WLAN_AKM_SUITE_PSK.to_ne_bytes().to_vec(),
         ),
+        dot11::SecurityMode::Wpa2PskSha256 => {
+            // Beacon RSNE (RSN_PSK_SHA256_MIXED) advertises both PSK and
+            // PSK-SHA256, so START_AP must offer the same pair for either to be
+            // selectable. AKM 6 does not require PMF, so mfp_required omits it.
+            const WLAN_AKM_SUITE_PSK_SHA256: u32 = 0x000f_ac06;
+            let mut a = WLAN_AKM_SUITE_PSK.to_ne_bytes().to_vec();
+            a.extend_from_slice(&WLAN_AKM_SUITE_PSK_SHA256.to_ne_bytes());
+            (NL80211_AUTHTYPE_OPEN_SYSTEM, a)
+        }
         dot11::SecurityMode::Wpa3Sae => (
             NL80211_AUTHTYPE_OPEN_SYSTEM,
             WLAN_AKM_SUITE_SAE.to_ne_bytes().to_vec(),
@@ -2457,12 +2874,19 @@ pub fn run_offload_ap(
         );
     }
 
-    let mut stations: Vec<[u8; 6]> = Vec::new();
+    let mut stations: HashSet<[u8; 6]> = HashSet::new();
     let mut keyed: HashSet<[u8; 6]> = HashSet::new();
+    let mut key_install_pending: HashSet<[u8; 6]> = HashSet::new();
+    // Exact pairwise key material already installed in the kernel. This makes
+    // retries idempotent (an authorization/VLAN retry never re-installs a key
+    // and resets its PN) and lets an authenticator-initiated PTK rekey replace a
+    // genuinely changed key even though the station remains authorized.
+    let mut installed_pairwise_keys: HashMap<[u8; 6], Vec<u8>> = HashMap::new();
     // reference AP does not start WPA until the successful Association Response is
     // MAC-ACKed. Track its sequence-control value so a stale TX-status event for
     // an older response cannot release the current handshake's EAPOL frame.
-    let mut assoc_tx: std::collections::HashMap<[u8; 6], u16> = std::collections::HashMap::new();
+    let mut assoc_tx: std::collections::HashMap<[u8; 6], PendingAssocTx> =
+        std::collections::HashMap::new();
     let mut held_assoc_eapol: std::collections::HashMap<[u8; 6], Vec<u8>> =
         std::collections::HashMap::new();
     // MLD per-link routing: each affiliated link's (BSSID, freq), and the
@@ -2492,7 +2916,8 @@ pub fn run_offload_ap(
     // The BSS-wide GTK/IGTK installed in the kernel, tracked as (key index,
     // bytes). We install once a station is keyed, then re-install whenever the
     // AP rotates the key (group rekey toggles the GTK index 1<->2 and the IGTK
-    // index 4<->5), removing the stale index — a reference AP-style two-phase rekey.
+    // index 4<->5). Both bounded slots remain installed during the two-phase
+    // transition and a later rotation overwrites the older slot.
     // (Per-STA-VIF mode installs each station's own GTK on its AP_VLAN instead.)
     let mut gtk_state: std::collections::HashMap<Option<u8>, (u8, [u8; 16])> =
         std::collections::HashMap::new();
@@ -2517,7 +2942,10 @@ pub fn run_offload_ap(
         enabled: ap.per_sta_vif(),
         base_iface: iface.to_string(),
         map: std::collections::HashMap::new(),
+        ifindices: std::collections::HashSet::new(),
     };
+    let mut installed_group_key_epoch = ap.group_key_epoch();
+    let mut group_key_install_pending = false;
 
     // reference AP uses separate netlink sockets for synchronous commands vs async
     // events. We do the same: `cmd` issues request/ACK commands (NEW_STATION,
@@ -2525,6 +2953,21 @@ pub fn run_offload_ap(
     // (auth/assoc/EAPOL) that belongs to the event socket `sock`. Sharing one
     // socket dropped EAPOL frames mid-handshake and made rejoins fail.
     let mut cmd = NetlinkSocket::open()?;
+    let eapol_tx = EapolTxWorker::start(family_id)?;
+    let cleanup_worker = KernelCleanupWorker::start(family_id)?;
+    let mut next_cleanup_id = 1u64;
+    let mut retiring_stations: HashSet<[u8; 6]> = HashSet::new();
+    let mut base_station_cleanup: HashMap<[u8; 6], BaseStationCleanup> = HashMap::new();
+    // Transport-owned mapping survives removal from the protocol state machine,
+    // preserving the MLD identity cfg80211 needs for DEL_KEY/DEL_STATION.
+    let mut kernel_stations: HashMap<[u8; 6], [u8; 6]> = HashMap::new();
+    let mut station_telemetry = match StationTelemetryWorker::start(family_id, ifindex) {
+        Ok(worker) => Some(worker),
+        Err(err) => {
+            eprintln!("netlink AP: station telemetry worker unavailable: {err}");
+            None
+        }
+    };
 
     // A SIGKILL/OOM/container restart can strand this radio's per-station VIFs
     // from the previous run (the SOCKET_OWNER reap only fires on a clean socket
@@ -2558,12 +3001,191 @@ pub fn run_offload_ap(
         crate::spr::SprNotifier::new(path, spr_dhcp_helper.map(std::path::PathBuf::from))
     });
 
+    let mut event_buf = vec![0u8; 65536];
     loop {
+        // Apply cleanup completions only when their generation still matches
+        // the reservation in the main radio thread. Until the final interface
+        // completion, VlanState::map continues to reserve the name/id and keeps
+        // its ifindex admitted by the event filter.
+        while let Ok(result) = cleanup_worker.results.try_recv() {
+            for warning in &result.warnings {
+                eprintln!(
+                    "netlink AP: cleanup id={} sta={} {warning}",
+                    result.id,
+                    crate::util::bytes_to_mac(&result.core_sta),
+                );
+            }
+            match result.kind {
+                KernelCleanupKind::Station => {
+                    let vlan_match = vlan
+                        .map
+                        .get_mut(&result.core_sta)
+                        .is_some_and(|assignment| {
+                            if assignment.station_cleanup_id != Some(result.id) {
+                                return false;
+                            }
+                            assignment.station_cleanup_id = None;
+                            if result.success {
+                                assignment.station_removed = true;
+                                assignment.station_retry_at = None;
+                            } else {
+                                assignment.station_retry_at =
+                                    Some(Instant::now() + CLEANUP_RETRY_DELAY);
+                            }
+                            true
+                        });
+                    if vlan_match {
+                        if result.success {
+                            stations.remove(&result.core_sta);
+                            keyed.remove(&result.core_sta);
+                            installed_pairwise_keys.remove(&result.core_sta);
+                            kernel_stations.remove(&result.core_sta);
+                        }
+                        continue;
+                    }
+                    let base_match =
+                        base_station_cleanup
+                            .get_mut(&result.core_sta)
+                            .is_some_and(|cleanup| {
+                                if cleanup.cleanup_id != Some(result.id) {
+                                    return false;
+                                }
+                                cleanup.cleanup_id = None;
+                                if !result.success {
+                                    cleanup.retry_at = Instant::now() + CLEANUP_RETRY_DELAY;
+                                }
+                                true
+                            });
+                    if base_match && result.success {
+                        base_station_cleanup.remove(&result.core_sta);
+                        retiring_stations.remove(&result.core_sta);
+                        stations.remove(&result.core_sta);
+                        keyed.remove(&result.core_sta);
+                        installed_pairwise_keys.remove(&result.core_sta);
+                        kernel_stations.remove(&result.core_sta);
+                    }
+                }
+                KernelCleanupKind::Interface => {
+                    if vlan
+                        .complete_interface_cleanup(
+                            &result.core_sta,
+                            result.id,
+                            result.success,
+                            Instant::now(),
+                        )
+                        .is_some()
+                    {
+                        // Atomic release point: only now, after the worker saw a
+                        // successful/absent DEL_INTERFACE ACK, can allocate()
+                        // observe this VLAN id and interface name as free.
+                        vlan_gtk.retain(|(known, _), _| known != &result.core_sta);
+                        retiring_stations.remove(&result.core_sta);
+                    }
+                }
+            }
+        }
+
+        // Drive pending cleanup without waiting in the radio loop. A station
+        // cleanup always precedes AP_VLAN deletion; interface ids remain
+        // reserved during both the event grace period and any driver retries.
+        let now = Instant::now();
+        let retiring: Vec<[u8; 6]> = retiring_stations.iter().copied().collect();
+        for core_sta in retiring {
+            if let Some(assignment) = vlan.map.get_mut(&core_sta) {
+                if assignment.retire_at.is_none() {
+                    assignment.retire_at = Some(now + VLAN_EVENT_GRACE);
+                    assignment.station_retry_at = Some(now);
+                }
+                if !assignment.station_removed
+                    && assignment.station_cleanup_id.is_none()
+                    && assignment.station_retry_at.is_none_or(|retry| retry <= now)
+                {
+                    let id = allocate_cleanup_id(&mut next_cleanup_id);
+                    let job = KernelCleanupJob {
+                        id,
+                        core_sta,
+                        action: KernelCleanupAction::Station {
+                            base_ifindex: ifindex,
+                            station_ifindex: assignment.ifindex,
+                            kernel_sta: assignment.sta_addr,
+                            delete_on_base_too: assignment.station_may_be_on_base,
+                        },
+                    };
+                    if cleanup_worker.schedule(job) {
+                        assignment.station_cleanup_id = Some(id);
+                        assignment.station_retry_at = None;
+                    }
+                }
+                let delete_due = assignment.retire_at.is_some_and(|deadline| deadline <= now);
+                if assignment.station_removed
+                    && delete_due
+                    && assignment.interface_cleanup_id.is_none()
+                    && assignment
+                        .interface_retry_at
+                        .is_none_or(|retry| retry <= now)
+                {
+                    let id = allocate_cleanup_id(&mut next_cleanup_id);
+                    let job = KernelCleanupJob {
+                        id,
+                        core_sta,
+                        action: KernelCleanupAction::Interface {
+                            ifindex: assignment.ifindex,
+                        },
+                    };
+                    if cleanup_worker.schedule(job) {
+                        assignment.interface_cleanup_id = Some(id);
+                        assignment.interface_retry_at = None;
+                    }
+                }
+                continue;
+            }
+
+            if !base_station_cleanup.contains_key(&core_sta) {
+                if let Some(&kernel_sta) = kernel_stations.get(&core_sta) {
+                    base_station_cleanup.insert(
+                        core_sta,
+                        BaseStationCleanup {
+                            kernel_sta,
+                            cleanup_id: None,
+                            retry_at: now,
+                        },
+                    );
+                } else {
+                    // NEW_STATION never succeeded, so there is no kernel
+                    // resource to retire and no identifier to reserve.
+                    retiring_stations.remove(&core_sta);
+                    stations.remove(&core_sta);
+                    keyed.remove(&core_sta);
+                    installed_pairwise_keys.remove(&core_sta);
+                    continue;
+                }
+            }
+            let Some(cleanup) = base_station_cleanup.get_mut(&core_sta) else {
+                continue;
+            };
+            if cleanup.cleanup_id.is_none() && cleanup.retry_at <= now {
+                let id = allocate_cleanup_id(&mut next_cleanup_id);
+                let job = KernelCleanupJob {
+                    id,
+                    core_sta,
+                    action: KernelCleanupAction::Station {
+                        base_ifindex: ifindex,
+                        station_ifindex: ifindex,
+                        kernel_sta: cleanup.kernel_sta,
+                        delete_on_base_too: false,
+                    },
+                };
+                if cleanup_worker.schedule(job) {
+                    cleanup.cleanup_id = Some(id);
+                }
+            }
+        }
+
         // Management frames (auth/assoc) and EAPOL (control port over nl80211)
         // arrive on the event socket. Poll at 20 ms so the tick() below can fire
-        // the fast (~30 ms) first EAPOL retransmit promptly on an idle loop.
-        if let Some(buf) = sock.recv(Duration::from_millis(20)) {
-            for parsed in msg::parse_messages(&buf) {
+        // the 100-ms first EAPOL retransmit promptly on an idle loop.
+        if let Some(len) = sock.recv_into(Duration::from_millis(20), &mut event_buf) {
+            for parsed in msg::messages(&event_buf[..len]) {
                 if parsed.typ != family_id {
                     continue;
                 }
@@ -2578,13 +3200,12 @@ pub fn run_offload_ap(
                 if msg::find_attr(&attrs, NL80211_ATTR_IFINDEX)
                     .and_then(read_u32)
                     .is_some_and(|event_ifindex| {
-                        event_ifindex != ifindex
-                            && !vlan.map.values().any(|v| v.ifindex == event_ifindex)
+                        event_ifindex != ifindex && !vlan.ifindices.contains(&event_ifindex)
                     })
                 {
                     continue;
                 }
-                if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+                if crate::util::netlink_debug_enabled() {
                     if let Some(c) = parsed.genl_cmd() {
                         if c == NL80211_CMD_FRAME || c == NL80211_CMD_CONTROL_PORT_FRAME {
                             let sub = msg::find_attr(&attrs, NL80211_ATTR_FRAME)
@@ -2611,7 +3232,7 @@ pub fn run_offload_ap(
                             ap.note_eapol_acked(&sta);
                         }
                     }
-                    if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+                    if crate::util::netlink_debug_enabled() {
                         let acked = msg::find_attr(&attrs, NL80211_ATTR_ACK).is_some();
                         let flen = msg::find_attr(&attrs, NL80211_ATTR_FRAME)
                             .map(|f| f.len())
@@ -2661,12 +3282,12 @@ pub fn run_offload_ap(
                     }
                     let sta = tx.addr1;
                     let sc = u16::from_le_bytes([fr[22], fr[23]]);
-                    if assoc_tx.get(&sta).copied() != Some(sc) {
+                    if assoc_tx.get(&sta).map(|pending| pending.sc) != Some(sc) {
                         continue;
                     }
                     assoc_tx.remove(&sta);
                     let core_sta = ap.station_link_for_peer(&sta).unwrap_or(sta);
-                    if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+                    if crate::util::netlink_debug_enabled() {
                         eprintln!(
                             "netlink AP: ASSOC-RESP TX-STATUS sta={} acked={acked} sc={sc}",
                             crate::util::bytes_to_mac(&sta)
@@ -2682,12 +3303,16 @@ pub fn run_offload_ap(
                             route_outputs(
                                 &mut sock,
                                 &mut cmd,
+                                &eapol_tx,
                                 family_id,
                                 ifindex,
                                 freq,
                                 &released,
                                 &mut stations,
+                                &mut kernel_stations,
+                                &mut retiring_stations,
                                 &mut keyed,
+                                &mut installed_pairwise_keys,
                                 &mut vlan,
                                 &ap,
                                 &link_route,
@@ -2705,28 +3330,10 @@ pub fn run_offload_ap(
                     } else {
                         held_assoc_eapol.remove(&sta);
                         ap.note_assoc_response_not_acked(&core_sta);
-                        let old_vlan = if vlan.enabled {
-                            vlan.map.remove(&core_sta)
-                        } else {
-                            None
-                        };
-                        match old_vlan {
-                            Some(assignment) => {
-                                nl_del_station(
-                                    &mut cmd,
-                                    family_id,
-                                    assignment.ifindex,
-                                    &assignment.sta_addr,
-                                );
-                                nl_del_iface(&mut cmd, family_id, assignment.ifindex);
-                            }
-                            None => {
-                                let kernel_addr = ap.station_mld_mac(&core_sta).unwrap_or(core_sta);
-                                nl_del_station(&mut cmd, family_id, ifindex, &kernel_addr);
-                            }
-                        }
-                        stations.retain(|s| s != &core_sta);
-                        keyed.remove(&core_sta);
+                        // The cleanup worker performs PTK -> station -> VIF
+                        // teardown. Keep all identifiers reserved until its
+                        // generation-tagged completion is applied.
+                        retiring_stations.insert(core_sta);
                     }
                     continue;
                 }
@@ -2751,7 +3358,7 @@ pub fn run_offload_ap(
                         let Some(f) = msg::find_attr(&attrs, NL80211_ATTR_FRAME) else {
                             continue;
                         };
-                        if ap.mld && std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+                        if ap.mld && crate::util::netlink_debug_enabled() {
                             let attr_summary = attrs
                                 .iter()
                                 .map(|(typ, data)| format!("{typ}:{}", data.len()))
@@ -2882,7 +3489,7 @@ pub fn run_offload_ap(
                                 link_route.insert(sta, lid);
                             }
                         }
-                        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+                        if crate::util::netlink_debug_enabled() {
                             let mut s = [0u8; 6];
                             s.copy_from_slice(src);
                             eprintln!(
@@ -2901,12 +3508,68 @@ pub fn run_offload_ap(
                 route_outputs(
                     &mut sock,
                     &mut cmd,
+                    &eapol_tx,
                     family_id,
                     ifindex,
                     freq,
                     &out,
                     &mut stations,
+                    &mut kernel_stations,
+                    &mut retiring_stations,
                     &mut keyed,
+                    &mut installed_pairwise_keys,
+                    &mut vlan,
+                    &ap,
+                    &link_route,
+                    &link_params,
+                    &wiphy_caps_by_link,
+                    &mut assoc_tx,
+                    &mut held_assoc_eapol,
+                );
+            }
+        }
+
+        // A few real drivers occasionally lose the Association Response
+        // TX-status event even though the response reached the client. Holding
+        // m1 forever in that case makes every core retry replace the same held
+        // frame, then ends in a message-1 timeout without transmitting any of
+        // them. After a bounded grace, release the newest held frame. If the
+        // Association Response truly was lost, the station ignores m1 and
+        // retries association; it still cannot be authorized without valid
+        // m2/m4 MICs.
+        let now = Instant::now();
+        let stalled_assoc: Vec<[u8; 6]> = assoc_tx
+            .iter()
+            .filter(|(_, pending)| now.duration_since(pending.sent_at) >= ASSOC_TX_STATUS_GRACE)
+            .map(|(sta, _)| *sta)
+            .collect();
+        for sta in stalled_assoc {
+            assoc_tx.remove(&sta);
+            let core_sta = ap.station_link_for_peer(&sta).unwrap_or(sta);
+            if let Some(frame) = held_assoc_eapol.remove(&sta) {
+                eprintln!(
+                    "netlink AP: ASSOC-RESP TX-STATUS missing for {}; releasing held EAPOL after {} ms",
+                    crate::util::bytes_to_mac(&sta),
+                    ASSOC_TX_STATUS_GRACE.as_millis(),
+                );
+                ap.note_eapol_transmitted(&core_sta);
+                let released = crate::ap::Outgoing {
+                    frames: vec![frame],
+                    to_network: Vec::new(),
+                };
+                route_outputs(
+                    &mut sock,
+                    &mut cmd,
+                    &eapol_tx,
+                    family_id,
+                    ifindex,
+                    freq,
+                    &released,
+                    &mut stations,
+                    &mut kernel_stations,
+                    &mut retiring_stations,
+                    &mut keyed,
+                    &mut installed_pairwise_keys,
                     &mut vlan,
                     &ap,
                     &link_route,
@@ -2920,18 +3583,23 @@ pub fn run_offload_ap(
 
         // Handshake-reliability maintenance: retransmit pending EAPOL m1/m3
         // whose m2/m4 was lost, and deauth a station whose 4-way times out. The
-        // recv() above blocks ~200 ms, so this runs several times a second.
+        // recv() above blocks for at most 20 ms, so timer granularity stays close
+        // to the reference event loop's 100-ms first EAPOL retry.
         let tick_out = ap.tick();
         if !tick_out.frames.is_empty() {
             route_outputs(
                 &mut sock,
                 &mut cmd,
+                &eapol_tx,
                 family_id,
                 ifindex,
                 freq,
                 &tick_out,
                 &mut stations,
+                &mut kernel_stations,
+                &mut retiring_stations,
                 &mut keyed,
+                &mut installed_pairwise_keys,
                 &mut vlan,
                 &ap,
                 &link_route,
@@ -2942,102 +3610,187 @@ pub fn run_offload_ap(
             );
         }
 
-        // Prune bookkeeping for stations the AP has dropped (deauth / 4-way
-        // timeout), so `stations`/`keyed` don't grow unbounded over connect/
-        // disconnect cycles (and the key-install loop below doesn't iterate dead
-        // entries). Keep a disconnected station's AP_VLAN briefly: SPR's
-        // reference AP action calls `STA <mac>` after receiving AP-STA-DISCONNECTED,
-        // then uses the returned vlan_id to remove DHCP/firewall state.
-        let live: HashSet<[u8; 6]> = ap.station_macs().into_iter().collect();
-        stations.retain(|s| live.contains(s));
-        keyed.retain(|s| live.contains(s));
-        // MLO Association Responses and their first EAPOL frame are addressed
-        // to the peer MLD while the core station table is keyed by the
-        // association-link MAC. Preserve either representation.
-        assoc_tx.retain(|s, _| live.contains(s) || ap.station_link_for_peer(s).is_some());
-        held_assoc_eapol.retain(|s, _| live.contains(s) || ap.station_link_for_peer(s).is_some());
-        if vlan.enabled {
-            vlan_gtk.retain(|(s, _), _| live.contains(s));
-            let gone: Vec<[u8; 6]> = vlan
-                .map
-                .keys()
-                .copied()
-                .filter(|s| !live.contains(s))
-                .collect();
-            for s in gone {
-                let now = Instant::now();
-                let remove = match vlan.map.get_mut(&s) {
-                    Some(assignment) => match assignment.retire_at {
-                        Some(deadline) => now >= deadline,
-                        None => {
-                            nl_del_station(
-                                &mut cmd,
-                                family_id,
-                                assignment.ifindex,
-                                &assignment.sta_addr,
-                            );
-                            assignment.retire_at = Some(now + VLAN_EVENT_GRACE);
-                            false
-                        }
-                    },
-                    None => false,
-                };
-                if remove {
-                    if let Some(assignment) = vlan.map.remove(&s) {
-                        nl_del_iface(&mut cmd, family_id, assignment.ifindex);
-                    }
-                }
+        // Reconcile only actual state changes. The previous implementation
+        // rebuilt a live HashSet and rescanned every station/VLAN every 20 ms.
+        for sta in ap.drain_removed_stations() {
+            retiring_stations.insert(sta);
+            key_install_pending.remove(&sta);
+            assoc_tx.remove(&sta);
+            held_assoc_eapol.remove(&sta);
+            if let Some(worker) = station_telemetry.as_mut() {
+                worker.forget(&sta);
             }
+            vlan.begin_retirement(&sta, Instant::now() + VLAN_EVENT_GRACE);
         }
 
-        // Install keys for any station that just completed the 4-way. With
-        // per-station VIFs the PTK + GTK + authorize go on the station's AP_VLAN
-        // (each gets its own group key); otherwise the pairwise key goes on the
-        // main AP and the BSS-wide GTK/IGTK is (re)installed below.
+        // Install keys for any station that just completed the 4-way. Match the
+        // reference per_sta_vif ordering: messages 1-4 run while the station is
+        // still on the base AP, the PTK is installed there, and only then is the
+        // station moved to its private AP_VLAN for its per-station GTK and
+        // authorization. Moving it before message 1 is accepted by hwsim, but
+        // real drivers can then accept CONTROL_PORT_FRAME on the base ifindex
+        // without actually delivering it to the station.
+        key_install_pending.extend(ap.drain_key_ready_stations());
         let mut newly_keyed = false;
-        for sta in &stations {
-            if keyed.contains(sta) || !ap.is_associated(sta) {
+        let pending_keys: Vec<[u8; 6]> = key_install_pending.iter().copied().collect();
+        for sta in &pending_keys {
+            if retiring_stations.contains(sta) {
+                key_install_pending.remove(sta);
                 continue;
             }
-            let key_if = if vlan.enabled {
-                match vlan.map.get(sta) {
-                    Some(v) => v.ifindex,
-                    None => continue, // VLAN not set up yet; try again next pass
-                }
-            } else {
-                ifindex
-            };
+            if !ap.is_associated(sta) {
+                key_install_pending.remove(sta);
+                continue;
+            }
             if let Some(tk) = ap.station_pairwise_key(sta) {
+                let already_authorized = keyed.contains(sta);
                 let mld_mac = ap.mld.then(|| ap.station_mld_mac(sta)).flatten();
                 let key_sta = mld_mac.as_ref().unwrap_or(sta);
+                let assoc_link_id = link_route.get(sta).copied().unwrap_or(ap.link_id);
                 // MLO pairwise keys are addressed to the peer MLD. The kernel
                 // rejects MLO_LINK_ID on pairwise NEW_KEY; per-link scoping only
                 // applies to group/management keys.
-                nl_new_key(
-                    &mut cmd,
-                    family_id,
-                    key_if,
-                    Some(key_sta),
-                    0,
-                    tk,
-                    ap.pairwise_cipher().suite_selector(),
-                    true,
-                    None,
-                );
+                let kernel_has_key = installed_pairwise_keys
+                    .get(sta)
+                    .is_some_and(|installed| installed.as_slice() == tk);
+                if !kernel_has_key {
+                    if !nl_new_key(
+                        &mut cmd,
+                        family_id,
+                        ifindex,
+                        Some(key_sta),
+                        0,
+                        tk,
+                        ap.pairwise_cipher().suite_selector(),
+                        true,
+                        None,
+                    ) {
+                        continue;
+                    }
+                    installed_pairwise_keys.insert(*sta, tk.to_vec());
+                }
+                if already_authorized {
+                    // Authenticator-initiated PTK rekey: the station remains on
+                    // its existing VLAN and authorized throughout. A changed TK
+                    // was installed above; an identical TK was deliberately not
+                    // re-installed, preserving the kernel's packet counters.
+                    key_install_pending.remove(sta);
+                    eprintln!(
+                        "netlink AP: station {} pairwise rekey complete (changed={})",
+                        crate::util::bytes_to_mac(sta),
+                        !kernel_has_key,
+                    );
+                    continue;
+                }
+
+                let key_if = if vlan.enabled {
+                    if !vlan.map.contains_key(sta) {
+                        // Create the private interface only after m4. Merely
+                        // creating it cannot disturb the station; SET_STA_VLAN
+                        // below is the point where its data path moves.
+                        let (vlan_id, name) = match vlan.allocate() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("netlink AP: allocate per-station VIF failed: {e}");
+                                continue;
+                            }
+                        };
+                        let parent_addr = ap_vlan_parent_addr(&ap);
+                        let vidx = match nl_create_ap_vlan(
+                            &mut cmd,
+                            family_id,
+                            ifindex,
+                            &name,
+                            &parent_addr,
+                        ) {
+                            Ok(vidx) => vidx,
+                            Err(e) => {
+                                eprintln!("netlink AP: create AP_VLAN {name} failed: {e}");
+                                continue;
+                            }
+                        };
+                        // Reserve the id/name immediately after NEW_INTERFACE.
+                        // From this point onward every failure goes through the
+                        // asynchronous retirement state machine; no allocator
+                        // can observe the VIF as free before DEL_INTERFACE ACKs.
+                        let kernel_addr = mld_mac.unwrap_or(*sta);
+                        vlan.insert(
+                            *sta,
+                            VlanAssignment {
+                                ifindex: vidx,
+                                vlan_id,
+                                ifname: name.clone(),
+                                sta_addr: kernel_addr,
+                                station_may_be_on_base: true,
+                                retire_at: None,
+                                station_removed: false,
+                                station_cleanup_id: None,
+                                station_retry_at: None,
+                                interface_cleanup_id: None,
+                                interface_retry_at: None,
+                            },
+                        );
+                        // cfg80211 stores an MLO peer under its MLD MAC. Match
+                        // the reference AP and bind the AP_VLAN on every
+                        // negotiated MLO link; binding only the association
+                        // link leaves partner-link traffic on the base BSS.
+                        let vlan_links = per_station_link_ids(
+                            ap.mld,
+                            mld_mac.is_some(),
+                            assoc_link_id,
+                            ap.station_mld_link_ids(sta),
+                        );
+                        let mut vlan_bind_error = None;
+                        for &link_id in &vlan_links {
+                            if let Err(e) = nl_set_sta_vlan(
+                                &mut cmd,
+                                family_id,
+                                ifindex,
+                                &kernel_addr,
+                                vidx,
+                                link_id,
+                            ) {
+                                vlan_bind_error = Some((link_id, e));
+                                break;
+                            }
+                        }
+                        if let Some((link_id, e)) = vlan_bind_error {
+                            eprintln!("netlink AP: set_sta_vlan link={link_id:?} failed: {e}");
+                            retiring_stations.insert(*sta);
+                            vlan.begin_retirement(sta, Instant::now());
+                            continue;
+                        }
+                        vlan.map
+                            .get_mut(sta)
+                            .expect("new AP_VLAN reservation")
+                            .station_may_be_on_base = false;
+                        eprintln!(
+                            "netlink AP: station {} -> {name} (vlan_id {vlan_id}, ifindex {vidx}, links={vlan_links:?})",
+                            crate::util::bytes_to_mac(&kernel_addr),
+                        );
+                    }
+                    vlan.map
+                        .get(sta)
+                        .map(|assignment| assignment.ifindex)
+                        .unwrap_or(ifindex)
+                } else {
+                    ifindex
+                };
+
                 if vlan.enabled {
                     // The GTK index is BSS-wide (the advertised key id, shared by
                     // every station); only the per-station GTK *value* differs.
                     let gidx = ap.gtk_key_id();
                     let gkey = ap.station_gtk(sta);
-                    let group_links: Vec<Option<u8>> = if mld_mac.is_some() {
-                        ap.station_mld_link_ids(sta).into_iter().map(Some).collect()
-                    } else if ap.mld {
-                        vec![Some(ap.link_id)]
-                    } else {
-                        vec![None]
-                    };
+                    let group_links = per_station_link_ids(
+                        ap.mld,
+                        mld_mac.is_some(),
+                        assoc_link_id,
+                        ap.station_mld_link_ids(sta),
+                    );
+                    let mut group_keys_ok = true;
                     for link_id in group_links {
-                        nl_new_key(
+                        if !nl_new_key(
                             &mut cmd,
                             family_id,
                             key_if,
@@ -3047,8 +3800,14 @@ pub fn run_offload_ap(
                             WLAN_CIPHER_SUITE_CCMP,
                             false,
                             link_id,
-                        );
+                        ) {
+                            group_keys_ok = false;
+                            continue;
+                        }
                         vlan_gtk.insert((*sta, link_id), (gidx, gkey));
+                    }
+                    if !group_keys_ok {
+                        continue;
                     }
                 }
                 // Authorization is MLD-level state. Match reference AP: select an
@@ -3057,8 +3816,13 @@ pub fn run_offload_ap(
                 // partner links. Applying AUTHORIZED/WME/MFP to link stations
                 // can leave ath12k's data scheduler anchored to the association
                 // link even though the partner station was added successfully.
-                nl_authorize(&mut cmd, family_id, key_if, key_sta);
+                // The reference driver also addresses SET_STATION through the
+                // base BSS after STA_VLAN has moved the peer.
+                if !nl_authorize(&mut cmd, family_id, ifindex, key_sta) {
+                    continue;
+                }
                 keyed.insert(*sta);
+                key_install_pending.remove(sta);
                 newly_keyed = true;
                 eprintln!(
                     "netlink AP: station {} keyed + authorized",
@@ -3067,12 +3831,16 @@ pub fn run_offload_ap(
             }
         }
 
+        let group_keys_changed =
+            group_key_install_pending || installed_group_key_epoch != ap.group_key_epoch();
+        let mut group_keys_installed = true;
+
         // BSS-wide GTK: install once a station is keyed, and re-install whenever
         // the AP rotates it (group rekey). The kernel must end up using exactly
         // the GTK bytes + index that rekey_gtk() handed the stations — otherwise
         // a departed STA can still read kernel group traffic. (Per-STA-VIF mode
         // has no BSS-wide group key; each AP_VLAN is keyed below instead.)
-        if !vlan.enabled && (newly_keyed || !keyed.is_empty()) {
+        if !vlan.enabled && (newly_keyed || group_keys_changed) && !keyed.is_empty() {
             let gtk_idx = ap.gtk_key_id();
             let gtk = ap.gtk();
             let group_links: Vec<Option<u8>> = if ap.mld {
@@ -3085,9 +3853,11 @@ pub fn run_offload_ap(
             };
             for link_id in group_links {
                 if gtk_state.get(&link_id) != Some(&(gtk_idx, gtk)) {
-                    // Install the (new) GTK at its index and make it the multicast
-                    // default TX key, then remove the previous index.
-                    nl_new_key(
+                    // Keep the alternate GTK slot until the next rotation
+                    // overwrites it. This is the reference AP's bounded two-slot
+                    // behavior and avoids a delete window while stations finish
+                    // the group-key handshake.
+                    if nl_new_key(
                         &mut cmd,
                         family_id,
                         ifindex,
@@ -3097,26 +3867,25 @@ pub fn run_offload_ap(
                         WLAN_CIPHER_SUITE_CCMP,
                         false,
                         link_id,
-                    );
-                    if let Some((old_idx, _)) = gtk_state.get(&link_id).copied() {
-                        if old_idx != gtk_idx {
-                            nl_del_key(&mut cmd, family_id, ifindex, old_idx, link_id);
-                        }
+                    ) {
+                        gtk_state.insert(link_id, (gtk_idx, gtk));
+                    } else {
+                        group_keys_installed = false;
                     }
-                    gtk_state.insert(link_id, (gtk_idx, gtk));
                 }
             }
         }
 
-        // Per-STA-VIF rekey: re-install each station's own rotated GTK on its
-        // AP_VLAN at the new (toggled) index, dropping the stale index — the
-        // per-AP_VLAN two-phase rekey. Without this, a periodic/strict rekey
+        // Per-STA-VIF rekey: install each station's own rotated GTK on its
+        // AP_VLAN at the new (toggled) index. The alternate slot remains until
+        // a later rotation overwrites it, preserving the two-phase rekey window.
+        // Without this, a periodic/strict rekey
         // would hand stations a new key while the AP_VLAN kernel key stayed
         // stale. The initial install above seeds vlan_gtk, so this only fires on
         // an actual rotation.
-        if vlan.enabled {
+        if vlan.enabled && group_keys_changed {
             for sta in &stations {
-                if !keyed.contains(sta) {
+                if !keyed.contains(sta) || retiring_stations.contains(sta) {
                     continue;
                 }
                 let Some(assignment) = vlan.map.get(sta) else {
@@ -3127,17 +3896,17 @@ pub fn run_offload_ap(
                 let gidx = ap.gtk_key_id();
                 let gkey = ap.station_gtk(sta);
                 let mld_station = ap.mld && ap.station_mld_mac(sta).is_some();
-                let group_links: Vec<Option<u8>> = if mld_station {
-                    ap.station_mld_link_ids(sta).into_iter().map(Some).collect()
-                } else if ap.mld {
-                    vec![Some(ap.link_id)]
-                } else {
-                    vec![None]
-                };
+                let assoc_link_id = link_route.get(sta).copied().unwrap_or(ap.link_id);
+                let group_links = per_station_link_ids(
+                    ap.mld,
+                    mld_station,
+                    assoc_link_id,
+                    ap.station_mld_link_ids(sta),
+                );
                 for link_id in group_links {
                     let state_key = (*sta, link_id);
                     if vlan_gtk.get(&state_key) != Some(&(gidx, gkey)) {
-                        nl_new_key(
+                        if nl_new_key(
                             &mut cmd,
                             family_id,
                             vidx,
@@ -3147,13 +3916,11 @@ pub fn run_offload_ap(
                             WLAN_CIPHER_SUITE_CCMP,
                             false,
                             link_id,
-                        );
-                        if let Some(&(old_idx, _)) = vlan_gtk.get(&state_key) {
-                            if old_idx != gidx {
-                                nl_del_key(&mut cmd, family_id, vidx, old_idx, link_id);
-                            }
+                        ) {
+                            vlan_gtk.insert(state_key, (gidx, gkey));
+                        } else {
+                            group_keys_installed = false;
                         }
-                        vlan_gtk.insert(state_key, (gidx, gkey));
                     }
                 }
             }
@@ -3162,7 +3929,7 @@ pub fn run_offload_ap(
         // IGTK for PMF (SAE/OWE): BSS-wide (one BIP key for the radio's robust
         // management frames), installed on the main AP interface in both modes so
         // the kernel can BIP-protect/validate them; re-install on rotation.
-        if ap.is_pmf() && (newly_keyed || !keyed.is_empty()) {
+        if ap.is_pmf() && (newly_keyed || group_keys_changed) && !keyed.is_empty() {
             let igtk_idx = ap.igtk_key_id() as u8;
             let igtk = ap.igtk();
             let mgmt_links: Vec<Option<u8>> = if ap.mld {
@@ -3175,7 +3942,7 @@ pub fn run_offload_ap(
             };
             for link_id in mgmt_links {
                 if igtk_state.get(&link_id) != Some(&(igtk_idx, igtk)) {
-                    nl_install_igtk(
+                    if nl_install_igtk(
                         &mut cmd,
                         family_id,
                         ifindex,
@@ -3183,13 +3950,11 @@ pub fn run_offload_ap(
                         &igtk,
                         &ap.igtk_ipn(),
                         link_id,
-                    );
-                    if let Some((old_idx, _)) = igtk_state.get(&link_id).copied() {
-                        if old_idx != igtk_idx {
-                            nl_del_key(&mut cmd, family_id, ifindex, old_idx, link_id);
-                        }
+                    ) {
+                        igtk_state.insert(link_id, (igtk_idx, igtk));
+                    } else {
+                        group_keys_installed = false;
                     }
-                    igtk_state.insert(link_id, (igtk_idx, igtk));
                 }
             }
 
@@ -3222,11 +3987,6 @@ pub fn run_offload_ap(
                         &ap.bigtk_ipn(),
                         link_id,
                     ) {
-                        if let Some((old_idx, _)) = bigtk_state.get(&link_id).copied() {
-                            if old_idx != bigtk_idx {
-                                nl_del_key(&mut cmd, family_id, ifindex, old_idx, link_id);
-                            }
-                        }
                         bigtk_state.insert(link_id, (bigtk_idx, bigtk));
                         eprintln!("netlink AP: Beacon Protection enabled (BIGTK idx {bigtk_idx} installed; kernel stamps per-beacon MME)");
                     } else {
@@ -3237,26 +3997,31 @@ pub fn run_offload_ap(
                 }
             }
         }
+        if newly_keyed || group_keys_changed {
+            if group_keys_installed {
+                installed_group_key_epoch = ap.group_key_epoch();
+                group_key_install_pending = false;
+            } else {
+                // Do not advance userspace's installed epoch until every
+                // required kernel key ACKs. Successful links are recognized by
+                // the state maps and skipped while failed links retry.
+                group_key_install_pending = true;
+            }
+        }
 
         // Control interface: service pending commands (sending any frames they
         // produce, e.g. an admin DEAUTH), then surface AP-STA-* events to the
         // log and to any attached clients.
         if let Some(ctrl) = control.as_mut() {
             let ctrl_frames = {
-                // The resolver's public shape is `Fn` because most metadata is
-                // an in-memory lookup. RefCell gives that closure narrowly
-                // scoped mutable access to the synchronous nl80211 command
-                // socket for GET_STATION telemetry; the borrow is gone before
-                // route_outputs uses `cmd` below.
-                let stats_sock = std::cell::RefCell::new(&mut cmd);
+                // Cache misses only enqueue work on the telemetry thread.
+                let telemetry = std::cell::RefCell::new(&mut station_telemetry);
                 let station_info = |mac: &[u8; 6]| {
                     vlan.assignment_for(mac).map(|assignment| {
-                        let telemetry = nl_get_station_telemetry(
-                            &mut stats_sock.borrow_mut(),
-                            family_id,
-                            ifindex,
-                            mac,
-                        );
+                        let telemetry = telemetry
+                            .borrow_mut()
+                            .as_mut()
+                            .and_then(|worker| worker.get(*mac));
                         crate::control::StationControlInfo {
                             vlan_id: assignment.vlan_id,
                             ifname: assignment.ifname.clone(),
@@ -3274,12 +4039,16 @@ pub fn run_offload_ap(
                 route_outputs(
                     &mut sock,
                     &mut cmd,
+                    &eapol_tx,
                     family_id,
                     ifindex,
                     freq,
                     &out,
                     &mut stations,
+                    &mut kernel_stations,
+                    &mut retiring_stations,
                     &mut keyed,
+                    &mut installed_pairwise_keys,
                     &mut vlan,
                     &ap,
                     &link_route,
@@ -3291,6 +4060,19 @@ pub fn run_offload_ap(
             }
         }
         for ev in ap.drain_events() {
+            if let crate::ap::ApEvent::Disconnected { mac, .. } = &ev {
+                let core_sta = ap
+                    .station_link_for_peer(mac)
+                    .or_else(|| vlan.core_key_for(mac))
+                    .or_else(|| {
+                        kernel_stations.iter().find_map(|(core_sta, kernel_sta)| {
+                            (*kernel_sta == *mac).then_some(*core_sta)
+                        })
+                    })
+                    .unwrap_or(*mac);
+                retiring_stations.insert(core_sta);
+                vlan.begin_retirement(&core_sta, Instant::now() + VLAN_EVENT_GRACE);
+            }
             // reference AP adds `vlanid` (no underscore) to the connect event. SPR's
             // action script ignores that extra argv today and synchronously asks
             // `STA <mac>` for `vlan_id`, which the control responder above serves.
@@ -3332,14 +4114,22 @@ pub fn run_offload_ap(
     }
 }
 
-/// Remove a station from the kernel (on disconnect, or before re-adding a
-/// rejoining client). Best-effort: a no-op if the station does not exist.
-fn nl_del_station(sock: &mut NetlinkSocket, family: u16, ifindex: u32, sta: &[u8; 6]) {
+/// Remove a station from the kernel. An already-absent station is success so
+/// cleanup retries remain idempotent.
+fn nl_del_station(
+    sock: &mut NetlinkSocket,
+    family: u16,
+    ifindex: u32,
+    sta: &[u8; 6],
+) -> io::Result<()> {
     let seq = sock.next_seq();
     let m = GenlMessage::new(family, NL80211_CMD_DEL_STATION, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
         .attr(Attr::bytes(NL80211_ATTR_MAC, sta));
-    let _ = sock.request_ack(m);
+    match sock.request_ack(m) {
+        Err(error) if kernel_object_is_absent(&error) => Ok(()),
+        result => result,
+    }
 }
 
 /// Bring a network interface up (set IFF_UP) via an ioctl, like reference AP's
@@ -3382,6 +4172,47 @@ fn iface_set_up(name: &str) -> io::Result<()> {
     iface_set_state(name, true)
 }
 
+/// Set a down netdev's hardware address through SIOCSIFHWADDR. This ordering
+/// intentionally matches the reference nl80211 backend for AP_VLAN interfaces:
+/// NEW_INTERFACE first, address ioctl second, IFF_UP last.
+fn iface_set_mac(name: &str, mac: &[u8; 6]) -> io::Result<()> {
+    #[repr(C)]
+    struct IfReq {
+        name: [libc::c_char; libc::IFNAMSIZ],
+        address: libc::sockaddr,
+        _pad: [u8; 8],
+    }
+
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name must be 1..15 bytes",
+        ));
+    }
+
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut req: IfReq = std::mem::zeroed();
+        for (dst, src) in req.name.iter_mut().zip(name.bytes()) {
+            *dst = src as libc::c_char;
+        }
+        req.address.sa_family = libc::ARPHRD_ETHER as libc::sa_family_t;
+        for (dst, src) in req.address.sa_data.iter_mut().zip(mac) {
+            *dst = *src as libc::c_char;
+        }
+        let rc = libc::ioctl(fd, libc::SIOCSIFHWADDR as _, &req as *const IfReq);
+        let err = io::Error::last_os_error();
+        libc::close(fd);
+        if rc < 0 {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 /// Create an `AP_VLAN` interface beneath the AP (NEW_INTERFACE), bring it up,
 /// and return its ifindex. Each per-station VIF gets its own such interface.
 /// Delete every stranded per-station VIF belonging to this radio: netdevs named
@@ -3409,7 +4240,9 @@ fn flush_stale_ap_vlans(sock: &mut NetlinkSocket, family: u16, iface: &str) {
         let idx = unsafe { libc::if_nametoindex(cname.as_ptr() as *const libc::c_char) };
         if idx != 0 {
             eprintln!("netlink AP: flushing stale per-station VIF {name} (ifindex {idx})");
-            nl_del_iface(sock, family, idx);
+            if let Err(error) = nl_del_iface(sock, family, idx) {
+                eprintln!("netlink AP: failed to flush stale VIF {name}: {error}");
+            }
         }
     }
 }
@@ -3419,6 +4252,7 @@ fn nl_create_ap_vlan(
     family: u16,
     ap_ifindex: u32,
     name: &str,
+    parent_addr: &[u8; 6],
 ) -> io::Result<u32> {
     // A prior run (or a prior failed attempt this run) may have left a netdev of
     // this name behind — the allocator only tracks this process's own live map,
@@ -3427,17 +4261,10 @@ fn nl_create_ap_vlan(
     let cname = format!("{name}\0");
     let existing = unsafe { libc::if_nametoindex(cname.as_ptr() as *const libc::c_char) };
     if existing != 0 {
-        nl_del_iface(sock, family, existing);
+        nl_del_iface(sock, family, existing)?;
     }
     let seq = sock.next_seq();
-    let m = GenlMessage::new(family, NL80211_CMD_NEW_INTERFACE, 0, seq)
-        .attr(Attr::u32(NL80211_ATTR_IFINDEX, ap_ifindex))
-        .attr(Attr::string(NL80211_ATTR_IFNAME, name))
-        .attr(Attr::u32(NL80211_ATTR_IFTYPE, NL80211_IFTYPE_AP_VLAN))
-        // Per-station VIFs are process-scoped. Tying them to the command socket
-        // makes the kernel remove them on clean shutdown or a crash, preventing
-        // stale interfaces from exhausting the radio's interface limit.
-        .attr(Attr::bytes(NL80211_ATTR_SOCKET_OWNER, &[]));
+    let m = ap_vlan_create_message(family, seq, ap_ifindex, name);
     sock.request_ack(m)?;
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr() as *const libc::c_char) };
     if idx == 0 {
@@ -3446,11 +4273,15 @@ fn nl_create_ap_vlan(
             "AP_VLAN ifindex lookup failed",
         ));
     }
-    // NEW_INTERFACE already committed the netdev; if bringing it up fails (e.g.
-    // ENOLINK when the parent BSS addressing is unusable) it must be torn down
-    // here, otherwise the dead vdev leaks and the next attempt piles another on.
-    if let Err(e) = iface_set_up(name) {
-        nl_del_iface(sock, family, idx);
+    // NEW_INTERFACE already committed the netdev. Match the reference backend:
+    // set the AP/MLD address while it is down, then bring it up. If either step
+    // fails, tear it down so the next attempt does not pile onto a dead vdev.
+    if let Err(e) = iface_set_mac(name, parent_addr).and_then(|()| iface_set_up(name)) {
+        if let Err(cleanup_error) = nl_del_iface(sock, family, idx) {
+            return Err(io::Error::other(format!(
+                "{e}; cleanup of AP_VLAN {name} failed: {cleanup_error}"
+            )));
+        }
         return Err(e);
     }
     Ok(idx)
@@ -3582,8 +4413,52 @@ pub fn run_offload_aps(
     )
 }
 
-/// Move a station into an AP_VLAN (SET_STATION + NL80211_ATTR_STA_VLAN), so its
-/// data path and group key live on that per-station interface.
+/// Select the nl80211 link scopes used for a per-station AP_VLAN and its GTK.
+///
+/// A non-MLO AP has no link attribute. A legacy peer on an MLD AP belongs only
+/// to its association link. An MLO peer must be updated on every negotiated
+/// link, just as the reference AP walks every partner `hostapd_data`.
+fn per_station_link_ids(
+    ap_mld: bool,
+    peer_mld: bool,
+    association_link: u8,
+    mut negotiated_links: Vec<u8>,
+) -> Vec<Option<u8>> {
+    if !ap_mld {
+        return vec![None];
+    }
+    if !peer_mld {
+        return vec![Some(association_link)];
+    }
+    if !negotiated_links.contains(&association_link) {
+        negotiated_links.push(association_link);
+    }
+    negotiated_links.sort_unstable();
+    negotiated_links.dedup();
+    negotiated_links.into_iter().map(Some).collect()
+}
+
+fn set_sta_vlan_message(
+    family: u16,
+    ap_ifindex: u32,
+    sta: &[u8; 6],
+    vlan_ifindex: u32,
+    link_id: Option<u8>,
+    seq: u32,
+) -> GenlMessage {
+    let mut m = GenlMessage::new(family, NL80211_CMD_SET_STATION, 0, seq)
+        .attr(Attr::u32(NL80211_ATTR_IFINDEX, ap_ifindex))
+        .attr(Attr::bytes(NL80211_ATTR_MAC, sta))
+        .attr(Attr::u32(NL80211_ATTR_STA_VLAN, vlan_ifindex));
+    if let Some(link_id) = link_id {
+        m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
+    }
+    m
+}
+
+/// Move one station link into an AP_VLAN (SET_STATION +
+/// NL80211_ATTR_STA_VLAN), so its data path and group key live on that
+/// per-station interface.
 fn nl_set_sta_vlan(
     sock: &mut NetlinkSocket,
     family: u16,
@@ -3593,27 +4468,179 @@ fn nl_set_sta_vlan(
     link_id: Option<u8>,
 ) -> io::Result<()> {
     let seq = sock.next_seq();
-    let mut m = GenlMessage::new(family, NL80211_CMD_SET_STATION, 0, seq)
-        .attr(Attr::u32(NL80211_ATTR_IFINDEX, ap_ifindex))
-        .attr(Attr::bytes(NL80211_ATTR_MAC, sta))
-        .attr(Attr::u32(NL80211_ATTR_STA_VLAN, vlan_ifindex));
-    if let Some(link_id) = link_id {
-        m = m.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
-    }
+    let m = set_sta_vlan_message(family, ap_ifindex, sta, vlan_ifindex, link_id, seq);
     sock.request_ack(m)
 }
 
-/// Delete a dynamically-created interface (an AP_VLAN) by ifindex.
-fn nl_del_iface(sock: &mut NetlinkSocket, family: u16, ifindex: u32) {
+#[cfg(test)]
+mod station_vlan_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn mld_peer_binds_every_negotiated_link() {
+        assert_eq!(
+            per_station_link_ids(true, true, 1, vec![1, 0, 1]),
+            vec![Some(0), Some(1)]
+        );
+        assert_eq!(
+            per_station_link_ids(true, true, 1, vec![0]),
+            vec![Some(0), Some(1)],
+            "association link is retained even if partner parsing omitted it"
+        );
+    }
+
+    #[test]
+    fn legacy_peer_uses_its_actual_mld_ap_association_link() {
+        assert_eq!(
+            per_station_link_ids(true, false, 1, Vec::new()),
+            vec![Some(1)]
+        );
+        assert_eq!(
+            per_station_link_ids(false, false, 0, Vec::new()),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn sta_vlan_message_scopes_the_requested_mlo_link() {
+        let sta = [0x02, 0, 0, 0, 0, 1];
+        let msg = set_sta_vlan_message(42, 7, &sta, 88, Some(1), 9);
+        assert_eq!(msg.cmd, NL80211_CMD_SET_STATION);
+        assert_eq!(
+            msg.attrs
+                .iter()
+                .find(|attr| attr.typ == NL80211_ATTR_STA_VLAN)
+                .map(|attr| attr.data.as_slice()),
+            Some(88u32.to_ne_bytes().as_slice())
+        );
+        assert_eq!(
+            msg.attrs
+                .iter()
+                .find(|attr| attr.typ == NL80211_ATTR_MLO_LINK_ID)
+                .map(|attr| attr.data.as_slice()),
+            Some([1u8].as_slice())
+        );
+    }
+
+    #[test]
+    fn pairwise_key_delete_is_explicit_and_station_scoped() {
+        let sta = [0x02, 0, 0, 0, 0, 1];
+        let msg = del_pairwise_key_message(42, 9, 7, &sta);
+        assert_eq!(msg.cmd, NL80211_CMD_DEL_KEY);
+        assert_eq!(
+            msg.attrs
+                .iter()
+                .find(|attr| attr.typ == NL80211_ATTR_IFINDEX)
+                .map(|attr| attr.data.as_slice()),
+            Some(7u32.to_ne_bytes().as_slice())
+        );
+        assert_eq!(
+            msg.attrs
+                .iter()
+                .find(|attr| attr.typ == NL80211_ATTR_MAC)
+                .map(|attr| attr.data.as_slice()),
+            Some(sta.as_slice())
+        );
+        let key = msg
+            .attrs
+            .iter()
+            .find(|attr| attr.typ & !msg::NLA_F_NESTED == NL80211_ATTR_KEY)
+            .expect("nested key attributes");
+        let key_attrs = msg::parse_attrs(&key.data);
+        assert_eq!(
+            msg::find_attr(&key_attrs, NL80211_KEY_IDX),
+            Some([0u8].as_slice())
+        );
+    }
+
+    #[test]
+    fn retiring_vif_id_is_reserved_until_final_interface_release() {
+        let sta = [0x02, 0, 0, 0, 0, 1];
+        let now = Instant::now();
+        let mut vlan = VlanState {
+            enabled: true,
+            base_iface: "wlan0".to_string(),
+            map: HashMap::new(),
+            ifindices: HashSet::new(),
+        };
+        vlan.insert(
+            sta,
+            VlanAssignment {
+                ifindex: 88,
+                vlan_id: PER_STA_VLAN_ID_START,
+                ifname: format!("wlan0.{PER_STA_VLAN_ID_START}"),
+                sta_addr: sta,
+                station_may_be_on_base: false,
+                retire_at: Some(now),
+                station_removed: false,
+                station_cleanup_id: Some(41),
+                station_retry_at: None,
+                interface_cleanup_id: None,
+                interface_retry_at: None,
+            },
+        );
+
+        assert_eq!(vlan.allocate().unwrap().0, PER_STA_VLAN_ID_START + 1);
+
+        // DEL_STATION completion still does not release the AP_VLAN.
+        {
+            let assignment = vlan.map.get_mut(&sta).unwrap();
+            assignment.station_cleanup_id = None;
+            assignment.station_removed = true;
+            assignment.interface_cleanup_id = Some(42);
+        }
+        assert_eq!(vlan.allocate().unwrap().0, PER_STA_VLAN_ID_START + 1);
+
+        // Neither a stale completion nor a matching failure releases it.
+        assert!(vlan
+            .complete_interface_cleanup(&sta, 41, true, now)
+            .is_none());
+        assert!(vlan
+            .complete_interface_cleanup(&sta, 42, false, now)
+            .is_none());
+        assert_eq!(vlan.allocate().unwrap().0, PER_STA_VLAN_ID_START + 1);
+
+        // Simulate the retry being assigned a fresh generation. A delayed
+        // success from the old job still cannot release the live reservation.
+        vlan.map.get_mut(&sta).unwrap().interface_cleanup_id = Some(43);
+        assert!(vlan
+            .complete_interface_cleanup(&sta, 42, true, now)
+            .is_none());
+        assert_eq!(vlan.allocate().unwrap().0, PER_STA_VLAN_ID_START + 1);
+
+        // Only the matching successful/absent DEL_INTERFACE ACK frees the id.
+        assert!(vlan
+            .complete_interface_cleanup(&sta, 43, true, now)
+            .is_some());
+        assert_eq!(vlan.allocate().unwrap().0, PER_STA_VLAN_ID_START);
+    }
+}
+
+/// Delete a dynamically-created interface by ifindex. An already-absent
+/// interface is success so cleanup retries remain idempotent.
+fn nl_del_iface(sock: &mut NetlinkSocket, family: u16, ifindex: u32) -> io::Result<()> {
     let seq = sock.next_seq();
     let m = GenlMessage::new(family, NL80211_CMD_DEL_INTERFACE, 0, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex));
-    let _ = sock.request_ack(m);
+    match sock.request_ack(m) {
+        Err(error) if kernel_object_is_absent(&error) => Ok(()),
+        result => result,
+    }
 }
 
-/// Allow an attached reference AP control client action enough time to query `STA <mac>` and
-/// remove SPR DHCP/firewall state after a disconnect event.
+/// Allow an attached reference AP control client action enough time to query
+/// `STA <mac>` and remove SPR DHCP/firewall state after a disconnect event.
+/// The VIF stays reserved throughout this grace period and until the kernel
+/// acknowledges its final DEL_INTERFACE.
 const VLAN_EVENT_GRACE: Duration = Duration::from_secs(5);
+const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+fn allocate_cleanup_id(next: &mut u64) -> u64 {
+    let id = *next;
+    *next = (*next).wrapping_add(1).max(1);
+    id
+}
 
 #[derive(Clone, Debug)]
 struct VlanAssignment {
@@ -3623,7 +4650,23 @@ struct VlanAssignment {
     /// nl80211 indexes an MLO peer by its MLD MAC even though RustAP's frame
     /// state remains keyed by the association-link MAC.
     sta_addr: [u8; 6],
+    /// True only while SET_STA_VLAN may have failed after a partial move. A
+    /// normally-bound peer is deleted solely through its AP_VLAN; sending a
+    /// redundant base-BSS DEL_STATION can be rejected by strict drivers.
+    station_may_be_on_base: bool,
     retire_at: Option<Instant>,
+    station_removed: bool,
+    station_cleanup_id: Option<u64>,
+    station_retry_at: Option<Instant>,
+    interface_cleanup_id: Option<u64>,
+    interface_retry_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct BaseStationCleanup {
+    kernel_sta: [u8; 6],
+    cleanup_id: Option<u64>,
+    retry_at: Instant,
 }
 
 /// Per-station-VIF bookkeeping. IDs and names follow reference AP's wildcard VLAN
@@ -3632,6 +4675,9 @@ struct VlanState {
     enabled: bool,
     base_iface: String,
     map: std::collections::HashMap<[u8; 6], VlanAssignment>,
+    /// AP_VLAN ifindices accepted by the radio's event filter. Keeping this
+    /// reverse index avoids scanning every station VIF for every nl80211 event.
+    ifindices: std::collections::HashSet<u32>,
 }
 
 impl VlanState {
@@ -3649,6 +4695,63 @@ impl VlanState {
                 .find(|assignment| &assignment.sta_addr == mac)
         })
     }
+
+    fn core_key_for(&self, mac: &[u8; 6]) -> Option<[u8; 6]> {
+        self.map.contains_key(mac).then_some(*mac).or_else(|| {
+            self.map.iter().find_map(|(core_sta, assignment)| {
+                (assignment.sta_addr == *mac).then_some(*core_sta)
+            })
+        })
+    }
+
+    fn begin_retirement(&mut self, core_sta: &[u8; 6], delete_after: Instant) -> bool {
+        let Some(assignment) = self.map.get_mut(core_sta) else {
+            return false;
+        };
+        assignment.retire_at = Some(
+            assignment
+                .retire_at
+                .map(|existing| existing.min(delete_after))
+                .unwrap_or(delete_after),
+        );
+        assignment.station_retry_at.get_or_insert(Instant::now());
+        true
+    }
+
+    fn insert(&mut self, sta: [u8; 6], assignment: VlanAssignment) {
+        let ifindex = assignment.ifindex;
+        if let Some(old) = self.map.insert(sta, assignment) {
+            self.ifindices.remove(&old.ifindex);
+        }
+        self.ifindices.insert(ifindex);
+    }
+
+    fn remove(&mut self, sta: &[u8; 6]) -> Option<VlanAssignment> {
+        let assignment = self.map.remove(sta)?;
+        self.ifindices.remove(&assignment.ifindex);
+        Some(assignment)
+    }
+
+    /// Apply a generation-tagged DEL_INTERFACE completion. The allocation
+    /// becomes visible as free only in the successful matching branch.
+    fn complete_interface_cleanup(
+        &mut self,
+        sta: &[u8; 6],
+        cleanup_id: u64,
+        success: bool,
+        now: Instant,
+    ) -> Option<VlanAssignment> {
+        let assignment = self.map.get_mut(sta)?;
+        if assignment.interface_cleanup_id != Some(cleanup_id) {
+            return None;
+        }
+        assignment.interface_cleanup_id = None;
+        if !success {
+            assignment.interface_retry_at = Some(now + CLEANUP_RETRY_DELAY);
+            return None;
+        }
+        self.remove(sta)
+    }
 }
 
 /// Resolve the affiliated link carrying a received MLD management frame.
@@ -3656,8 +4759,9 @@ impl VlanState {
 /// nl80211 normally supplies `MLO_LINK_ID`, but ath12k can omit it for
 /// pre-association Authentication frames. In that case the on-air RA/BSSID
 /// identifies a unique link; an MLD-addressed frame can additionally be
-/// disambiguated by the event frequency. A present-but-inconsistent link ID is
-/// never overridden.
+/// disambiguated by the event frequency. Some drivers report an inconsistent
+/// link ID even when the frame's RA/BSSID names one affiliated BSS exactly; in
+/// that case the on-air address is authoritative.
 fn resolve_mld_rx_link(
     link_params: &std::collections::HashMap<u8, ([u8; 6], u32)>,
     reported_link_id: Option<u8>,
@@ -3674,6 +4778,17 @@ fn resolve_mld_rx_link(
                 || frame_bssid == ap_mld_mac
                 || (allow_broadcast && frame_bssid == &broadcast))
     };
+
+    let addressed: Vec<u8> = link_params
+        .iter()
+        .filter(|(_, (link_bssid, _))| {
+            (ra == link_bssid || frame_bssid == link_bssid) && address_matches(link_bssid)
+        })
+        .map(|(link_id, _)| *link_id)
+        .collect();
+    if addressed.len() == 1 {
+        return Some(addressed[0]);
+    }
 
     if let Some(link_id) = reported_link_id {
         return link_params
@@ -3734,13 +4849,13 @@ mod mld_rx_link_tests {
     }
 
     #[test]
-    fn inconsistent_reported_link_is_rejected() {
+    fn explicit_link_bssid_overrides_inconsistent_reported_link() {
         let links = links();
         let mld = [0x04, 0xf0, 0x21, 0xc9, 0x1e, 0xff];
         let link1 = links[&1].0;
         assert_eq!(
             resolve_mld_rx_link(&links, Some(0), Some(6135), &link1, &link1, &mld, false,),
-            None
+            Some(1)
         );
     }
 
@@ -3811,18 +4926,22 @@ fn mld_route(
 fn route_outputs(
     sock: &mut NetlinkSocket,
     cmd: &mut NetlinkSocket,
+    eapol_tx: &EapolTxWorker,
     family: u16,
     ifindex: u32,
     freq: u32,
     out: &crate::ap::Outgoing,
-    stations: &mut Vec<[u8; 6]>,
+    stations: &mut std::collections::HashSet<[u8; 6]>,
+    kernel_stations: &mut std::collections::HashMap<[u8; 6], [u8; 6]>,
+    retiring_stations: &mut std::collections::HashSet<[u8; 6]>,
     keyed: &mut std::collections::HashSet<[u8; 6]>,
+    installed_pairwise_keys: &mut std::collections::HashMap<[u8; 6], Vec<u8>>,
     vlan: &mut VlanState,
     ap: &crate::ap::Ap,
     link_route: &std::collections::HashMap<[u8; 6], u8>,
     link_params: &std::collections::HashMap<u8, ([u8; 6], u32)>,
     wiphy_caps_by_link: &std::collections::HashMap<u8, WiphyCapabilities>,
-    assoc_tx: &mut std::collections::HashMap<[u8; 6], u16>,
+    assoc_tx: &mut std::collections::HashMap<[u8; 6], PendingAssocTx>,
     held_assoc_eapol: &mut std::collections::HashMap<[u8; 6], Vec<u8>>,
 ) {
     for f in &out.frames {
@@ -3854,30 +4973,34 @@ fn route_outputs(
             // Configure only successful responses; rejected associations must
             // never create a kernel station.
             let sta_addr = ap.station_link_for_peer(&d.addr1).unwrap_or(d.addr1);
+            if assoc_succeeded && retiring_stations.contains(&sta_addr) {
+                // A new protocol session raced the teardown of an older kernel
+                // peer with the same address. Do not let it inherit that peer or
+                // its AP_VLAN. Accelerate the final interface deletion, suppress
+                // this success response, and let the client retry after the
+                // generation-tagged cleanup completion releases the address.
+                vlan.begin_retirement(&sta_addr, Instant::now());
+                eprintln!(
+                    "netlink AP: defer association for {} until kernel cleanup completes",
+                    crate::util::bytes_to_mac(&sta_addr),
+                );
+                continue;
+            }
+            if assoc_succeeded && stations.contains(&sta_addr) && keyed.contains(&sta_addr) {
+                // A genuinely new (re)association cannot mutate an authorized
+                // kernel peer in place: it may still own a PTK, replay counters,
+                // and an AP_VLAN. Retire the complete old incarnation first.
+                retiring_stations.insert(sta_addr);
+                vlan.begin_retirement(&sta_addr, Instant::now());
+                eprintln!(
+                    "netlink AP: retire previous kernel session for {} before reassociation",
+                    crate::util::bytes_to_mac(&sta_addr),
+                );
+                continue;
+            }
             if assoc_succeeded && !(stations.contains(&sta_addr) && !keyed.contains(&sta_addr)) {
                 let aid = u16::from_le_bytes([d.body[4], d.body[5]]) & 0x3fff;
                 let mld_mac = ap.mld.then(|| ap.station_mld_mac(&sta_addr)).flatten();
-                // (Re-)association: tear down any prior incarnation of this
-                // station and rebuild it, and drop it from `keyed` so the fresh
-                // 4-way re-installs keys (a rejoining client derives new keys).
-                // A station that previously lived in an AP_VLAN must be removed
-                // from *that* interface, then its VLAN torn down — deleting it on
-                // the main AP leaves a stale station on the old VLAN.
-                let old_vlan = if vlan.enabled {
-                    vlan.map.remove(&sta_addr)
-                } else {
-                    None
-                };
-                match old_vlan {
-                    Some(assignment) => {
-                        nl_del_station(cmd, family, assignment.ifindex, &assignment.sta_addr);
-                        nl_del_iface(cmd, family, assignment.ifindex);
-                    }
-                    None => {
-                        let kernel_addr = mld_mac.unwrap_or(sta_addr);
-                        nl_del_station(cmd, family, ifindex, &kernel_addr);
-                    }
-                }
                 // HT/VHT caps go in SET_STATION (the only place rate control reads
                 // them); NEW_STATION adds the station unassociated first so SET can
                 // apply them without EINVAL. RUSTAP_NO_STA_CAPS=1 disables caps
@@ -3924,7 +5047,16 @@ fn route_outputs(
                 // only during step 3. Associating the primary before step 2 leaves
                 // num_partner_links=0 in WMI; ADD_LINK_STA then succeeds in the
                 // kernel but never enrolls that late peer in firmware scheduling.
-                nl_new_station(cmd, family, ifindex, &sta_addr, mld_mac.as_ref(), link_id);
+                let kernel_addr = mld_mac.unwrap_or(sta_addr);
+                // Record ownership before issuing NEW_STATION. Even an error ACK
+                // may follow a partially-applied driver operation, so every
+                // failure path must schedule idempotent key/station cleanup.
+                kernel_stations.insert(sta_addr, kernel_addr);
+                if !nl_new_station(cmd, family, ifindex, &sta_addr, mld_mac.as_ref(), link_id) {
+                    retiring_stations.insert(sta_addr);
+                    continue;
+                }
+                let mut setup_ok = true;
                 if let Some(mld) = mld_mac {
                     let link_profiles = sta_caps
                         .map(dot11::parse_mld_link_profiles)
@@ -3938,7 +5070,7 @@ fn route_outputs(
                         let profile = link_profiles.iter().find(|profile| {
                             profile.link_id == peer_link_id && profile.mac == peer_link_mac
                         });
-                        nl_add_link_station(
+                        if !nl_add_link_station(
                             cmd,
                             family,
                             ifindex,
@@ -3953,76 +5085,47 @@ fn route_outputs(
                             sta_caps,
                             profile.map(|profile| profile.ies.as_slice()),
                             eml_capability,
-                            ap.is_pmf(),
-                        );
+                            ap.station_uses_pmf(&sta_addr),
+                        ) {
+                            setup_ok = false;
+                            break;
+                        }
                     }
                 }
-                nl_set_station_assoc(
-                    cmd,
-                    family,
-                    ifindex,
-                    &sta_addr,
-                    aid,
-                    listen_interval,
-                    capability,
-                    sta_caps,
-                    mld_mac.as_ref(),
-                    link_id,
-                    eml_capability,
-                    mld_mac.is_some(),
-                    ap.is_pmf(),
-                );
+                if setup_ok {
+                    setup_ok = nl_set_station_assoc(
+                        cmd,
+                        family,
+                        ifindex,
+                        &sta_addr,
+                        aid,
+                        listen_interval,
+                        capability,
+                        sta_caps,
+                        mld_mac.as_ref(),
+                        link_id,
+                        eml_capability,
+                        mld_mac.is_some(),
+                        ap.station_uses_pmf(&sta_addr),
+                    );
+                }
+                if !setup_ok {
+                    retiring_stations.insert(sta_addr);
+                    continue;
+                }
                 keyed.remove(&sta_addr);
-                if !stations.contains(&sta_addr) {
-                    stations.push(sta_addr);
-                }
-                if vlan.enabled {
-                    // Per-station VIF: give this station its own AP_VLAN so its
-                    // group key is isolated from other stations. Match reference AP's
-                    // `<base>.#` naming and lowest-free id allocation.
-                    let (vlan_id, name) = match vlan.allocate() {
-                        Ok(v) => v,
-                        Err(e) => {
-                            eprintln!("netlink AP: allocate per-station VIF failed: {e}");
-                            continue;
-                        }
-                    };
-                    match nl_create_ap_vlan(cmd, family, ifindex, &name) {
-                        Ok(vidx) => {
-                            // cfg80211 stores an MLO peer under its MLD MAC.
-                            // reference AP translates the station identity before
-                            // SET_STATION(STA_VLAN); using the link address here
-                            // returns ENOENT on ath12k.
-                            let kernel_addr = mld_mac.unwrap_or(sta_addr);
-                            if let Err(e) =
-                                nl_set_sta_vlan(cmd, family, ifindex, &kernel_addr, vidx, link_id)
-                            {
-                                eprintln!("netlink AP: set_sta_vlan failed: {e}");
-                                nl_del_iface(cmd, family, vidx);
-                            } else {
-                                vlan.map.insert(
-                                    sta_addr,
-                                    VlanAssignment {
-                                        ifindex: vidx,
-                                        vlan_id,
-                                        ifname: name.clone(),
-                                        sta_addr: kernel_addr,
-                                        retire_at: None,
-                                    },
-                                );
-                                eprintln!(
-                                    "netlink AP: station {} -> {name} (vlan_id {vlan_id}, ifindex {vidx})",
-                                    crate::util::bytes_to_mac(&kernel_addr)
-                                );
-                            }
-                        }
-                        Err(e) => eprintln!("netlink AP: create AP_VLAN {name} failed: {e}"),
-                    }
-                }
+                installed_pairwise_keys.remove(&sta_addr);
+                stations.insert(sta_addr);
             }
             if assoc_succeeded && body.len() >= 24 {
                 let sc = u16::from_le_bytes([body[22], body[23]]);
-                assoc_tx.insert(d.addr1, sc);
+                assoc_tx.insert(
+                    d.addr1,
+                    PendingAssocTx {
+                        sc,
+                        sent_at: Instant::now(),
+                    },
+                );
             }
             // MLD TX translation: send on the client's link, and rewrite the
             // source (addr2 TA + addr3 BSSID) from the canonical `bssid` to that
@@ -4049,7 +5152,7 @@ fn route_outputs(
                 // management-frame TX status is pending; queueing every copy here
                 // would recreate the stale-frame flood this gate is meant to stop.
                 held_assoc_eapol.insert(d.addr1, f.clone());
-                if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+                if crate::util::netlink_debug_enabled() {
                     eprintln!(
                         "netlink AP: hold EAPOL for ASSOC-RESP ACK sta={}",
                         crate::util::bytes_to_mac(&d.addr1)
@@ -4058,15 +5161,19 @@ fn route_outputs(
                 continue;
             }
             let core_sta = ap.station_link_for_peer(&d.addr1).unwrap_or(d.addr1);
+            if retiring_stations.contains(&core_sta) {
+                continue;
+            }
             let mld_mac = ap.mld.then(|| ap.station_mld_mac(&core_sta)).flatten();
             let dst = mld_mac.as_ref().unwrap_or(&d.addr1);
-            // Send the EAPOL on the client's link (the kernel builds the MPDU
-            // with that link's address from the link id). Uses the command socket:
-            // the send is synchronous (NLM_F_ACK) so kernel rejections surface,
-            // and waiting on the event socket would drop frame events.
+            // Match the reference AP's nl80211 driver: control-port EAPOL always
+            // uses the BSS driver's base AP ifindex, even after SET_STA_VLAN
+            // moves the peer's data path to an AP_VLAN. AP_VLAN is not a valid
+            // CONTROL_PORT_FRAME TX interface on mac80211 (EOPNOTSUPP). The
+            // destination MAC and, for MLO, link id select the peer.
             let (_f, link_id) = mld_route(ap, link_route, link_params, freq, &core_sta);
             let eapol = &d.body[8..];
-            nl_send_eapol(cmd, family, ifindex, dst, eapol, link_id);
+            eapol_tx.send(ifindex, *dst, eapol.to_vec(), link_id);
         }
     }
 }

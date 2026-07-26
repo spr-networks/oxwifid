@@ -212,10 +212,11 @@ fn main() {
 }
 
 fn log_startup(cfg: &Config) {
-    // EHT (--phy be) mandates PMF, so a non-MFPR mode is upgraded to WPA3-SAE
-    // (see Config::effective_key_mgmt); report what the AP will actually advertise.
+    // 6 GHz removes PSK AKMs; report the security mode the AP will actually
+    // advertise after that band-specific policy is applied.
     let security = match cfg.effective_key_mgmt() {
         KeyMgmt::Psk => "WPA2-PSK",
+        KeyMgmt::PskSha256 => "WPA2-PSK (PSK + PSK-SHA256)",
         KeyMgmt::Sae => "WPA3-SAE",
         KeyMgmt::SaeTransition => "WPA3-SAE/WPA2 transition",
         KeyMgmt::Owe => "OWE",
@@ -255,6 +256,7 @@ fn run_iface(_node: ApNode, _iface: &str, _channel: u8, _band6: bool) {
 fn run_netlink_config(mut cfg: Config) -> Result<(), String> {
     let ap = cfg.build_ap();
     let extra: Vec<Ap> = cfg.bss.iter().map(|bss| cfg.build_bss_ap(bss)).collect();
+    let ctrl_path = cfg.effective_ctrl_path();
     if !extra.is_empty() {
         eprintln!(
             "barely-ap: {} + {} additional BSS(es)",
@@ -271,7 +273,7 @@ fn run_netlink_config(mut cfg: Config) -> Result<(), String> {
         extra,
         &cfg.iface,
         cfg.channel,
-        cfg.ctrl_path.as_deref(),
+        ctrl_path.as_deref(),
         cfg.psk_file.as_deref(),
         cfg.spr_api_socket.as_deref(),
         cfg.spr_dhcp_helper.as_deref(),

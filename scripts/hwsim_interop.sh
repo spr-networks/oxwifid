@@ -206,7 +206,7 @@ dir_a "A WPA2 CCMP-128 ac" "--phy ac --cipher ccmp-128" psk ccmp-128
 dir_a "A WPA3-SAE ax"      "--phy ax --sae"             sae ccmp-128
 dir_a "A WPA3 CCMP-256 ax" "--phy ax --sae --cipher ccmp-256" sae ccmp-256
 dir_a "A WPA3 GCMP-256 ax" "--phy ax --sae --cipher gcmp-256" sae gcmp-256
-dir_a "A WPA3-SAE-EHT be"  "--phy be"                   sae ccmp-128
+dir_a "A WPA3-SAE-EHT be"  "--phy be --sae"             sae ccmp-128
 dir_a "A OWE ax"           "--phy ax --owe"             owe ccmp-128
 
 # ---------------------------------------------------------------------------

@@ -174,6 +174,35 @@ fn psk_sha256_client_selects_akm6_in_association() {
 }
 
 #[test]
+fn psk_sha256_mlo_stays_fail_closed_without_the_pmf_key_path() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:01");
+    let sta_mac = mac_to_bytes("02:00:00:00:00:02");
+    let mut client = Client::new("uplink", "correct horse battery staple", sta_mac);
+    client.enable_psk_sha256();
+    client.enable_mld(
+        mac_to_bytes("02:00:00:00:10:00"),
+        mac_to_bytes("02:00:00:00:10:02"),
+        mac_to_bytes("02:00:00:00:20:00"),
+    );
+    let beacon = dot11::build_beacon(
+        &ap_mac,
+        b"uplink",
+        36,
+        0,
+        &dot11::RSN_PSK_SHA256,
+        b"US",
+        20,
+        true,
+        dot11::PhyMode::Eht,
+        0,
+    );
+    assert!(
+        client.handle_incoming(&framed(beacon)).frames.is_empty(),
+        "AKM6 MLO must not fall through to the SAE-only association template"
+    );
+}
+
+#[test]
 fn station_pins_authentication_and_association_to_selected_ap() {
     let (mut ap, mut client, ap_mac, sta) = wpa2_pair();
     assert_eq!(client.handle_incoming(&ap.beacon_frame()).frames.len(), 1);
