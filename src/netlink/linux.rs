@@ -3623,12 +3623,17 @@ pub fn run_offload_ap(
         }
 
         // Install keys for any station that just completed the 4-way. Match the
-        // reference per_sta_vif ordering: messages 1-4 run while the station is
-        // still on the base AP, the PTK is installed there, and only then is the
-        // station moved to its private AP_VLAN for its per-station GTK and
-        // authorization. Moving it before message 1 is accepted by hwsim, but
-        // real drivers can then accept CONTROL_PORT_FRAME on the base ifindex
-        // without actually delivering it to the station.
+        // reference per_sta_vif ordering exactly:
+        //
+        //   1. messages 1-4 run on the base AP;
+        //   2. install the PTK and authorize the station on the base AP;
+        //   3. create and group-key the private AP_VLAN;
+        //   4. bind the already-authorized station into the AP_VLAN.
+        //
+        // SET_STA_VLAN changes the peer's data-path attachment. A later
+        // base-ifindex authorization update is not the same operation as
+        // authorizing that peer before the move, so preserve the reference
+        // implementation's ordering instead of relying on driver tolerance.
         key_install_pending.extend(ap.drain_key_ready_stations());
         let mut newly_keyed = false;
         let pending_keys: Vec<[u8; 6]> = key_install_pending.iter().copied().collect();
@@ -3682,15 +3687,25 @@ pub fn run_offload_ap(
                     continue;
                 }
 
+                // reference AP authorizes the kernel station before its
+                // per_sta_vif callback creates and binds the private AP_VLAN.
+                // Keep this ahead of every AP_VLAN operation: the authorization
+                // update is MLD-level state addressed through the base BSS.
+                if !nl_authorize(&mut cmd, family_id, ifindex, key_sta) {
+                    continue;
+                }
+
                 let key_if = if vlan.enabled {
                     if !vlan.map.contains_key(sta) {
-                        // Create the private interface only after m4. Merely
-                        // creating it cannot disturb the station; SET_STA_VLAN
-                        // below is the point where its data path moves.
+                        // Create the private interface only after m4 and base-BSS
+                        // authorization. The station remains on the base AP until
+                        // its group key is installed and SET_STA_VLAN succeeds.
                         let (vlan_id, name) = match vlan.allocate() {
                             Ok(v) => v,
                             Err(e) => {
                                 eprintln!("netlink AP: allocate per-station VIF failed: {e}");
+                                retiring_stations.insert(*sta);
+                                key_install_pending.remove(sta);
                                 continue;
                             }
                         };
@@ -3705,6 +3720,8 @@ pub fn run_offload_ap(
                             Ok(vidx) => vidx,
                             Err(e) => {
                                 eprintln!("netlink AP: create AP_VLAN {name} failed: {e}");
+                                retiring_stations.insert(*sta);
+                                key_install_pending.remove(sta);
                                 continue;
                             }
                         };
@@ -3728,44 +3745,6 @@ pub fn run_offload_ap(
                                 interface_cleanup_id: None,
                                 interface_retry_at: None,
                             },
-                        );
-                        // cfg80211 stores an MLO peer under its MLD MAC. Match
-                        // the reference AP and bind the AP_VLAN on every
-                        // negotiated MLO link; binding only the association
-                        // link leaves partner-link traffic on the base BSS.
-                        let vlan_links = per_station_link_ids(
-                            ap.mld,
-                            mld_mac.is_some(),
-                            assoc_link_id,
-                            ap.station_mld_link_ids(sta),
-                        );
-                        let mut vlan_bind_error = None;
-                        for &link_id in &vlan_links {
-                            if let Err(e) = nl_set_sta_vlan(
-                                &mut cmd,
-                                family_id,
-                                ifindex,
-                                &kernel_addr,
-                                vidx,
-                                link_id,
-                            ) {
-                                vlan_bind_error = Some((link_id, e));
-                                break;
-                            }
-                        }
-                        if let Some((link_id, e)) = vlan_bind_error {
-                            eprintln!("netlink AP: set_sta_vlan link={link_id:?} failed: {e}");
-                            retiring_stations.insert(*sta);
-                            vlan.begin_retirement(sta, Instant::now());
-                            continue;
-                        }
-                        vlan.map
-                            .get_mut(sta)
-                            .expect("new AP_VLAN reservation")
-                            .station_may_be_on_base = false;
-                        eprintln!(
-                            "netlink AP: station {} -> {name} (vlan_id {vlan_id}, ifindex {vidx}, links={vlan_links:?})",
-                            crate::util::bytes_to_mac(&kernel_addr),
                         );
                     }
                     vlan.map
@@ -3806,19 +3785,64 @@ pub fn run_offload_ap(
                         vlan_gtk.insert((*sta, link_id), (gidx, gkey));
                     }
                     if !group_keys_ok {
+                        // The station is already authorized on the base AP.
+                        // Never leave it there after private-VIF setup failed.
+                        retiring_stations.insert(*sta);
+                        vlan.begin_retirement(sta, Instant::now());
+                        key_install_pending.remove(sta);
                         continue;
                     }
-                }
-                // Authorization is MLD-level state. Match reference AP: select an
-                // MLO peer by its MLD MAC and issue one plain SET_STATION,
-                // without MLO_LINK_ID/MLD_ADDR and without MODIFY_LINK_STA on
-                // partner links. Applying AUTHORIZED/WME/MFP to link stations
-                // can leave ath12k's data scheduler anchored to the association
-                // link even though the partner station was added successfully.
-                // The reference driver also addresses SET_STATION through the
-                // base BSS after STA_VLAN has moved the peer.
-                if !nl_authorize(&mut cmd, family_id, ifindex, key_sta) {
-                    continue;
+
+                    // cfg80211 stores an MLO peer under its MLD MAC. Match the
+                    // reference AP and bind the already-authorized station on
+                    // every negotiated MLO link only after the AP_VLAN GTK is
+                    // ready. Binding only the association link leaves partner
+                    // traffic on the base BSS.
+                    let assignment = vlan
+                        .map
+                        .get(sta)
+                        .expect("AP_VLAN reservation must exist before binding");
+                    if assignment.station_may_be_on_base {
+                        let vidx = assignment.ifindex;
+                        let vlan_id = assignment.vlan_id;
+                        let name = assignment.ifname.clone();
+                        let kernel_addr = assignment.sta_addr;
+                        let vlan_links = per_station_link_ids(
+                            ap.mld,
+                            mld_mac.is_some(),
+                            assoc_link_id,
+                            ap.station_mld_link_ids(sta),
+                        );
+                        let mut vlan_bind_error = None;
+                        for &link_id in &vlan_links {
+                            if let Err(e) = nl_set_sta_vlan(
+                                &mut cmd,
+                                family_id,
+                                ifindex,
+                                &kernel_addr,
+                                vidx,
+                                link_id,
+                            ) {
+                                vlan_bind_error = Some((link_id, e));
+                                break;
+                            }
+                        }
+                        if let Some((link_id, e)) = vlan_bind_error {
+                            eprintln!("netlink AP: set_sta_vlan link={link_id:?} failed: {e}");
+                            retiring_stations.insert(*sta);
+                            vlan.begin_retirement(sta, Instant::now());
+                            key_install_pending.remove(sta);
+                            continue;
+                        }
+                        vlan.map
+                            .get_mut(sta)
+                            .expect("bound AP_VLAN reservation")
+                            .station_may_be_on_base = false;
+                        eprintln!(
+                            "netlink AP: station {} -> {name} (vlan_id {vlan_id}, ifindex {vidx}, links={vlan_links:?})",
+                            crate::util::bytes_to_mac(&kernel_addr),
+                        );
+                    }
                 }
                 keyed.insert(*sta);
                 key_install_pending.remove(sta);

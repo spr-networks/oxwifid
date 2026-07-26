@@ -544,17 +544,17 @@ fn eapol_message_2_must_match_association_rsn() {
         .unwrap();
     let mut mismatched_rsn = dot11::RSN.to_vec();
     *mismatched_rsn.last_mut().unwrap() ^= 0x10;
-    let mismatched_m2 = dot11::build_eapol_m2(
-        &ap_mac,
-        &sta,
-        &snonce,
-        &kck,
-        &mismatched_rsn,
-        1,
-        0,
-        dot11::KeyMic::select(false, false),
-        None,
-    );
+    let mismatched_m2 = dot11::build_eapol_m2(dot11::EapolM2Params {
+        bssid: &ap_mac,
+        sta: &sta,
+        snonce: &snonce,
+        kck: &kck,
+        supp_rsn: &mismatched_rsn,
+        replay_counter: 1,
+        sc: 0,
+        mic: dot11::KeyMic::select(false, false),
+        oci: None,
+    });
     assert!(
         ap.handle_incoming(&framed(mismatched_m2)).frames.is_empty(),
         "M2 with a different RSNE must not advance to M3"
@@ -600,17 +600,17 @@ fn encrypted_m2_is_rejected_before_key_unwrap() {
     let mic = dot11::KeyMic::select(false, false).compute(&kck, &wrap_eapol(&body));
     body[77..93].copy_from_slice(&mic);
 
-    let normal_m2 = dot11::build_eapol_m2(
-        &ap_mac,
-        &sta,
-        &snonce,
-        &kck,
-        &dot11::RSN,
-        1,
-        0,
-        dot11::KeyMic::select(false, false),
-        None,
-    );
+    let normal_m2 = dot11::build_eapol_m2(dot11::EapolM2Params {
+        bssid: &ap_mac,
+        sta: &sta,
+        snonce: &snonce,
+        kck: &kck,
+        supp_rsn: &dot11::RSN,
+        replay_counter: 1,
+        sc: 0,
+        mic: dot11::KeyMic::select(false, false),
+        oci: None,
+    });
     let mut encrypted_m2 = normal_m2[..32].to_vec();
     encrypted_m2.extend_from_slice(&wrap_eapol(&body));
     assert!(
@@ -848,17 +848,17 @@ fn begin_wpa2(ap: &mut Ap) {
 }
 
 fn send_m2(ap: &mut Ap, snonce: &[u8; 32], kck: &[u8]) -> Vec<Vec<u8>> {
-    let frame = dot11::build_eapol_m2(
-        &mac_to_bytes("02:00:00:00:00:00"),
-        &mac_to_bytes("02:00:00:00:ab:cd"),
+    let frame = dot11::build_eapol_m2(dot11::EapolM2Params {
+        bssid: &mac_to_bytes("02:00:00:00:00:00"),
+        sta: &mac_to_bytes("02:00:00:00:ab:cd"),
         snonce,
         kck,
-        &dot11::RSN,
-        1,
-        0,
-        dot11::KeyMic::select(false, false),
-        None,
-    );
+        supp_rsn: &dot11::RSN,
+        replay_counter: 1,
+        sc: 0,
+        mic: dot11::KeyMic::select(false, false),
+        oci: None,
+    });
     ap.handle_incoming(&framed(frame)).frames
 }
 
@@ -1152,17 +1152,17 @@ fn a_second_four_way_does_not_reset_the_packet_number_under_the_old_key() {
     // the transmit packet number must NOT restart while the old TK is still the
     // transmit key, which would replay CCMP nonces under a key that has already
     // used them.
-    let m2 = dot11::build_eapol_m2(
-        &ap_mac,
-        &sta,
-        &snonce,
-        &kck,
-        &dot11::RSN,
-        m1_replay,
-        0,
-        dot11::KeyMic::select(false, false),
-        None,
-    );
+    let m2 = dot11::build_eapol_m2(dot11::EapolM2Params {
+        bssid: &ap_mac,
+        sta: &sta,
+        snonce: &snonce,
+        kck: &kck,
+        supp_rsn: &dot11::RSN,
+        replay_counter: m1_replay,
+        sc: 0,
+        mic: dot11::KeyMic::select(false, false),
+        oci: None,
+    });
     assert_eq!(ap.handle_incoming(&framed(m2)).frames.len(), 1, "m2 -> m3");
     assert_eq!(
         ap.station_tk(&sta).expect("still keyed"),

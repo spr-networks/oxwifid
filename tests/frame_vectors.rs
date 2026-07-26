@@ -1054,22 +1054,22 @@ fn eapol_m3_matches() {
     let kck = from_hex(f["kck"].as_str().unwrap());
     let kek = from_hex(f["kek"].as_str().unwrap());
     let gtk = from_hex(f["gtk"].as_str().unwrap());
-    let built = dot11::build_eapol_m3(
-        &mac6("02:00:00:00:00:00"),
-        &mac6(f["sta"].as_str().unwrap()),
-        &anonce,
-        &kck,
-        &kek,
-        &dot11::RSN,
-        1,
-        &gtk,
-        None,
-        None,
-        None,
-        2,
-        48,
-        dot11::KeyMic::HmacSha1,
-    );
+    let built = dot11::build_eapol_m3(dot11::EapolM3Params {
+        bssid: &mac6("02:00:00:00:00:00"),
+        sta: &mac6(f["sta"].as_str().unwrap()),
+        anonce: &anonce,
+        kck: &kck,
+        kek: &kek,
+        ap_rsn: &dot11::RSN,
+        gtk_key_id: 1,
+        gtk: &gtk,
+        igtk: None,
+        bigtk: None,
+        oci: None,
+        replay_counter: 2,
+        sc: 48,
+        mic: dot11::KeyMic::HmacSha1,
+    });
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
 }
 

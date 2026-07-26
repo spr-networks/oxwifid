@@ -6,19 +6,32 @@ use crate::group_keys::{gtk_kde, igtk_kde, mlo_bigtk_kde, mlo_gtk_kde_with_pn, m
 use crate::structures::security::{KeyInfo, KeyMic};
 use zeroize::Zeroize;
 
-#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields/KDEs.
-pub fn build_group_key_msg1(
-    bssid: &[u8; 6],
-    sta: &[u8; 6],
-    kck: &[u8],
-    kek: &[u8],
-    gtk_key_id: u8,
-    gtk: &[u8],
-    igtk: Option<(u16, [u8; 6], [u8; 16])>,
-    replay: u64,
-    sc: u16,
-    mic: KeyMic,
-) -> Vec<u8> {
+pub struct GroupKeyMsg1Params<'a> {
+    pub bssid: &'a [u8; 6],
+    pub sta: &'a [u8; 6],
+    pub kck: &'a [u8],
+    pub kek: &'a [u8],
+    pub gtk_key_id: u8,
+    pub gtk: &'a [u8],
+    pub igtk: Option<(u16, [u8; 6], [u8; 16])>,
+    pub replay: u64,
+    pub sc: u16,
+    pub mic: KeyMic,
+}
+
+pub fn build_group_key_msg1(params: GroupKeyMsg1Params<'_>) -> Vec<u8> {
+    let GroupKeyMsg1Params {
+        bssid,
+        sta,
+        kck,
+        kek,
+        gtk_key_id,
+        gtk,
+        igtk,
+        replay,
+        sc,
+        mic,
+    } = params;
     build_group_key_msg1_with_rsc(
         bssid, sta, kck, kek, gtk_key_id, gtk, 0, igtk, replay, sc, mic,
     )
