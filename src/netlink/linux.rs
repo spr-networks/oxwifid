@@ -3313,7 +3313,7 @@ pub fn run_offload_ap(
                                 &mut keyed,
                                 &mut installed_pairwise_keys,
                                 &mut vlan,
-                                &ap,
+                                &mut ap,
                                 &link_route,
                                 &link_params,
                                 &wiphy_caps_by_link,
@@ -3518,7 +3518,7 @@ pub fn run_offload_ap(
                     &mut keyed,
                     &mut installed_pairwise_keys,
                     &mut vlan,
-                    &ap,
+                    &mut ap,
                     &link_route,
                     &link_params,
                     &wiphy_caps_by_link,
@@ -3570,7 +3570,7 @@ pub fn run_offload_ap(
                     &mut keyed,
                     &mut installed_pairwise_keys,
                     &mut vlan,
-                    &ap,
+                    &mut ap,
                     &link_route,
                     &link_params,
                     &wiphy_caps_by_link,
@@ -3600,7 +3600,7 @@ pub fn run_offload_ap(
                 &mut keyed,
                 &mut installed_pairwise_keys,
                 &mut vlan,
-                &ap,
+                &mut ap,
                 &link_route,
                 &link_params,
                 &wiphy_caps_by_link,
@@ -4073,7 +4073,7 @@ pub fn run_offload_ap(
                     &mut keyed,
                     &mut installed_pairwise_keys,
                     &mut vlan,
-                    &ap,
+                    &mut ap,
                     &link_route,
                     &link_params,
                     &wiphy_caps_by_link,
@@ -4960,7 +4960,7 @@ fn route_outputs(
     keyed: &mut std::collections::HashSet<[u8; 6]>,
     installed_pairwise_keys: &mut std::collections::HashMap<[u8; 6], Vec<u8>>,
     vlan: &mut VlanState,
-    ap: &crate::ap::Ap,
+    ap: &mut crate::ap::Ap,
     link_route: &std::collections::HashMap<[u8; 6], u8>,
     link_params: &std::collections::HashMap<u8, ([u8; 6], u32)>,
     wiphy_caps_by_link: &std::collections::HashMap<u8, WiphyCapabilities>,
@@ -5000,8 +5000,12 @@ fn route_outputs(
                 // A new protocol session raced the teardown of an older kernel
                 // peer with the same address. Do not let it inherit that peer or
                 // its AP_VLAN. Accelerate the final interface deletion, suppress
-                // this success response, and let the client retry after the
-                // generation-tagged cleanup completion releases the address.
+                // this success response, cancel the userspace 4-way prepared
+                // alongside it, and let the client retry after the generation-
+                // tagged cleanup completion releases the address.
+                assoc_tx.remove(&d.addr1);
+                held_assoc_eapol.remove(&d.addr1);
+                ap.note_assoc_response_not_acked(&sta_addr);
                 vlan.begin_retirement(&sta_addr, Instant::now());
                 eprintln!(
                     "netlink AP: defer association for {} until kernel cleanup completes",
@@ -5013,6 +5017,9 @@ fn route_outputs(
                 // A genuinely new (re)association cannot mutate an authorized
                 // kernel peer in place: it may still own a PTK, replay counters,
                 // and an AP_VLAN. Retire the complete old incarnation first.
+                assoc_tx.remove(&d.addr1);
+                held_assoc_eapol.remove(&d.addr1);
+                ap.note_assoc_response_not_acked(&sta_addr);
                 retiring_stations.insert(sta_addr);
                 vlan.begin_retirement(&sta_addr, Instant::now());
                 eprintln!(

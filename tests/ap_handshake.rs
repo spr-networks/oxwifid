@@ -324,6 +324,60 @@ fn unacked_assoc_response_cancels_speculative_eapol() {
     ap.note_assoc_response_not_acked(&sta);
     ap.test_expire_eapol();
     assert!(ap.tick().frames.is_empty());
+    assert!(
+        ap.drain_events().is_empty(),
+        "cancelling an unsent speculative m1 must not disconnect the station"
+    );
+
+    // Authentication/session state is retained: after the transport finishes
+    // cleaning the old kernel peer and the normal 250-ms request backoff has
+    // elapsed, the client's Association retry can restart the 4-way without
+    // another Authentication exchange.
+    ap.test_clear_auth_backoff();
+    let retry = ap.handle_incoming(&assoc_req);
+    assert_eq!(
+        retry.frames.len(),
+        2,
+        "association retry must produce a fresh response and m1"
+    );
+}
+
+#[test]
+fn cancelling_a_suppressed_reassociation_preserves_the_established_session() {
+    let v = vectors();
+    let sta = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = connected_ap(false);
+    assert_eq!(ap.drain_events().len(), 1, "consume initial connect event");
+    ap.test_clear_auth_backoff();
+
+    let assoc_req = from_hex(v["incoming"]["assoc_req"]["bytes"].as_str().unwrap());
+    let prepared = ap.handle_incoming(&assoc_req);
+    assert_eq!(
+        prepared.frames.len(),
+        2,
+        "reassociation prepares a response and a new m1"
+    );
+
+    ap.note_assoc_response_not_acked(&sta);
+    assert!(
+        ap.is_associated(&sta),
+        "cancelling the new attempt must not disconnect the old association"
+    );
+    assert!(
+        ap.drain_events().is_empty(),
+        "cancellation must not emit a disconnect event"
+    );
+
+    let mut downlink = Vec::new();
+    downlink.extend_from_slice(&sta);
+    downlink.extend_from_slice(&mac_to_bytes("02:00:00:00:00:00"));
+    downlink.extend_from_slice(&[0x08, 0x00]);
+    downlink.extend_from_slice(b"old association remains usable until cleanup");
+    assert_eq!(
+        ap.deliver_to_station(&downlink).len(),
+        1,
+        "the established PTK must remain usable"
+    );
 }
 
 /// Complete the golden handshake against a fresh AP, optionally in guest mode.
