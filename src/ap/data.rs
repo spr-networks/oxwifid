@@ -37,13 +37,18 @@ impl Ap {
             }
         };
 
-        // CCMP replay protection: the packet number must strictly increase.
+        // CCMP replay protection: the packet number must strictly increase
+        // within its own traffic identifier. The transmitter runs one PN
+        // sequence per TID, so a single station-wide counter would reject
+        // perfectly valid frames as soon as two access categories interleave
+        // (e.g. a voice frame arriving between two best-effort ones).
         let pn = match frame.ccmp_pn() {
             Some(p) => p,
             None => return,
         };
+        let replay_index = frame.qos.map_or(16, |q| usize::from(q & 0x000f));
         if let Some(s) = self.stations.get(&sta) {
-            if pn <= s.last_rx_pn {
+            if pn <= s.last_rx_pn[replay_index] {
                 return; // replayed / out-of-order frame
             }
         }
@@ -59,7 +64,7 @@ impl Ap {
             // sanity: source MAC in the Ethernet frame must match the station
             Some(eth) if eth.len() >= 12 && eth[6..12] == sta => {
                 if let Some(s) = self.stations.get_mut(&sta) {
-                    s.last_rx_pn = pn;
+                    s.last_rx_pn[replay_index] = pn;
                 }
                 // Guest BSS client isolation: a frame addressed to another of
                 // this AP's stations must not be carried. It still counts for

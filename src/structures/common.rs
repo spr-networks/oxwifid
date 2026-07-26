@@ -125,9 +125,21 @@ impl Dot11 {
         (self.fc1 & 0x04) != 0 || (self.sc & 0x000F) != 0
     }
 
-    /// `true` if this is an EAPOL frame (LLC/SNAP with ethertype 0x888E).
+    /// `true` if this is an EAPOL frame: an unprotected Data frame whose payload
+    /// is LLC/SNAP with ethertype 0x888E.
+    ///
+    /// Only Data frames carry an LLC/SNAP payload, so the frame type belongs in
+    /// the test — otherwise the SNAP header and an EAPOL-Key body placed in a
+    /// Management frame's body are parsed as a key message on the uncontrolled
+    /// port. The Protected check is redundant defence rather than a fix for a
+    /// reachable case (a CCMP header always sets ext_iv, so its fourth octet is
+    /// never the 0x00 the SNAP match requires); it states the invariant that a
+    /// protected payload is ciphertext, and lets each receiver order its
+    /// protected-data and EAPOL branches freely.
     pub fn is_eapol(&self) -> bool {
-        self.body.len() >= 8
+        self.frame_type() == TYPE_DATA
+            && !self.protected()
+            && self.body.len() >= 8
             && self.body[..6] == [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00]
             && self.body[6..8] == ETHERTYPE_EAPOL.to_be_bytes()
     }

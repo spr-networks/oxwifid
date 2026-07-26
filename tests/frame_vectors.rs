@@ -1167,6 +1167,10 @@ fn mld_group_rekey_carries_every_link_without_legacy_kdes() {
     );
     let frame = dot11::Dot11::parse(&built).unwrap();
     let ek = dot11::EapolKey::parse(frame.eapol_key_body().unwrap()).unwrap();
+    assert_eq!(
+        ek.key_length, 0,
+        "RSN Group Key message 1 carries the GTK length in its KDE"
+    );
     let unwrapped = crypto::aes_unwrap(&kek, &ek.key_data).expect("group key data unwraps");
 
     assert_eq!(dot11::parse_gtk_kde_full(&unwrapped), None);

@@ -92,6 +92,37 @@ fn wpa3_sae_h2e_full_handshake_and_ping() {
     );
 }
 
+#[test]
+fn asynchronous_sae_worker_preserves_exchange_order() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:ce");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    ap.enable_sae();
+    ap.enable_async_sae();
+    let mut sta = Client::new("turtlenet", "password1234", sta_mac);
+    sta.enable_sae();
+
+    let mut to_client = vec![ap.beacon_frame()];
+    let mut to_ap = Vec::new();
+    for _ in 0..250 {
+        for frame in to_client.drain(..) {
+            to_ap.extend(sta.handle_incoming(&frame).frames);
+        }
+        let mut next = Vec::new();
+        for frame in to_ap.drain(..) {
+            next.extend(ap.handle_incoming(&frame).frames);
+        }
+        next.extend(ap.tick().frames);
+        to_client = next;
+        if sta.connected >= 4 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(sta.connected, 4);
+    assert!(ap.is_associated(&sta_mac));
+}
+
 fn run_sae(mut sta: Client) -> (Ap, FakeNet, Client) {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
@@ -164,6 +195,38 @@ fn mld_assoc_req(sta: [u8; 6], sta_mld: [u8; 6], profiles: &[(u8, [u8; 6])]) -> 
     let mut framed = dot11::RADIOTAP_TX.to_vec();
     framed.extend_from_slice(&frame);
     framed
+}
+
+#[test]
+fn negotiated_mld_links_start_with_the_actual_association_link() {
+    let mut ap = mld_ap_for_tests();
+    let sta_link1 = mac_to_bytes("02:11:22:33:44:11");
+    let sta_link0 = mac_to_bytes("02:11:22:33:44:10");
+    let sta_mld = mac_to_bytes("02:11:22:33:44:1f");
+
+    // Netlink canonicalizes the frame addresses to AP link 0 before handing
+    // the frame to the state machine, while preserving the real RX link here.
+    ap.set_mgmt_rx_link(Some(1));
+    open_auth(&mut ap, sta_link1);
+
+    let link_info = dot11::per_sta_profile(0, &sta_link0, &[0x30, 0x04]);
+    let mut assoc = dot11::build_assoc_req(
+        &mac_to_bytes("02:00:00:00:10:01"),
+        &sta_link1,
+        b"turtlenet",
+        0x20,
+    );
+    assoc.extend_from_slice(&dot11::multi_link_ap_basic(&sta_mld, 1, 0, 1, &link_info));
+    let mut framed = dot11::RADIOTAP_TX.to_vec();
+    framed.append(&mut assoc);
+
+    let out = ap.handle_incoming(&framed);
+    assert_eq!(assoc_status(&out.frames[0]), dot11::STATUS_SUCCESS);
+    assert_eq!(
+        ap.station_mld_link_ids(&sta_link1),
+        vec![0, 1],
+        "GTK delivery and kernel installation must cover the partner and active association link"
+    );
 }
 
 fn mld_assoc_req_pmkid(
@@ -894,6 +957,98 @@ fn transition_mode_accepts_both_wpa2_and_wpa3_clients() {
         );
         assert!(ap.is_associated(&sta_mac));
     }
+}
+
+#[test]
+fn legacy_wpa2_on_mld_transition_uses_the_selected_link_bssid_for_ptk() {
+    let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
+    let ap_link1 = mac_to_bytes("02:00:00:00:10:02");
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = mld_ap_for_tests();
+    ap.enable_transition();
+    let mut net = FakeNet::new(ap_link1, [10, 10, 10, 1]);
+    let mut sta = Client::new("turtlenet", "password1234", sta_mac);
+
+    // The core keeps one canonical AP address. The netlink boundary translates
+    // link-1 frames to/from that address while preserving mgmt_rx_link=1.
+    let translate = |frame: &mut Vec<u8>, ap_to_sta: bool| {
+        let body_len = dot11::strip_radiotap(frame).expect("802.11 frame").len();
+        let off = frame.len() - body_len;
+        if body_len < 22 {
+            return;
+        }
+        if ap_to_sta {
+            frame[off + 10..off + 16].copy_from_slice(&ap_link1);
+            frame[off + 16..off + 22].copy_from_slice(&ap_link1);
+        } else {
+            frame[off + 4..off + 10].copy_from_slice(&ap_link0);
+            frame[off + 16..off + 22].copy_from_slice(&ap_link0);
+        }
+    };
+
+    let link1 = ap
+        .active_mld_links()
+        .into_iter()
+        .find(|link| link.link_id == 1)
+        .expect("link 1");
+    let mut to_client = vec![ap.beacon_frame_unprotected_for_link(&link1)];
+    let mut to_ap = Vec::new();
+    let mut rounds = 0;
+    while sta.connected < 4 && rounds < 60 {
+        rounds += 1;
+        for frame in to_client.drain(..) {
+            to_ap.extend(sta.handle_incoming(&frame).frames);
+        }
+        let mut next_to_client = Vec::new();
+        for mut frame in to_ap.drain(..) {
+            ap.set_mgmt_rx_link(Some(1));
+            translate(&mut frame, false);
+            for mut response in ap_step(&mut ap, &mut net, &frame) {
+                translate(&mut response, true);
+                next_to_client.push(response);
+            }
+        }
+        to_client = next_to_client;
+    }
+
+    assert_eq!(
+        sta.connected, 4,
+        "legacy WPA2 must complete on MLD link 1 (rounds={rounds})"
+    );
+    assert!(ap.is_associated(&sta_mac));
+}
+
+#[test]
+fn transition_mode_negotiates_optional_pmf_per_wpa2_station() {
+    const RSN_PSK_PMF: [u8; 28] = [
+        0x30, 0x1a, // id 48, len 26
+        0x01, 0x00, // version
+        0x00, 0x0f, 0xac, 0x04, // group CCMP
+        0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, // one pairwise CCMP
+        0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, // one AKM: PSK
+        0x80, 0x00, // MFPC, but not MFPR
+        0x00, 0x00, // PMKID count
+        0x00, 0x0f, 0xac, 0x06, // BIP-CMAC-128
+    ];
+
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    ap.enable_transition();
+
+    let mut assoc = dot11::build_assoc_req(&ap_mac, &sta_mac, b"turtlenet", 0);
+    assert!(assoc.ends_with(&dot11::RSN));
+    assoc.truncate(assoc.len() - dot11::RSN.len());
+    assoc.extend_from_slice(&RSN_PSK_PMF);
+    let mut frame = dot11::RADIOTAP_TX.to_vec();
+    frame.extend_from_slice(&assoc);
+
+    let out = ap.handle_incoming(&frame);
+    assert_eq!(out.frames.len(), 2, "association response plus message 1");
+    assert!(
+        ap.station_uses_pmf(&sta_mac),
+        "a WPA2 station that selects optional PMF must receive an IGTK"
+    );
 }
 
 #[test]

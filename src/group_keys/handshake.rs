@@ -6,6 +6,7 @@ use crate::group_keys::{gtk_kde, igtk_kde, mlo_bigtk_kde, mlo_gtk_kde_with_pn, m
 use crate::structures::security::{KeyInfo, KeyMic};
 use zeroize::Zeroize;
 
+#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields/KDEs.
 pub fn build_group_key_msg1(
     bssid: &[u8; 6],
     sta: &[u8; 6],
@@ -55,10 +56,13 @@ pub fn build_group_key_msg1_with_rsc(
         key_descriptor_type_version: mic.version(),
     };
     let zero_nonce = [0u8; 32];
+    // RSN Group Key message 1 has a zero Key Length. The GTK length lives in
+    // the encrypted KDE; 16 is the WPA (not RSN) encoding and strict clients
+    // such as iOS reject it without returning message 2.
     let body0 =
-        build_eapol_key_body_with_rsc(ki, 16, replay, &zero_nonce, key_rsc, &[0u8; 16], &keydata);
+        build_eapol_key_body_with_rsc(ki, 0, replay, &zero_nonce, key_rsc, &[0u8; 16], &keydata);
     let mic = mic.compute(kck, &eapol_wrap(&body0));
-    let body = build_eapol_key_body_with_rsc(ki, 16, replay, &zero_nonce, key_rsc, &mic, &keydata);
+    let body = build_eapol_key_body_with_rsc(ki, 0, replay, &zero_nonce, key_rsc, &mic, &keydata);
     let mut frame = eapol_data_header(bssid, sta, sc);
     frame.extend_from_slice(&eapol_wrap(&body));
     frame
@@ -134,10 +138,12 @@ pub fn build_group_key_msg1_mld_with_rsc(
         key_descriptor_type_version: mic.version(),
     };
     let zero_nonce = [0u8; 32];
+    // As above, RSN Group Key message 1 carries zero in Key Length even for an
+    // MLD; each MLO GTK KDE describes its own key material.
     let body0 =
-        build_eapol_key_body_with_rsc(ki, 16, replay, &zero_nonce, key_rsc, &[0u8; 16], &keydata);
+        build_eapol_key_body_with_rsc(ki, 0, replay, &zero_nonce, key_rsc, &[0u8; 16], &keydata);
     let mic = mic.compute(kck, &eapol_wrap(&body0));
-    let body = build_eapol_key_body_with_rsc(ki, 16, replay, &zero_nonce, key_rsc, &mic, &keydata);
+    let body = build_eapol_key_body_with_rsc(ki, 0, replay, &zero_nonce, key_rsc, &mic, &keydata);
     let mut frame = eapol_data_header(bssid, sta, sc);
     frame.extend_from_slice(&eapol_wrap(&body));
     frame

@@ -217,6 +217,27 @@ fn periodic_group_rekey_fires_on_tick() {
 }
 
 #[test]
+fn periodic_group_rekey_clock_advances_while_idle() {
+    let (mut ap, _net) = wpa3_ap();
+    ap.set_group_rekey(1);
+    ap.test_expire_group_rekey();
+    let old = ap.gtk();
+
+    let out = ap.tick();
+
+    assert!(out.frames.is_empty(), "there are no stations to notify");
+    assert_ne!(
+        ap.gtk(),
+        old,
+        "the idle BSS still advances its periodic group-key clock"
+    );
+    assert!(
+        ap.tick().frames.is_empty(),
+        "the first future association must not inherit an overdue rekey"
+    );
+}
+
+#[test]
 fn disabling_periodic_rekey_stops_it() {
     let (mut ap, _net, _sta) = wpa3_up();
     ap.set_group_rekey(0); // disabled
@@ -270,6 +291,38 @@ fn no_strict_rekey_when_last_station_leaves() {
         old,
         "no strict rekey when the last station leaves"
     );
+}
+
+#[test]
+fn fresh_auth_cancels_stale_group_rekey_state() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
+    let mut old_a = Client::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:00:01"),
+    );
+    let mut b = Client::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:00:02"),
+    );
+    connect(&mut ap, &mut net, &mut old_a);
+    connect(&mut ap, &mut net, &mut b);
+
+    // Start a strict/periodic-style group rekey, but race a fresh
+    // Authentication from A ahead of its Group-Key message 2. The new session's
+    // four-way M2 must not be parsed as an ACK for the obsolete group exchange.
+    assert_eq!(ap.rekey_gtk().len(), 2);
+    ap.test_clear_auth_backoff();
+    let mut new_a = Client::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:00:01"),
+    );
+    connect(&mut ap, &mut net, &mut new_a);
+    assert!(ap.is_associated(&new_a.mac));
 }
 
 /// Per-STA-VIF: a group rekey must rotate EACH station's OWN per-station GTK
@@ -349,5 +402,371 @@ fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
         a.gtk(),
         b.gtk(),
         "post-rekey, the two stations still hold different GTKs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pairwise (PTK) rekeying — an authenticator may restart the 4-way at any time
+// on an established link. The station must answer it, must keep the installed
+// key carrying traffic until the new one is authenticated, and must not let an
+// unauthenticated message 1 disturb either.
+// ---------------------------------------------------------------------------
+
+fn framed(frame: Vec<u8>) -> Vec<u8> {
+    let mut out = dot11::RADIOTAP_TX.to_vec();
+    out.extend_from_slice(&frame);
+    out
+}
+
+/// A plain WPA2 pair, connected. WPA2 (no PMF) is what lets a bare Association
+/// Request drive the AP into a second 4-way; under PMF the AP answers that with
+/// an SA Query instead, which is a different test.
+fn wpa2_up() -> (Ap, FakeNet, Client) {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
+    let mut sta = Client::new(
+        "turtlenet",
+        "password1234",
+        mac_to_bytes("02:00:00:00:ab:cd"),
+    );
+    connect(&mut ap, &mut net, &mut sta);
+    (ap, net, sta)
+}
+
+/// Whether a downlink frame the AP encrypts under its installed PTK still
+/// decrypts at the station — i.e. both ends agree on the live pairwise key.
+fn downlink_round_trips(ap: &mut Ap, sta: &mut Client) -> bool {
+    let bssid = sta.bssid().expect("associated");
+    let eth = [
+        sta.mac.as_slice(),
+        bssid.as_slice(),
+        &[0x08, 0x00],
+        b"downlink probe",
+    ]
+    .concat();
+    let frames = ap.deliver_to_station(&eth);
+    frames.len() == 1 && sta.handle_incoming(&frames[0]).to_network == vec![eth]
+}
+
+fn uplink_round_trips(ap: &mut Ap, sta: &mut Client) -> bool {
+    let bssid = sta.bssid().expect("associated");
+    let eth = [
+        bssid.as_slice(),
+        sta.mac.as_slice(),
+        &[0x08, 0x00],
+        b"uplink probe",
+    ]
+    .concat();
+    match sta.encrypt_uplink(&eth) {
+        Some(protected) => ap.handle_incoming(&protected).to_network == vec![eth],
+        None => false,
+    }
+}
+
+/// Make the AP start a second 4-way for an already-associated station and
+/// return the frames it emits (Association Response + message 1).
+fn start_ptk_rekey(ap: &mut Ap, sta: &Client) -> Vec<Vec<u8>> {
+    ap.test_clear_auth_backoff();
+    let assoc = dot11::build_assoc_req_for_cipher(
+        &sta.bssid().expect("associated"),
+        &sta.mac,
+        b"turtlenet",
+        0,
+        dot11::DataCipher::Ccmp128,
+    );
+    ap.handle_incoming(&framed(assoc)).frames
+}
+
+fn pump(ap: &mut Ap, net: &mut FakeNet, sta: &mut Client, mut to_sta: Vec<Vec<u8>>) {
+    for _ in 0..10 {
+        if to_sta.is_empty() {
+            break;
+        }
+        let mut to_ap = Vec::new();
+        for f in to_sta.drain(..) {
+            to_ap.extend(sta.handle_incoming(&f).frames);
+        }
+        for f in to_ap.drain(..) {
+            to_sta.extend(ap_step(ap, net, &f));
+        }
+    }
+}
+
+#[test]
+fn ap_initiated_ptk_rekey_replaces_the_key_without_dropping_the_link() {
+    let (mut ap, mut net, mut sta) = wpa2_up();
+    let sta_mac = sta.mac;
+    let old_tk = ap.station_tk(&sta_mac).expect("pairwise key installed");
+
+    let to_sta = start_ptk_rekey(&mut ap, &sta);
+    pump(&mut ap, &mut net, &mut sta, to_sta);
+
+    assert_eq!(
+        sta.connected, 4,
+        "the station stays associated across a rekey"
+    );
+    let new_tk = ap.station_tk(&sta_mac).expect("pairwise key installed");
+    assert_ne!(new_tk, old_tk, "the 4-way installed a fresh PTK");
+    assert!(
+        downlink_round_trips(&mut ap, &mut sta),
+        "downlink works under the rekeyed PTK"
+    );
+    assert!(
+        uplink_round_trips(&mut ap, &mut sta),
+        "uplink works under the rekeyed PTK"
+    );
+}
+
+#[test]
+fn identical_ptk_from_a_fresh_handshake_never_resets_packet_numbers() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let mut ap = Ap::new("turtlenet", "password1234", ap_mac, 1);
+    let fixed_anonce = [0x33; 32];
+    ap.set_test_fixtures([0x44; 16], fixed_anonce);
+    let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
+    let mut sta = Client::new("turtlenet", "password1234", sta_mac);
+    sta.set_test_snonce([0x55; 32]);
+    connect(&mut ap, &mut net, &mut sta);
+
+    let uplink = [
+        ap_mac.as_slice(),
+        sta_mac.as_slice(),
+        &[0x08, 0x00],
+        b"uplink before identical rekey",
+    ]
+    .concat();
+    let before_up = sta.encrypt_uplink(&uplink).expect("protected uplink");
+    let before_up_pn = dot11::strip_radiotap(&before_up)
+        .and_then(dot11::Dot11::parse)
+        .and_then(|frame| frame.ccmp_pn())
+        .expect("uplink PN");
+    assert_eq!(
+        ap.handle_incoming(&before_up).to_network,
+        vec![uplink.clone()]
+    );
+
+    let downlink = [
+        sta_mac.as_slice(),
+        ap_mac.as_slice(),
+        &[0x08, 0x00],
+        b"downlink before identical rekey",
+    ]
+    .concat();
+    let before_down = ap.deliver_to_station(&downlink).remove(0);
+    let before_down_pn = dot11::strip_radiotap(&before_down)
+        .and_then(dot11::Dot11::parse)
+        .and_then(|frame| frame.ccmp_pn())
+        .expect("downlink PN");
+    assert_eq!(
+        sta.handle_incoming(&before_down).to_network,
+        vec![downlink.clone()]
+    );
+
+    // Both nonce overrides remain fixed, forcing the second handshake to
+    // derive exactly the already-installed PTK under a newer EAPOL counter.
+    let old_tk = ap.station_tk(&sta_mac).expect("installed PTK");
+    let to_sta = start_ptk_rekey(&mut ap, &sta);
+    pump(&mut ap, &mut net, &mut sta, to_sta);
+    assert_eq!(ap.station_tk(&sta_mac), Some(old_tk));
+
+    let next_up = sta.encrypt_uplink(&uplink).expect("post-rekey uplink");
+    let next_up_pn = dot11::strip_radiotap(&next_up)
+        .and_then(dot11::Dot11::parse)
+        .and_then(|frame| frame.ccmp_pn())
+        .expect("post-rekey uplink PN");
+    assert_eq!(
+        next_up_pn,
+        before_up_pn + 1,
+        "supplicant must not reinstall an unchanged PTK"
+    );
+    assert_eq!(ap.handle_incoming(&next_up).to_network, vec![uplink]);
+
+    let next_down = ap.deliver_to_station(&downlink).remove(0);
+    let next_down_pn = dot11::strip_radiotap(&next_down)
+        .and_then(dot11::Dot11::parse)
+        .and_then(|frame| frame.ccmp_pn())
+        .expect("post-rekey downlink PN");
+    assert_eq!(
+        next_down_pn,
+        before_down_pn + 1,
+        "authenticator must not reinstall an unchanged PTK"
+    );
+    assert_eq!(sta.handle_incoming(&next_down).to_network, vec![downlink]);
+}
+
+#[test]
+fn a_rekey_installs_nothing_at_message_2() {
+    let (mut ap, _net, mut sta) = wpa2_up();
+    let sta_mac = sta.mac;
+    let old_tk = ap.station_tk(&sta_mac).expect("pairwise key installed");
+
+    // Deliver ONLY message 1, so the station derives a candidate and answers
+    // with message 2 — and stops there.
+    let m1 = start_ptk_rekey(&mut ap, &sta)
+        .into_iter()
+        .find(|f| {
+            dot11::strip_radiotap(f)
+                .and_then(dot11::Dot11::parse)
+                .is_some_and(|p| p.is_eapol())
+        })
+        .expect("the AP emits a fresh message 1");
+    let reply = sta.handle_incoming(&m1);
+    assert_eq!(
+        reply.frames.len(),
+        1,
+        "the station answers a rekey message 1 with message 2"
+    );
+
+    // Neither peer may have moved off the old key yet: message 3 has not been
+    // seen, so the candidate is unauthenticated. Installing at message 2 (and
+    // resetting the packet number with it) is the key-reinstallation bug.
+    assert_eq!(
+        ap.station_tk(&sta_mac).expect("still keyed"),
+        old_tk,
+        "the AP holds the old PTK until message 4"
+    );
+    assert!(
+        downlink_round_trips(&mut ap, &mut sta),
+        "the station still decrypts under the old PTK after sending message 2"
+    );
+}
+
+#[test]
+fn a_forged_message_1_cannot_drop_or_wedge_an_established_session() {
+    let (mut ap, mut net, mut sta) = wpa2_up();
+    let sta_mac = sta.mac;
+    let bssid = sta.bssid().expect("associated");
+    let old_tk = ap.station_tk(&sta_mac).expect("pairwise key installed");
+
+    // Message 1 carries no MIC, so anyone can inject one. This one claims a
+    // replay counter no legitimate authenticator could ever exceed.
+    let forged = dot11::build_eapol_m1_for_key_length(
+        &bssid,
+        &sta_mac,
+        &[0xa5; 32],
+        u64::MAX - 1,
+        0,
+        dot11::KeyMic::HmacSha1,
+        16,
+    );
+    sta.handle_incoming(&framed(forged));
+
+    assert_eq!(sta.connected, 4, "the session survives a forged message 1");
+    assert!(
+        downlink_round_trips(&mut ap, &mut sta),
+        "the installed PTK still carries data after a forged message 1"
+    );
+
+    // And the forged counter must not have raised the replay bar: a genuine
+    // rekey afterwards still completes. (Recording it would have locked the
+    // station out of every future rekey until the AP gave up and deauthed.)
+    let to_sta = start_ptk_rekey(&mut ap, &sta);
+    pump(&mut ap, &mut net, &mut sta, to_sta);
+    assert_eq!(sta.connected, 4);
+    assert_ne!(
+        ap.station_tk(&sta_mac).expect("still keyed"),
+        old_tk,
+        "a genuine rekey still completes after a forged message 1"
+    );
+    assert!(downlink_round_trips(&mut ap, &mut sta));
+}
+
+// ---------------------------------------------------------------------------
+// Guards mirrored from the reference authenticator/supplicant: a re-delivered
+// group key must not roll the receive replay window back, and a MIC-less
+// pairwise key message must not be honoured in the clear once a PTK is
+// installed under PMF.
+// ---------------------------------------------------------------------------
+
+/// Deliver a group-addressed frame under the AP's current GTK and report
+/// whether the station accepted it.
+fn group_frame_accepted(ap: &mut Ap, sta: &mut Client, payload: &[u8]) -> bool {
+    let bssid = sta.bssid().expect("associated");
+    let eth = [&[0xffu8; 6][..], bssid.as_slice(), &[0x08, 0x00], payload].concat();
+    let frames = ap.deliver_to_station(&eth);
+    frames.len() == 1 && sta.handle_incoming(&frames[0]).to_network == vec![eth]
+}
+
+#[test]
+fn redelivering_the_same_gtk_does_not_roll_back_the_replay_window() {
+    let (mut ap, _net, mut sta) = wpa3_up();
+
+    // Capture a group frame the station has already accepted. Replaying it must
+    // fail: its packet number is no longer ahead of the receive window.
+    let bssid = sta.bssid().expect("associated");
+    let eth = [
+        &[0xffu8; 6][..],
+        bssid.as_slice(),
+        &[0x08, 0x00],
+        b"group one",
+    ]
+    .concat();
+    let captured = ap.deliver_to_station(&eth).remove(0);
+    assert_eq!(sta.handle_incoming(&captured).to_network, vec![eth.clone()]);
+    assert!(
+        sta.handle_incoming(&captured).to_network.is_empty(),
+        "a replayed group frame is rejected"
+    );
+
+    // Now the AP runs a Group Key Handshake that re-delivers the SAME GTK under
+    // a fresh, properly MIC'd replay counter — which is exactly what the counter
+    // checks cannot distinguish from a genuine rotation. The station must keep
+    // its replay window rather than re-seed it from this message's RSC.
+    let gtk_before = ap.gtk();
+    let msgs = ap.test_rekey_gtk_without_rotation();
+    assert_eq!(ap.gtk(), gtk_before, "the AP re-sent the same GTK");
+    for m in &msgs {
+        sta.handle_incoming(m);
+    }
+    assert_eq!(sta.gtk(), gtk_before, "station still holds that GTK");
+
+    assert!(
+        sta.handle_incoming(&captured).to_network.is_empty(),
+        "the replay window must survive re-delivery of an unchanged GTK"
+    );
+    // Fresh group traffic still works, so the window was preserved, not frozen.
+    assert!(group_frame_accepted(&mut ap, &mut sta, b"group two"));
+}
+
+#[test]
+fn an_unprotected_rekey_message_1_is_ignored_once_a_ptk_is_installed_under_pmf() {
+    let (mut ap, mut net, mut sta) = wpa3_up();
+    let bssid = sta.bssid().expect("associated");
+
+    // Under PMF the AP carries EAPOL inside protected data once keys exist, so a
+    // plaintext MIC-less message 1 can only have been injected. Answering it
+    // would let an off-path attacker churn the handshake state of a working
+    // session (and clobber an in-flight rekey candidate).
+    let forged = dot11::build_eapol_m1_for_key_length(
+        &bssid,
+        &sta.mac,
+        &[0x5a; 32],
+        u64::MAX - 1,
+        0,
+        dot11::KeyMic::AesCmac,
+        16,
+    );
+    let out = sta.handle_incoming(&framed(forged));
+    assert!(
+        out.frames.is_empty(),
+        "an unprotected message 1 must not be answered under PMF"
+    );
+    assert_eq!(sta.connected, 4, "and must not disturb the session");
+    assert!(downlink_round_trips(&mut ap, &mut sta));
+    assert!(uplink_round_trips(&mut ap, &mut sta));
+
+    // The controlled port still works: a group rekey delivered over protected
+    // data is processed normally.
+    let _ = &mut net;
+    let msgs = ap.rekey_gtk();
+    for m in &msgs {
+        sta.handle_incoming(m);
+    }
+    assert_eq!(
+        sta.gtk(),
+        ap.gtk(),
+        "protected-port group rekey still works"
     );
 }

@@ -73,11 +73,7 @@ fn control_station_macs(ap: &Ap) -> Vec<[u8; 6]> {
     macs
 }
 
-fn station_reply(
-    ap: &Ap,
-    mac: &[u8; 6],
-    station_info: &dyn Fn(&[u8; 6]) -> Option<StationControlInfo>,
-) -> String {
+fn station_reply(ap: &Ap, mac: &[u8; 6], info: Option<StationControlInfo>) -> String {
     let core_mac = ap.station_link_for_peer(mac).unwrap_or(*mac);
     let assoc_ies = ap.station_assoc_ies(&core_mac).unwrap_or(&[]);
     let flags = station_flags(ap.is_associated(&core_mac), assoc_ies);
@@ -87,7 +83,7 @@ fn station_reply(
     if let Some(selector) = akm_suite_selector(assoc_ies) {
         reply.push_str(&format!("AKMSuiteSelector={selector}\n"));
     }
-    if let Some(info) = station_info(mac) {
+    if let Some(info) = info {
         reply.push_str(&format!(
             "vlan_id={}\nvlan_iface={}\n",
             info.vlan_id, info.ifname
@@ -242,7 +238,7 @@ pub fn handle_command_with_context(
                     if !known {
                         ("FAIL unknown station\n".to_string(), vec![])
                     } else {
-                        (station_reply(ap, &mac, station_info), vec![])
+                        (station_reply(ap, &mac, info), vec![])
                     }
                 }
                 None => ("FAIL invalid MAC\n".to_string(), vec![]),
@@ -252,7 +248,10 @@ pub fn handle_command_with_context(
         "STA-FIRST" => {
             let macs = control_station_macs(ap);
             match macs.first() {
-                Some(mac) => (station_reply(ap, mac, station_info), vec![]),
+                Some(mac) => {
+                    let info = station_info(mac);
+                    (station_reply(ap, mac, info), vec![])
+                }
                 None => ("FAIL\n".to_string(), vec![]),
             }
         }
@@ -260,7 +259,10 @@ pub fn handle_command_with_context(
             Some(after) => {
                 let macs = control_station_macs(ap);
                 match macs.into_iter().find(|mac| *mac > after) {
-                    Some(mac) => (station_reply(ap, &mac, station_info), vec![]),
+                    Some(mac) => {
+                        let info = station_info(&mac);
+                        (station_reply(ap, &mac, info), vec![])
+                    }
                     None => ("FAIL\n".to_string(), vec![]),
                 }
             }
@@ -362,7 +364,9 @@ mod tests {
     fn sta_command_reports_spr_vlan_contract_even_for_disconnect_grace() {
         let mut ap = ap();
         let sta = mac_to_bytes("02:00:00:00:ab:cd");
+        let calls = std::cell::Cell::new(0);
         let info = |mac: &[u8; 6]| {
+            calls.set(calls.get() + 1);
             (*mac == sta).then(|| StationControlInfo {
                 vlan_id: 4096,
                 ifname: "wlan3.4096".to_string(),
@@ -384,6 +388,7 @@ mod tests {
         assert!(reply.contains("signal_avg=-58\n"), "{reply}");
         assert!(reply.contains("tx_rate_info=60\n"), "{reply}");
         assert!(reply.contains("rx_rate_info=7206\n"), "{reply}");
+        assert_eq!(calls.get(), 1, "STA metadata must be resolved once");
         assert!(
             handle_command_with_station_info(&mut ap, "STA invalid", &info)
                 .0
@@ -423,9 +428,16 @@ pub use server::ControlServer;
 #[cfg(unix)]
 mod server {
     use super::{handle_command_with_context, Ap, StationControlInfo};
+    use crate::ap::PreparedPskFile;
     use std::io;
     use std::os::unix::net::UnixDatagram;
     use std::path::PathBuf;
+
+    struct CredentialReload {
+        requests: std::sync::mpsc::SyncSender<Vec<u8>>,
+        results: std::sync::mpsc::Receiver<Result<(usize, PreparedPskFile), String>>,
+        pending: bool,
+    }
 
     /// A bound control socket plus the set of clients subscribed to events.
     pub struct ControlServer {
@@ -433,6 +445,7 @@ mod server {
         path: PathBuf,
         ifname: String,
         psk_file: Option<PathBuf>,
+        reload: Option<CredentialReload>,
         attached: Vec<PathBuf>,
     }
 
@@ -451,25 +464,106 @@ mod server {
             // the same way, via directory ownership + mode.)
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            let psk_path = psk_file.map(PathBuf::from);
+            let reload = psk_path.as_ref().and_then(|reload_path| {
+                let reload_path = reload_path.clone();
+                let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+                let (result_tx, result_rx) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("rustap-credential-reload".to_string())
+                    .spawn(move || {
+                        use zeroize::Zeroize;
+                        while let Ok(ssid) = request_rx.recv() {
+                            let result = crate::config::parse_psk_file(
+                                reload_path.to_string_lossy().as_ref(),
+                            )
+                            .map(|mut entries| {
+                                let count = entries.len();
+                                let prepared = PreparedPskFile::derive(&ssid, &entries);
+                                for (_, password) in &mut entries {
+                                    password.zeroize();
+                                }
+                                (count, prepared)
+                            });
+                            if result_tx.send(result).is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .ok()
+                    .map(|_| CredentialReload {
+                        requests: request_tx,
+                        results: result_rx,
+                        pending: false,
+                    })
+            });
             Ok(ControlServer {
                 sock,
                 path: PathBuf::from(path),
                 ifname: ifname.to_string(),
-                psk_file: psk_file.map(PathBuf::from),
+                psk_file: psk_path,
+                reload,
                 attached: Vec::new(),
             })
         }
 
-        /// Drain and handle every pending command (non-blocking), returning any
-        /// frames the AP wants transmitted (e.g. an admin `DEAUTH`).
+        fn apply_reload_results(&mut self, ap: &mut Ap) {
+            let Some(reload) = self.reload.as_mut() else {
+                return;
+            };
+            loop {
+                match reload.results.try_recv() {
+                    Ok(result) => {
+                        reload.pending = false;
+                        match result {
+                            Ok((count, prepared)) => {
+                                ap.install_prepared_psk_file(prepared);
+                                if let Some(path) = self.psk_file.as_ref() {
+                                    eprintln!(
+                                        "netlink AP: reloaded {count} credential(s) from {}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                ap.cancel_psk_reload();
+                                if let Some(path) = self.psk_file.as_ref() {
+                                    eprintln!(
+                                        "netlink AP: credential reload from {} failed: {err}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if reload.pending {
+                            reload.pending = false;
+                            ap.cancel_psk_reload();
+                            eprintln!(
+                                "netlink AP: credential reload worker stopped before completing"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        /// Handle a bounded batch of pending commands, returning any frames the
+        /// AP wants transmitted (e.g. an admin `DEAUTH`). Bounding the batch
+        /// prevents a trusted-but-buggy local client from starving radio events.
         pub fn service(
             &mut self,
             ap: &mut Ap,
             station_info: &dyn Fn(&[u8; 6]) -> Option<StationControlInfo>,
         ) -> Vec<Vec<u8>> {
+            self.apply_reload_results(ap);
             let mut frames = Vec::new();
             let mut buf = [0u8; 4096];
-            loop {
+            const MAX_COMMANDS_PER_SERVICE: usize = 16;
+            for _ in 0..MAX_COMMANDS_PER_SERVICE {
                 let (n, peer) = match self.sock.recv_from(&mut buf) {
                     Ok((n, addr)) => match addr.as_pathname() {
                         Some(p) => (n, p.to_path_buf()),
@@ -496,32 +590,25 @@ mod server {
                     // (the set_psk_file guard would ignore it anyway; answer
                     // without reading the file).
                     "RELOAD_WPA_PSK" | "RELOAD" if ap.static_credential() => "OK\n".to_string(),
-                    "RELOAD_WPA_PSK" | "RELOAD" => match self.psk_file.as_deref() {
-                        Some(path) => {
-                            match crate::config::parse_psk_file(path.to_string_lossy().as_ref()) {
-                                Ok(mut entries) => {
-                                    ap.set_psk_file(&entries);
-                                    eprintln!(
-                                        "netlink AP: reloaded {} credential(s) from {}",
-                                        entries.len(),
-                                        path.display()
-                                    );
-                                    use zeroize::Zeroize;
-                                    for (_, password) in &mut entries {
-                                        password.zeroize();
-                                    }
-                                    "OK\n".to_string()
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "netlink AP: credential reload from {} failed: {e}",
-                                        path.display()
-                                    );
-                                    "FAIL\n".to_string()
-                                }
+                    "RELOAD_WPA_PSK" | "RELOAD" => match self.reload.as_mut() {
+                        Some(reload) if reload.pending => "OK\n".to_string(),
+                        Some(reload) => match reload.requests.try_send(ap.ssid.clone()) {
+                            Ok(()) => {
+                                reload.pending = true;
+                                ap.begin_psk_reload();
+                                "OK\n".to_string()
                             }
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                "FAIL busy\n".to_string()
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                "FAIL reload worker stopped\n".to_string()
+                            }
+                        },
+                        None if self.psk_file.is_none() => {
+                            "FAIL no psk_file configured\n".to_string()
                         }
-                        None => "FAIL no psk_file configured\n".to_string(),
+                        None => "FAIL reload worker unavailable\n".to_string(),
                     },
                     _ => {
                         let (r, fs) =

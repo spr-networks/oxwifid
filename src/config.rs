@@ -35,6 +35,10 @@ use zeroize::{Zeroize, Zeroizing};
 pub enum KeyMgmt {
     /// WPA2-Personal (PSK).
     Psk,
+    /// WPA2-Personal offering the SHA-256 PSK AKM (00-0F-AC:6) alongside the
+    /// SHA-1 one, so a SHA-256-capable station can select the stronger key
+    /// hierarchy while legacy WPA2 stations keep associating.
+    PskSha256,
     /// WPA3-Personal (SAE).
     Sae,
     /// WPA3-SAE with a WPA2-PSK fallback (transition mode).
@@ -111,7 +115,8 @@ pub struct Config {
     /// This affiliated link's Link ID (0-15).
     pub link_id: u8,
     /// Affiliated AP links for an MLD AP. Empty means the top-level
-    /// mac/channel/link_id describes the only link.
+    /// channel/link_id describes the only link; its BSSID is derived from the
+    /// runtime interface MLD address in netlink mode.
     pub mld_links: Vec<MldLinkConfig>,
     /// Advertised TID-to-link mapping shared by all eight QoS TIDs, expressed
     /// as the configured MLD Link IDs that may carry traffic. This is the
@@ -127,7 +132,8 @@ pub struct Config {
     /// exchange QoS Data frames with stations that negotiate it. Default on.
     pub wmm: bool,
     /// Path for the runtime control socket (reference AP-style `ctrl_interface`).
-    /// `None` disables it. netlink mode only.
+    /// When omitted for an SPR-integrated AP, the runtime derives the standard
+    /// `control_<iface>/<iface>` path beside `spr_api_socket`. netlink mode only.
     pub ctrl_path: Option<String>,
     /// SPR API Unix socket. When set, station events are delivered directly as
     /// HTTP PUT requests without spawning reference AP control client, an action script, or curl.
@@ -202,7 +208,7 @@ pub struct RadioConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MldLinkConfig {
     pub link_id: u8,
-    pub mac: [u8; 6],
+    pub mac: Option<[u8; 6]>,
     pub channel: u8,
     pub width: Option<u16>,
     /// Explicit RF band for this link. Channel numbers overlap between bands,
@@ -728,6 +734,29 @@ impl Config {
         resolved
     }
 
+    /// Runtime control socket path, including the SPR-compatible default.
+    ///
+    /// SPR's route reconciler discovers active Wi-Fi stations through this
+    /// control interface. A generated single-radio config that enables the SPR
+    /// API but omits `ctrl_path` must still expose the socket in the shared
+    /// state directory; otherwise DHCP succeeds but no per-station route is
+    /// installed.
+    pub fn effective_ctrl_path(&self) -> Option<String> {
+        if let Some(path) = self.ctrl_path.as_ref() {
+            return Some(path.clone());
+        }
+        if self.iface.is_empty() || self.iface.contains('/') {
+            return None;
+        }
+        let state_dir = std::path::Path::new(self.spr_api_socket.as_deref()?).parent()?;
+        Some(
+            state_dir
+                .join(format!("control_{0}/{0}", self.iface))
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
     fn validate_radio(&self) -> Result<(), String> {
         // WPA2-PSK / WPA3-SAE passphrases are 8..=63 characters; OWE has none.
         if self.key_mgmt != KeyMgmt::Owe && !(self.passphrase.is_empty() && self.psk_file.is_some())
@@ -741,7 +770,7 @@ impl Config {
         }
         // 6 GHz is Wi-Fi 6E/7 only and mandates WPA3 (SAE) or OWE — WPA2-PSK is
         // not permitted on 6 GHz in any mode.
-        if self.band.is_6ghz() && self.key_mgmt == KeyMgmt::Psk {
+        if self.band.is_6ghz() && matches!(self.key_mgmt, KeyMgmt::Psk | KeyMgmt::PskSha256) {
             return Err("6 GHz mandates WPA3/SAE or OWE, not WPA2-PSK".to_string());
         }
         if self.pairwise_cipher != DataCipher::Ccmp128 && self.mld {
@@ -777,11 +806,14 @@ impl Config {
                 if ids.contains(&link.link_id) {
                     return Err(format!("duplicate mld link_id {}", link.link_id));
                 }
-                if macs.contains(&link.mac) {
-                    return Err(format!(
-                        "duplicate mld link MAC {}",
-                        crate::util::bytes_to_mac(&link.mac)
-                    ));
+                if let Some(mac) = link.mac {
+                    if macs.contains(&mac) {
+                        return Err(format!(
+                            "duplicate mld link MAC {}",
+                            crate::util::bytes_to_mac(&mac)
+                        ));
+                    }
+                    macs.push(mac);
                 }
                 let width = link.width.unwrap_or(self.width);
                 let band = link.band.unwrap_or(self.band);
@@ -806,7 +838,6 @@ impl Config {
                 }
                 validate_band_channel(band, link.channel, &format!("mld link {}", link.link_id))?;
                 ids.push(link.link_id);
-                macs.push(link.mac);
             }
             if !ids.contains(&self.link_id) {
                 return Err(format!(
@@ -864,7 +895,7 @@ impl Config {
                     b.ssid
                 ));
             }
-            if self.band.is_6ghz() && b.key_mgmt == KeyMgmt::Psk {
+            if self.band.is_6ghz() && matches!(b.key_mgmt, KeyMgmt::Psk | KeyMgmt::PskSha256) {
                 return Err(format!(
                     "bss {:?}: 6 GHz mandates WPA3/SAE or OWE, not WPA2-PSK",
                     b.ssid
@@ -882,20 +913,19 @@ impl Config {
         Ok(())
     }
 
-    /// The key-management mode the AP will actually advertise, after applying the
-    /// PMF mandates of the chosen band/PHY.
+    /// The key-management mode the AP will actually advertise after applying
+    /// the 6 GHz security mandate.
     ///
-    /// 802.11be (EHT, `--phy be`) **requires** Management Frame Protection: a
-    /// spec-compliant client rejects an EHT BSS whose RSN element is not PMF-capable
-    /// (`MFPC`)/required (`MFPR`) — it logs "skip RSN IE - no mgmt frame protection"
-    /// and never associates. WPA2-PSK and SAE-transition advertise a non-MFPR RSN,
-    /// so under EHT they are upgraded to WPA3-SAE (which advertises MFPR|MFPC + the
-    /// BIP group-management cipher). This mirrors the existing 6 GHz rule, where
-    /// `band: 6` likewise forces SAE because 6 GHz mandates WPA3. OWE is already
-    /// PMF-protected and is left as-is.
+    /// EHT/802.11be by itself does not remove legacy AKMs on 2.4 or 5 GHz. In
+    /// particular, a reference AP MLD can advertise SAE transition mode with
+    /// PMF optional so non-EHT WPA2 clients can use an affiliated link. Only
+    /// 6 GHz removes PSK AKMs and forces SAE.
     pub fn effective_key_mgmt(&self) -> KeyMgmt {
-        if self.phy == crate::frames::PhyMode::Eht
-            && matches!(self.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition)
+        if self.band.is_6ghz()
+            && matches!(
+                self.key_mgmt,
+                KeyMgmt::Psk | KeyMgmt::PskSha256 | KeyMgmt::SaeTransition
+            )
         {
             KeyMgmt::Sae
         } else {
@@ -924,14 +954,22 @@ impl Config {
             ap.mld_mac = self.mac;
             ap.link_id = self.link_id;
             let links = self.resolved_mld_links();
+            ap.set_mld_links(links);
+            // Netlink mode must derive omitted link BSSIDs only after it has read
+            // the kernel's actual interface/MLD address. Other transports have no
+            // runtime address adoption step, so resolve against the configured
+            // MLD address now.
+            if self.mode != "netlink" {
+                ap.derive_missing_mld_link_macs();
+            }
             // Anchor the management plane (auth/assoc/EAPOL) on the association
             // link's BSSID: the client authenticates to that link address, so the
-            // AP's responses must originate from it (not the default `mac`). The
-            // per-link beacons already use their own `link.mac`.
-            if let Some(assoc) = links.iter().find(|l| l.link_id == self.link_id) {
-                ap.mac = assoc.mac;
+            // AP's responses must originate from it (not the MLD address). In
+            // netlink mode this can temporarily be the zero sentinel; bring-up
+            // resolves it before any link snapshot or frame construction.
+            if let Some(assoc) = ap.mld_link_mac(self.link_id) {
+                ap.mac = assoc;
             }
-            ap.set_mld_links(links);
             if let Some(default_links) = &self.mld_default_links {
                 let mask = default_links
                     .iter()
@@ -987,7 +1025,11 @@ impl Config {
         if self.mld_links.is_empty() {
             vec![MldLink {
                 link_id: self.link_id,
-                mac: self.mac,
+                // The top-level MAC is the AP MLD address, not an affiliated
+                // link BSSID. Use the same unresolved sentinel as an omitted
+                // mld_links[].mac so the two valid configuration forms follow
+                // one derivation path.
+                mac: [0u8; 6],
                 channel: self.channel,
                 width: self.width,
                 band6: self.band.is_6ghz(),
@@ -997,7 +1039,7 @@ impl Config {
                 .iter()
                 .map(|l| MldLink {
                     link_id: l.link_id,
-                    mac: l.mac,
+                    mac: l.mac.unwrap_or([0u8; 6]),
                     channel: l.channel,
                     width: l.width.unwrap_or(self.width),
                     band6: l.band.unwrap_or(self.band).is_6ghz(),
@@ -1021,11 +1063,13 @@ impl Config {
         ap.set_wmm(self.wmm);
         ap.set_group_rekey(self.group_rekey);
         ap.set_strict_rekey(self.strict_rekey);
-        // EHT mandates PMF for every BSS on the radio, the same way `band: 6` does
-        // below — upgrade a non-MFPR mode to SAE (see `effective_key_mgmt`).
-        let km = if self.phy == crate::frames::PhyMode::Eht
-            && matches!(bss.key_mgmt, KeyMgmt::Psk | KeyMgmt::SaeTransition)
-        {
+        // 6 GHz removes PSK AKMs. EHT on 2.4/5 GHz does not: a transition-mode
+        // BSS must remain available to legacy WPA2 clients.
+        let km = if self.band.is_6ghz()
+            && matches!(
+                bss.key_mgmt,
+                KeyMgmt::Psk | KeyMgmt::PskSha256 | KeyMgmt::SaeTransition
+            ) {
             KeyMgmt::Sae
         } else {
             bss.key_mgmt
@@ -1075,6 +1119,7 @@ impl Config {
 fn apply_security(ap: &mut Ap, km: KeyMgmt) {
     match km {
         KeyMgmt::Psk => {}
+        KeyMgmt::PskSha256 => ap.enable_psk_sha256(),
         KeyMgmt::Sae => ap.enable_sae(),
         KeyMgmt::SaeTransition => {
             ap.enable_sae();
@@ -1151,7 +1196,7 @@ fn parse_mld_link(item: &Value, _default_width: u16) -> Result<MldLinkConfig, St
     }
     Ok(MldLinkConfig {
         link_id: link_id.ok_or("mld link missing link_id")?,
-        mac: mac.ok_or("mld link missing mac")?,
+        mac,
         channel: channel.ok_or("mld link missing channel")?,
         width,
         band,
@@ -1285,11 +1330,12 @@ pub fn parse_phy(s: &str) -> Result<crate::frames::PhyMode, String> {
 fn parse_key_mgmt(s: &str) -> Result<KeyMgmt, String> {
     match s.to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
         "psk" | "wpa-psk" | "wpa2" | "wpa2-psk" => Ok(KeyMgmt::Psk),
+        "psk-sha256" | "wpa-psk-sha256" | "wpa2-psk-sha256" => Ok(KeyMgmt::PskSha256),
         "sae" | "wpa3" | "wpa3-sae" => Ok(KeyMgmt::Sae),
         "sae-transition" | "transition" | "wpa2-wpa3" | "wpa2+wpa3" => Ok(KeyMgmt::SaeTransition),
         "owe" => Ok(KeyMgmt::Owe),
         _ => Err(format!(
-            "unknown key_mgmt {s:?} (psk|sae|sae-transition|owe)"
+            "unknown key_mgmt {s:?} (psk|psk-sha256|sae|sae-transition|owe)"
         )),
     }
 }
@@ -1356,6 +1402,55 @@ mod tests {
         assert!(!c.per_sta_vif);
         assert!(c.bss.is_empty());
         assert!(c.mld_default_links.is_none());
+    }
+
+    #[test]
+    fn single_link_netlink_mld_leaves_bssid_for_runtime_derivation() {
+        let cfg = Config::from_json(
+            r#"{
+                "ssid":"single-mld", "passphrase":"password1234",
+                "key_mgmt":"sae", "phy":"be", "mode":"netlink",
+                "mld":true, "mac":"02:00:00:00:00:00",
+                "band":5, "channel":36, "width":80, "link_id":0
+            }"#,
+        )
+        .expect("single-link MLD config parses");
+        cfg.validate().expect("single-link MLD config validates");
+
+        let links = cfg.resolved_mld_links();
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].mac, [0u8; 6],
+            "top-level MLD MAC must not become the affiliated-link BSSID"
+        );
+
+        let ap = cfg.build_ap();
+        assert_eq!(
+            ap.active_mld_links()[0].mac,
+            [0u8; 6],
+            "netlink bring-up resolves the sentinel from the interface MLD address"
+        );
+    }
+
+    #[test]
+    fn non_netlink_mld_randomizes_omitted_link_bssid_with_configured_mld_oui() {
+        let cfg = Config::from_json(
+            r#"{
+                "ssid":"single-mld", "passphrase":"password1234",
+                "key_mgmt":"sae", "phy":"be", "mode":"stdio",
+                "mld":true, "mac":"02:00:00:00:aa:00",
+                "band":5, "channel":36, "width":80, "link_id":0
+            }"#,
+        )
+        .expect("single-link MLD config parses");
+        cfg.validate().expect("single-link MLD config validates");
+
+        let ap = cfg.build_ap();
+        let link = ap.active_mld_links()[0];
+        assert_eq!(&link.mac[..3], &[0x02, 0, 0]);
+        assert_eq!(link.mac[0] & 0x03, 0x02);
+        assert_eq!(ap.mac, link.mac);
+        assert_ne!(link.mac, ap.mld_mac);
     }
 
     #[test]
@@ -1567,47 +1662,38 @@ mod tests {
     }
 
     #[test]
-    fn eht_mandates_pmf_upgrading_non_mfpr_modes_to_sae() {
+    fn eht_keeps_configured_akms_while_six_ghz_removes_psk() {
         use crate::frames::{PhyMode, SecurityMode};
-        // 802.11be (EHT) requires PMF: a non-MFPR mode (WPA2-PSK / SAE-transition)
-        // is upgraded to WPA3-SAE, so the AP advertises an MFPR|MFPC RSN that a
-        // spec-compliant Wi-Fi 7 client will accept.
+        // Match the reference AP's EHT/MLD transition behavior: EHT on 2.4 or
+        // 5 GHz does not silently replace the operator-selected AKM.
         let mut c = Config::default();
         c.phy = PhyMode::Eht;
         c.key_mgmt = KeyMgmt::Psk;
         assert_eq!(
             c.effective_key_mgmt(),
-            KeyMgmt::Sae,
-            "EHT + PSK must advertise SAE/PMF"
+            KeyMgmt::Psk,
+            "EHT + PSK remains WPA2 outside 6 GHz"
         );
-        assert_eq!(c.build_ap().security_mode(), SecurityMode::Wpa3Sae);
+        assert_eq!(c.build_ap().security_mode(), SecurityMode::Wpa2);
 
-        c.key_mgmt = KeyMgmt::SaeTransition; // transition is only MFPC, not MFPR
+        c.key_mgmt = KeyMgmt::SaeTransition;
         assert_eq!(
             c.effective_key_mgmt(),
-            KeyMgmt::Sae,
-            "EHT + transition must advertise SAE/PMF"
+            KeyMgmt::SaeTransition,
+            "EHT MLD transition must retain the WPA2 fallback"
         );
+        assert_eq!(c.build_ap().security_mode(), SecurityMode::Transition);
 
-        // OWE is already PMF-protected; SAE is already correct — both unchanged.
+        // OWE and SAE are unchanged as well.
         c.key_mgmt = KeyMgmt::Owe;
         assert_eq!(c.effective_key_mgmt(), KeyMgmt::Owe);
         c.key_mgmt = KeyMgmt::Sae;
         assert_eq!(c.effective_key_mgmt(), KeyMgmt::Sae);
 
-        // An explicitly selected WPA2-PSK mode remains available on non-EHT
-        // PHYs even though the default is SAE.
-        for phy in [PhyMode::Ht, PhyMode::Vht, PhyMode::He] {
-            let mut c = Config::default();
-            c.phy = phy;
-            c.key_mgmt = KeyMgmt::Psk;
-            assert_eq!(
-                c.effective_key_mgmt(),
-                KeyMgmt::Psk,
-                "{phy:?} must stay WPA2-PSK"
-            );
-            assert_eq!(c.build_ap().security_mode(), SecurityMode::Wpa2);
-        }
+        // The band-specific 6 GHz rule still strips the WPA2 fallback.
+        c.band = Band::Ghz6;
+        c.key_mgmt = KeyMgmt::SaeTransition;
+        assert_eq!(c.effective_key_mgmt(), KeyMgmt::Sae);
     }
 
     #[test]

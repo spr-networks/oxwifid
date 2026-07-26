@@ -176,32 +176,61 @@ impl ParsedNlmsg<'_> {
     }
 }
 
-/// Iterate the netlink messages packed in a received buffer.
-pub fn parse_messages(buf: &[u8]) -> Vec<ParsedNlmsg<'_>> {
-    let mut out = Vec::new();
-    let mut off = 0;
-    while off + 16 <= buf.len() {
-        let len = u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
-        if len < 16 || off + len > buf.len() {
-            break;
+pub struct Messages<'a> {
+    buf: &'a [u8],
+    off: usize,
+}
+
+impl<'a> Iterator for Messages<'a> {
+    type Item = ParsedNlmsg<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.off + 16 > self.buf.len() {
+            return None;
         }
-        let typ = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
-        let flags = u16::from_ne_bytes([buf[off + 6], buf[off + 7]]);
-        let seq = u32::from_ne_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]);
-        out.push(ParsedNlmsg {
+        let off = self.off;
+        let len = u32::from_ne_bytes([
+            self.buf[off],
+            self.buf[off + 1],
+            self.buf[off + 2],
+            self.buf[off + 3],
+        ]) as usize;
+        if len < 16 || off + len > self.buf.len() {
+            self.off = self.buf.len();
+            return None;
+        }
+        let typ = u16::from_ne_bytes([self.buf[off + 4], self.buf[off + 5]]);
+        let flags = u16::from_ne_bytes([self.buf[off + 6], self.buf[off + 7]]);
+        let seq = u32::from_ne_bytes([
+            self.buf[off + 8],
+            self.buf[off + 9],
+            self.buf[off + 10],
+            self.buf[off + 11],
+        ]);
+        self.off += nla_align(len);
+        Some(ParsedNlmsg {
             typ,
             flags,
             seq,
-            payload: &buf[off + 16..off + len],
-        });
-        off += nla_align(len);
+            payload: &self.buf[off + 16..off + len],
+        })
     }
-    out
 }
 
-/// Parse a flat attribute area into `(type, data)` pairs (nesting flag stripped).
-pub fn parse_attrs(buf: &[u8]) -> Vec<(u16, &[u8])> {
-    let mut out = Vec::new();
+/// Iterate the netlink messages packed in a received buffer without allocating.
+pub fn messages(buf: &[u8]) -> Messages<'_> {
+    Messages { buf, off: 0 }
+}
+
+/// Parse packed messages into an owned index. Receive hot paths should use
+/// [`messages`] when they only need one forward pass.
+pub fn parse_messages(buf: &[u8]) -> Vec<ParsedNlmsg<'_>> {
+    messages(buf).collect()
+}
+
+/// Parse attributes into reusable caller-owned storage.
+pub fn parse_attrs_into<'a>(buf: &'a [u8], out: &mut Vec<(u16, &'a [u8])>) {
+    out.clear();
     let mut off = 0;
     while off + 4 <= buf.len() {
         let len = u16::from_ne_bytes([buf[off], buf[off + 1]]) as usize;
@@ -212,6 +241,12 @@ pub fn parse_attrs(buf: &[u8]) -> Vec<(u16, &[u8])> {
         out.push((typ, &buf[off + 4..off + len]));
         off += nla_align(len);
     }
+}
+
+/// Parse a flat attribute area into `(type, data)` pairs (nesting flag stripped).
+pub fn parse_attrs(buf: &[u8]) -> Vec<(u16, &[u8])> {
+    let mut out = Vec::new();
+    parse_attrs_into(buf, &mut out);
     out
 }
 

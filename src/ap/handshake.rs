@@ -8,30 +8,20 @@ impl Ap {
         if frame.addr1 != self.mac {
             return;
         }
-        let (
-            anonce,
-            ready,
-            awaiting_m4,
-            kck,
-            sha256_m4,
-            owe_m4,
-            group_rekeying,
-            eapol_replay,
-            m1_replay,
-        ) = match self.stations.get(&sta) {
-            Some(s) => (
-                s.anonce,
-                s.eapol_ready,
-                s.awaiting_m4,
-                s.kck,
-                s.sha256,
-                s.owe,
-                s.group_rekeying,
-                s.eapol_replay,
-                s.m1_replay,
-            ),
-            None => return,
-        };
+        let (anonce, ready, awaiting_m4, kck, station_mic, group_rekeying, eapol_replay, m1_replay) =
+            match self.stations.get(&sta) {
+                Some(s) => (
+                    s.anonce,
+                    s.eapol_ready,
+                    s.awaiting_m4,
+                    s.kck,
+                    s.key_mic(),
+                    s.group_rekeying,
+                    s.eapol_replay,
+                    s.m1_replay,
+                ),
+                None => return,
+            };
 
         let Some(eapol_frame) = frame.eapol_frame() else {
             return;
@@ -43,7 +33,7 @@ impl Ap {
             return;
         };
 
-        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+        if crate::util::netlink_debug_enabled() {
             eprintln!(
                 "AP: EAPOL rx from {} replay={} key_info=0x{:04x} ready={} anonce_set={} awaiting_m4={} rekey={}",
                 crate::util::bytes_to_mac(&sta),
@@ -61,7 +51,7 @@ impl Ap {
         // then clear its rekey state; once every station has ACKed, the BSS is
         // fully on the new GTK (reference AP's GKeyDoneStations reaching 0).
         if group_rekeying && ek.key_replay_counter == eapol_replay {
-            let version = expected_key_descriptor_version(sha256_m4, owe_m4);
+            let version = expected_key_descriptor_version(station_mic);
             if !key_info_matches(ek.key_info, 0x0300 | version)
                 || ek.key_length != 0
                 || ek.key_nonce != [0u8; 32]
@@ -77,7 +67,7 @@ impl Ap {
             for b in to_check[mic_off..mic_off + 16].iter_mut() {
                 *b = 0;
             }
-            let computed = dot11::KeyMic::select(sha256_m4, owe_m4).compute(&kck, &to_check);
+            let computed = station_mic.compute(&kck, &to_check);
             if crypto::constant_time_eq(&computed[..16], &ek.key_mic) {
                 if let Some(s) = self.stations.get_mut(&sta) {
                     s.group_rekeying = false;
@@ -102,7 +92,7 @@ impl Ap {
         // Message 4: accept the PTK candidate whose MIC verifies. reference AP keeps
         // both the old and new PTK when a station retries M2 with a changed
         // SNonce, so either subsequent M4 can finish the same 4-way.
-        let version = expected_key_descriptor_version(sha256_m4, owe_m4);
+        let version = expected_key_descriptor_version(station_mic);
         let is_m4 = key_info_matches(ek.key_info, 0x0308 | version)
             && ek.key_length == 0
             && ek.key_nonce == [0u8; 32];
@@ -132,8 +122,7 @@ impl Ap {
                 .flatten();
             let mut selected = None;
             for candidate in candidates {
-                let mut computed =
-                    dot11::KeyMic::select(sha256_m4, owe_m4).compute(&candidate.kck, &to_check);
+                let mut computed = station_mic.compute(&candidate.kck, &to_check);
                 let mic_valid = crypto::constant_time_eq(&computed[..16], &ek.key_mic);
                 computed.zeroize();
                 if !mic_valid {
@@ -155,6 +144,17 @@ impl Ap {
             if let Some(candidate) = selected {
                 let mut event_mac = None;
                 if let Some(s) = self.stations.get_mut(&sta) {
+                    let tk_len = self.pairwise_cipher.key_len();
+                    // A new handshake normally yields a new TK, but make the
+                    // packet-number invariant independent of nonce uniqueness.
+                    // Re-delivery of identical temporal-key material must never
+                    // reset TX PN or either RX replay window (KRACK), even when
+                    // it arrives under a fresh, authenticated replay counter.
+                    let same_temporal_key = s.associated
+                        && crypto::constant_time_eq(
+                            &s.pairwise_tk[..tk_len],
+                            &candidate.tk[..tk_len],
+                        );
                     s.kck.zeroize();
                     s.kek.zeroize();
                     s.tk.zeroize();
@@ -163,6 +163,22 @@ impl Ap {
                     s.kek = candidate.kek;
                     s.tk.copy_from_slice(&candidate.tk[..16]);
                     s.pairwise_tk = candidate.tk;
+                    // The transmit packet number belongs to the key it is used
+                    // with, so it is reset HERE — where the new PTK actually
+                    // becomes the transmit key — and not when message 2 arrives.
+                    // Resetting it at message 2 would restart the CCMP nonce
+                    // sequence while `pairwise_tk` still held the PREVIOUS PTK
+                    // (this station stays `associated` and keeps receiving
+                    // downlink throughout a rekey), replaying nonces under a key
+                    // that had already used them: the keystream-reuse primitive
+                    // behind KRACK. A station that re-runs the 4-way without a
+                    // fresh Authentication makes that window trivially
+                    // reachable, so the reset must be tied to the install.
+                    if !same_temporal_key {
+                        s.client_pn = 1;
+                        s.last_rx_pn = [0; 17];
+                        s.last_rx_mgmt_pn = 0;
+                    }
                     s.ptk_candidates.clear();
                     s.associated = true;
                     s.awaiting_m4 = false;
@@ -171,6 +187,7 @@ impl Ap {
                 }
                 if let Some(mac) = event_mac {
                     self.events.push(ApEvent::Connected { mac });
+                    self.key_ready_stations.push(sta);
                 }
                 // 4-way complete: release the held ANonce so any *future*
                 // reassociation derives a fresh one (KRACK-safe rekey).
@@ -194,14 +211,19 @@ impl Ap {
         }
 
         let snonce = ek.key_nonce;
-        // 802.11be MLD: the PTK is derived from the MLD MAC addresses (AA = AP
-        // MLD MAC, SPA = STA MLD MAC), not the per-link addresses — both peers
-        // key the link off the MLD identity. Falls back to the link addresses
-        // for a non-MLD station.
-        let client_mld = self.stations.get(&sta).and_then(|s| s.client_mld_mac);
+        // An MLD peer derives the PTK from the two MLD identities. A legacy
+        // station connected to an affiliated BSS instead uses that association
+        // link's BSSID as AA. Using the AP's canonical link-0 address here
+        // breaks the MIC whenever a legacy client selects another link.
+        let station = self.stations.get(&sta);
+        let client_mld = station.and_then(|s| s.client_mld_mac);
+        let association_link = station
+            .and_then(|s| s.assoc_link_id)
+            .and_then(|link_id| self.mld_link_mac(link_id))
+            .unwrap_or(self.mac);
         let (amac, smac) = match client_mld {
             Some(cmld) if self.mld => (self.mld_mac, cmld),
-            _ => (self.mac, sta),
+            _ => (association_link, sta),
         };
 
         // Use the SAE-derived PMK + SHA-256 key descriptors when the station
@@ -220,10 +242,10 @@ impl Ap {
         {
             return;
         }
-        let (sta_pmk, sha256, owe) = self
+        let (sta_pmk, sha256, pmf) = self
             .stations
             .get(&sta)
-            .map(|s| (s.pmk, s.sha256, s.owe))
+            .map(|s| (s.pmk, s.sha256, s.pmf))
             .unwrap_or((None, false, false));
 
         // reference AP `wpa_psk_file` order: a PMK already fixed for this station
@@ -235,19 +257,18 @@ impl Ap {
         let mut candidates: Vec<[u8; 32]> = if let Some(p) = sta_pmk {
             vec![p]
         } else {
-            let mut v: Vec<[u8; 32]> = Vec::new();
-            v.extend(
-                self.psk_candidates
-                    .iter()
-                    .filter(|(m, _)| *m == Some(sta))
-                    .map(|(_, p)| *p),
+            let exact = self
+                .psk_candidates_by_mac
+                .get(&sta)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let mut v = Vec::with_capacity(
+                exact.len()
+                    + self.wildcard_psk_candidates.len()
+                    + usize::from(!self.credential_file_authoritative),
             );
-            v.extend(
-                self.psk_candidates
-                    .iter()
-                    .filter(|(m, _)| m.is_none())
-                    .map(|(_, p)| *p),
-            );
+            v.extend_from_slice(exact);
+            v.extend_from_slice(&self.wildcard_psk_candidates);
             if !self.credential_file_authoritative {
                 v.push(self.pmk);
             }
@@ -255,7 +276,7 @@ impl Ap {
         };
 
         let mic_off_in_eapol = 4 + ek.mic_offset; // EAPOL header (4) + body offset
-        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+        if crate::util::netlink_debug_enabled() {
             eprintln!(
                 "AP: m2 PTK amac={} smac={} client_mld={:?} sta={} sha256={sha256} cands={} pmk[..8]={}",
                 crate::util::bytes_to_mac(&amac),
@@ -266,7 +287,7 @@ impl Ap {
                 candidates.first().map(|p| p[..8].iter().map(|x| format!("{x:02x}")).collect::<String>()).unwrap_or_default(),
             );
         }
-        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+        if crate::util::netlink_debug_enabled() {
             let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
             eprintln!("AP: m2 anonce={}", hex(&anonce));
             eprintln!("AP: m2 snonce={}", hex(&snonce));
@@ -282,6 +303,11 @@ impl Ap {
         let mut tk = [0u8; 32];
         let tk_len = self.pairwise_cipher.key_len();
         let mut matched_pmk: Option<[u8; 32]> = None;
+        // The MIC input is identical for every credential candidate. Build and
+        // clear it once rather than allocating/copying the full EAPOL frame for
+        // every password tried.
+        let mut to_check = eapol_frame.to_vec();
+        to_check[mic_off_in_eapol..mic_off_in_eapol + 16].fill(0);
         for pmk in &candidates {
             if sha256 {
                 let mut ptk =
@@ -297,12 +323,8 @@ impl Ap {
                 tk[..tk_len].copy_from_slice(&ptk[32..32 + tk_len]);
                 ptk.zeroize();
             }
-            let mut to_check = eapol_frame.to_vec();
-            for b in to_check[mic_off_in_eapol..mic_off_in_eapol + 16].iter_mut() {
-                *b = 0;
-            }
-            let mut computed = dot11::KeyMic::select(sha256, owe).compute(&kck, &to_check);
-            if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+            let mut computed = station_mic.compute(&kck, &to_check);
+            if crate::util::netlink_debug_enabled() {
                 let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
                 eprintln!(
                     "AP: m2 try kck={} computed_mic={}",
@@ -317,7 +339,8 @@ impl Ap {
                 break;
             }
         }
-        if matched_pmk.is_none() && std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+        to_check.zeroize();
+        if matched_pmk.is_none() && crate::util::netlink_debug_enabled() {
             eprintln!("AP: m2 MIC did not match the pending handshake");
         }
         let mut matched_pmk = match matched_pmk {
@@ -417,18 +440,17 @@ impl Ap {
                 });
             }
             s.eapol_ready = false;
-            s.client_pn = 1;
             s.eapol_replay = m3_replay;
         }
         // Deliver the IGTK KDE to PMF (WPA3-SAE) stations so they can validate
         // BIP-protected group-addressed management frames, and the BIGTK KDE when
         // Beacon Protection is enabled.
-        let igtk = if sha256 {
+        let igtk = if pmf {
             Some((self.igtk_key_id, self.igtk_ipn, self.igtk))
         } else {
             None
         };
-        let bigtk = if sha256 && self.beacon_prot {
+        let bigtk = if pmf && self.beacon_prot {
             Some((self.bigtk_key_id, self.bigtk_ipn, self.bigtk))
         } else {
             None
@@ -444,16 +466,14 @@ impl Ap {
         let sc = self.next_sc();
         // m3's key data must echo the exact RSNE (+ RSNXE) the AP advertises in
         // its beacon, or the supplicant rejects it as a Beacon/EAPOL IE mismatch.
-        let mut ap_rsn: Vec<u8> = if owe {
-            dot11::RSN_OWE.to_vec()
-        } else if sha256 {
-            let mut r = dot11::RSN_WPA3.to_vec();
-            r.extend_from_slice(&dot11::RSNXE_H2E);
-            r
-        } else {
-            dot11::RSN.to_vec()
-        };
-        ap_rsn[13] = self.pairwise_cipher.suite_type();
+        // Echo the AP's advertised RSNE verbatim — the exact bytes the beacon /
+        // probe response carry (`security_tail_for_cipher`). Selecting it from the
+        // station's own AKM instead breaks transition mode: a WPA2 (PSK) or WPA3
+        // (SAE) station would receive the single-AKM RSNE while the beacon carries
+        // the mixed PSK+SAE `RSN_TRANSITION`, so the supplicant rejects m3 as a
+        // Beacon/EAPOL IE mismatch (reason 17).
+        let ap_rsn: Vec<u8> =
+            dot11::security_tail_for_cipher(self.security_mode(), self.pairwise_cipher);
         // In per-station-VIF mode each station gets its own GTK *value* (broadcast
         // isolation); otherwise all stations share the BSS-wide GTK. Either way the
         // GTK *index* is the single BSS-wide `gtk_key_id` (what the RSNE advertises
@@ -496,7 +516,7 @@ impl Ap {
                 group_rsc,
                 m3_replay,
                 sc,
-                dot11::KeyMic::select(sha256, owe),
+                station_mic,
             )
         } else {
             dot11::build_eapol_m3_for_key_length_with_rsc(
@@ -514,7 +534,7 @@ impl Ap {
                 group_rsc,
                 m3_replay,
                 sc,
-                dot11::KeyMic::select(sha256, owe),
+                station_mic,
                 self.pairwise_cipher.key_len() as u16,
             )
         };
@@ -529,6 +549,7 @@ impl Ap {
             s.eapol_retries = 0;
             s.eapol_acked = false;
         }
+        self.arm_eapol_timer(&sta);
         kck.zeroize();
         kek.zeroize();
         tk.zeroize();
@@ -538,8 +559,8 @@ impl Ap {
         // be CCMP-protected and is sent via `btm_request()` after the STA has
         // installed the PTK.
         if self.btm {
-            let pmf = self.stations.get(&sta).map(|s| s.sha256).unwrap_or(false);
-            if !pmf {
+            let protected = self.stations.get(&sta).map(|s| s.pmf).unwrap_or(false);
+            if !protected {
                 let f = self.btm_request_frame(&sta);
                 out.tx(f);
             }

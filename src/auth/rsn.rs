@@ -14,6 +14,21 @@ pub const RSN_PSK_SHA256: [u8; 22] = [
     0x00, 0x0f, 0xac, 0x06, 0x00, 0x00,
 ];
 
+/// RSN information element offering both PSK AKMs: SHA-1 PSK (00-0F-AC:2) and
+/// PSK-SHA256 (00-0F-AC:6), with CCMP. This is what a `psk-sha256` BSS
+/// advertises, so a SHA-256-capable station can select AKM 6 (SHA-256 PTK
+/// derivation and an AES-128-CMAC key MIC at descriptor version 3) while plain
+/// WPA2 stations keep working. PMF is not advertised: AKM 6 does not require it,
+/// and a station that wants it negotiates SAE instead.
+pub const RSN_PSK_SHA256_MIXED: [u8; 26] = [
+    0x30, 0x18, // id 48, len 24
+    0x01, 0x00, // version
+    0x00, 0x0f, 0xac, 0x04, // group data cipher: CCMP-128
+    0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, // 1 pairwise: CCMP-128
+    0x02, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x0f, 0xac, 0x06, // 2 AKMs: PSK, PSK-SHA256
+    0x00, 0x00, // RSN capabilities
+];
+
 /// RSN information element for WPA3-SAE: CCMP-128 pairwise/group, AKM = SAE
 /// (00-0F-AC:8), RSN capabilities with MFPR|MFPC set, and a Group Management
 /// Cipher Suite of BIP-CMAC-128 (00-0F-AC:6) for PMF.
@@ -58,6 +73,7 @@ pub fn security_tail_for_cipher(mode: SecurityMode, cipher: DataCipher) -> Vec<u
     let mut v = Vec::new();
     match mode {
         SecurityMode::Wpa2 => v.extend_from_slice(&RSN),
+        SecurityMode::Wpa2PskSha256 => v.extend_from_slice(&RSN_PSK_SHA256_MIXED),
         SecurityMode::Wpa3Sae => {
             v.extend_from_slice(&RSN_WPA3);
             v.extend_from_slice(&RSNXE_H2E);
@@ -173,10 +189,12 @@ pub fn validate_assoc_rsn_for_cipher(
         return Err(STATUS_INVALID_IE);
     }
     let has_psk = info.akms.contains(&rsn_suite(2));
+    let has_psk_sha256 = info.akms.contains(&rsn_suite(6));
     let has_sae = info.akms.contains(&rsn_suite(8));
     let has_owe = info.akms.contains(&rsn_suite(18));
     let supported = match mode {
         SecurityMode::Wpa2 => has_psk,
+        SecurityMode::Wpa2PskSha256 => has_psk || has_psk_sha256,
         SecurityMode::Wpa3Sae => has_sae,
         SecurityMode::Transition => has_psk || has_sae,
         SecurityMode::Owe => has_owe,
@@ -201,11 +219,18 @@ pub fn validate_assoc_rsn_for_cipher(
 
 /// Validate a scanned BSS/association RSN for the WPA-PSK-SHA256 AKM.
 pub fn validate_psk_sha256_rsn(rsn: &[u8]) -> Result<(), u16> {
+    validate_psk_sha256_rsn_for_cipher(rsn, DataCipher::Ccmp128)
+}
+
+/// Validate a scanned BSS/association RSN for AKM 6 and an explicit pairwise
+/// cipher. A mixed AP may advertise AKM 2 as well, but an AKM6-configured
+/// station requires suite 6 and selects only it in its association request.
+pub fn validate_psk_sha256_rsn_for_cipher(rsn: &[u8], cipher: DataCipher) -> Result<(), u16> {
     let info = parse_rsn(rsn).ok_or(STATUS_INVALID_IE)?;
-    if info.group != rsn_suite(4)
-        || !info.pairwise.contains(&rsn_suite(4))
-        || !info.akms.contains(&rsn_suite(6))
-    {
+    if info.group != rsn_suite(4) || !info.pairwise.contains(&rsn_suite(cipher.suite_type())) {
+        return Err(STATUS_INVALID_IE);
+    }
+    if !info.akms.contains(&rsn_suite(6)) {
         return Err(STATUS_INVALID_AKMP);
     }
     Ok(())

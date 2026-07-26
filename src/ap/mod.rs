@@ -5,7 +5,9 @@
 //! AP network stack. Protocol-specific behavior lives in the focused child
 //! modules; this facade owns shared state and the stable public API.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
@@ -41,6 +43,14 @@ const EAPOL_FIRST_TIMEOUT: Duration = Duration::from_millis(100);
 /// reference AP's default dot11RSNAConfigPairwiseUpdateCount is four total sends:
 /// the initial message plus three retransmissions.
 const MAX_EAPOL_RETRIES: u8 = 3;
+
+/// How long an associated PMF station has to answer the SA Query provoked by an
+/// unprotected Authentication or (Re)Association Request bearing its address
+/// (IEEE 802.11 `dot11AssociationSAQueryMaximumTimeout`, 1000 TU). If it stays
+/// silent the association really is stale and is torn down, so a genuine
+/// reconnect is delayed by ~1 s rather than blocked; if it answers, the spoofed
+/// frame is discarded without disturbing the session.
+const SA_QUERY_TIMEOUT: Duration = Duration::from_millis(1024);
 
 /// How long an unconsumed message-1 ANonce/replay pair is held for a reconnecting
 /// station. The pair is destroyed as soon as message 2 verifies, before either
@@ -104,12 +114,123 @@ struct PendingHandshake {
     created_at: Instant,
 }
 
+struct SaeCommitJob {
+    id: u64,
+    sta: [u8; 6],
+    h2e: bool,
+    ssid: Vec<u8>,
+    password: Vec<u8>,
+    sae_ap: [u8; 6],
+    sae_sta: [u8; 6],
+    peer_mld: Option<[u8; 6]>,
+    commit_payload: Vec<u8>,
+}
+
+impl Drop for SaeCommitJob {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+enum SaeCommitOutcome {
+    Complete {
+        sae: Box<sae::Sae>,
+        commit_body: Vec<u8>,
+        confirm_body: Vec<u8>,
+        rejected_groups: Vec<u16>,
+    },
+    Reflection,
+    Failed(String),
+}
+
+struct SaeCommitResult {
+    id: u64,
+    sta: [u8; 6],
+    h2e: bool,
+    peer_mld: Option<[u8; 6]>,
+    commit_payload: Vec<u8>,
+    outcome: SaeCommitOutcome,
+}
+
+struct PendingSaeCommit {
+    id: u64,
+    commit_payload: Vec<u8>,
+    queued_at: Instant,
+    pending_confirm: Option<Vec<u8>>,
+}
+
+struct AsyncSae {
+    jobs: mpsc::SyncSender<SaeCommitJob>,
+    results: mpsc::Receiver<SaeCommitResult>,
+    pending: HashMap<[u8; 6], PendingSaeCommit>,
+    next_id: u64,
+}
+
 #[derive(Clone)]
 struct PtkCandidate {
     m3_replay_counter: u64,
     kck: [u8; 16],
     kek: [u8; 16],
     tk: [u8; 32],
+}
+
+pub(crate) struct PreparedPskFile {
+    candidates_by_mac: HashMap<[u8; 6], Vec<[u8; 32]>>,
+    wildcard_candidates: Vec<[u8; 32]>,
+    passwords_by_mac: HashMap<[u8; 6], Vec<u8>>,
+    wildcard_password: Option<Vec<u8>>,
+}
+
+impl PreparedPskFile {
+    pub(crate) fn derive(ssid: &[u8], entries: &[(Option<[u8; 6]>, String)]) -> PreparedPskFile {
+        let ssid = String::from_utf8_lossy(ssid);
+        let mut prepared = PreparedPskFile {
+            candidates_by_mac: HashMap::new(),
+            wildcard_candidates: Vec::new(),
+            passwords_by_mac: HashMap::new(),
+            wildcard_password: None,
+        };
+        for (mac, pass) in entries {
+            let pmk = crypto::pbkdf2_pmk(pass, &ssid);
+            match mac {
+                Some(mac) => {
+                    prepared
+                        .candidates_by_mac
+                        .entry(*mac)
+                        .or_default()
+                        .push(pmk);
+                    // SAE must choose before a MIC can identify among duplicate
+                    // entries, matching the prior first-entry behavior.
+                    prepared
+                        .passwords_by_mac
+                        .entry(*mac)
+                        .or_insert_with(|| pass.as_bytes().to_vec());
+                }
+                None => {
+                    prepared.wildcard_candidates.push(pmk);
+                    if prepared.wildcard_password.is_none() {
+                        prepared.wildcard_password = Some(pass.as_bytes().to_vec());
+                    }
+                }
+            }
+        }
+        prepared
+    }
+}
+
+impl Drop for PreparedPskFile {
+    fn drop(&mut self) {
+        for candidates in self.candidates_by_mac.values_mut() {
+            candidates.zeroize();
+        }
+        self.wildcard_candidates.zeroize();
+        for password in self.passwords_by_mac.values_mut() {
+            password.zeroize();
+        }
+        if let Some(password) = self.wildcard_password.as_mut() {
+            password.zeroize();
+        }
+    }
 }
 
 impl Drop for PtkCandidate {
@@ -137,8 +258,12 @@ pub struct Station {
     /// bytes according to `Ap::pairwise_cipher`.
     pairwise_tk: [u8; 32],
     pub client_pn: u64,
-    /// Highest received CCMP packet number (replay protection).
-    pub last_rx_pn: u64,
+    /// Highest received CCMP packet number (replay protection). CCMP replay
+    /// counters are per traffic identifier — a transmitter keeps one PN sequence
+    /// per TID, so a single shared counter would drop legitimate frames whenever
+    /// two access categories interleave. Slots 0-15 are QoS TIDs; slot 16 is the
+    /// non-QoS replay domain.
+    pub last_rx_pn: [u64; 17],
     /// Highest received CCMP PN for protected management frames (separate replay
     /// counter, so a captured protected Deauth/Disassoc/Action can't be replayed).
     pub last_rx_mgmt_pn: u64,
@@ -161,10 +286,23 @@ pub struct Station {
     /// The completed SAE exchange selected Hash-to-Element and therefore
     /// requires the association request to carry the SAE H2E RSNXE bit.
     pub sae_h2e: bool,
-    /// SHA-256 key descriptors + PMF (true for WPA3-SAE and OWE stations).
+    /// SHA-256 key hierarchy: the PTK comes from the SHA-256 KDF rather than
+    /// PRF-512. True for WPA3-SAE, OWE, and PSK-SHA256 stations. This says
+    /// nothing about management-frame protection — see `pmf`.
     pub sha256: bool,
     /// OWE station: the EAPOL-Key MIC is HMAC-SHA256 (not SAE's AES-CMAC).
     pub owe: bool,
+    /// PSK-SHA256 station (AKM 00-0F-AC:6): SHA-256 PTK with an AES-128-CMAC
+    /// key MIC at Key Descriptor Version 3.
+    pub psk_sha256: bool,
+    /// Management frame protection is in force for this station, so it must be
+    /// given the IGTK, its robust management frames must be protected, and its
+    /// association may not be torn down by unprotected Auth/Assoc frames. Set
+    /// for SAE and OWE. Deliberately distinct from `sha256`: PSK-SHA256 shares
+    /// the SHA-256 key hierarchy without negotiating PMF, so keying the two off
+    /// one flag would hand it an IGTK it never asked for and silently claim PMF
+    /// guarantees it does not have.
+    pub pmf: bool,
     /// Last time a frame was received from this station (inactivity timer).
     pub last_activity: Instant,
     /// Per-station GTK *value*, used only in `per_sta_vif` mode so each station's
@@ -198,6 +336,9 @@ pub struct Station {
     /// (via `CONTROL_PORT_FRAME_TX_STATUS`). reference AP extends that message's short
     /// initial timeout after an ACK; message 3 keeps the short first timeout.
     pub eapol_acked: bool,
+    /// Generation of the currently armed EAPOL deadline. Heap entries from an
+    /// older message/retry are discarded without scanning the station table.
+    eapol_timer_generation: u64,
     /// Awaiting this station's Group Key Handshake message 2 (its ACK of a GTK
     /// rekey). Cleared on msg 2; while any station has it set, a fresh rekey is
     /// not started (reference AP coalesces — `GKeyDoneStations`).
@@ -211,11 +352,11 @@ pub struct Station {
     /// association request, keyed by Link ID. The association-link address is
     /// still `mac`.
     pub client_mld_links: Vec<(u8, [u8; 6])>,
-    /// The affiliated link this MLD station associated on. A client may
-    /// associate on any of the AP's links; the m3 must key every link the
-    /// station holds — the association link plus its `client_mld_links`
-    /// partners — so this is stored at association time (m2/m3 arrive over the
-    /// control port, where the per-frame RX link is not available).
+    /// The affiliated AP link this station associated on. This is recorded for
+    /// both MLD peers and legacy single-link stations on an AP MLD. MLD peers
+    /// need it to key every held link; legacy peers need its BSSID for PTK
+    /// derivation. M2/M3 arrive over the control port, where the per-frame RX
+    /// link is not always available.
     pub assoc_link_id: Option<u8>,
     /// Cached SAE commit+confirm auth-response frames, resent verbatim when the
     /// STA retries an identical commit (a lost response on a flaky medium), so
@@ -225,6 +366,12 @@ pub struct Station {
     /// The peer SAE commit payload we last answered — recognizes an identical
     /// retry vs. a genuinely fresh commit.
     pub sae_commit: Vec<u8>,
+    /// The transaction identifier and start time of the SA Query provoked by an
+    /// unprotected Authentication or (Re)Association Request, if one is
+    /// outstanding. Cleared by a protected SA Query Response carrying that same
+    /// identifier; if it is still set after [`SA_QUERY_TIMEOUT`] the station is
+    /// presumed gone and torn down.
+    pub sa_query: Option<(u16, Instant)>,
 }
 
 impl Station {
@@ -245,8 +392,9 @@ impl Station {
             sae_resp: Vec::new(),
             sae_commit: Vec::new(),
             client_pn: 1, // CCMP PN starts at 1
-            last_rx_pn: 0,
+            last_rx_pn: [0; 17],
             last_rx_mgmt_pn: 0,
+            sa_query: None,
             eapol_replay: 0,
             m1_replay: 0,
             ptk_candidates: Vec::new(),
@@ -258,6 +406,8 @@ impl Station {
             sae_h2e: false,
             sha256: false,
             owe: false,
+            psk_sha256: false,
+            pmf: false,
             last_activity: Instant::now(),
             gtk: random_bytes::<16>(),
             traits: 0,
@@ -269,6 +419,7 @@ impl Station {
             eapol_tx: Instant::now(),
             eapol_retries: 0,
             eapol_acked: false,
+            eapol_timer_generation: 0,
             group_rekeying: false,
         }
     }
@@ -280,6 +431,21 @@ impl Station {
         let pn = self.client_pn;
         self.client_pn += 1;
         Some(pn)
+    }
+
+    /// The EAPOL-Key MIC algorithm (and Key Descriptor Version) this station's
+    /// AKM selects. Derived from the negotiation flags rather than stored, so it
+    /// can never fall out of step with them.
+    fn key_mic(&self) -> dot11::KeyMic {
+        if !self.sha256 {
+            dot11::KeyMic::HmacSha1
+        } else if self.owe {
+            dot11::KeyMic::HmacSha256
+        } else if self.psk_sha256 {
+            dot11::KeyMic::AesCmacV3
+        } else {
+            dot11::KeyMic::AesCmac
+        }
     }
 
     fn set_pmk(&mut self, pmk: Option<[u8; 32]>) {
@@ -486,25 +652,31 @@ pub struct Ap {
     /// Negotiated RSN pairwise cipher. Group traffic remains CCMP-128.
     pairwise_cipher: dot11::DataCipher,
     pub pmk: [u8; 32],
-    /// reference AP credential-file model: candidate PMKs, each optionally bound to a
-    /// station MAC. `None` MAC = wildcard onboarding entry.
-    /// On the 4-way, MAC-specific entries are tried before wildcards; the one
-    /// whose PTK verifies message 2's MIC is that station's password.
-    psk_candidates: Vec<(Option<[u8; 6]>, [u8; 32])>,
+    /// Credential-file PMKs indexed before the radio starts (or on the reload
+    /// worker). Message 2 lookup is O(matches) rather than scanning every device
+    /// credential on the radio loop.
+    psk_candidates_by_mac: HashMap<[u8; 6], Vec<[u8; 32]>>,
+    wildcard_psk_candidates: Vec<[u8; 32]>,
     /// The passphrases behind `psk_candidates`, retained so the same SPR
     /// per-device credential file can select an SAE password by station MAC.
     /// SAE has to choose its password before replying to the peer's commit, so
     /// unlike WPA2 it cannot discover the matching credential from message 2's
     /// MIC later in the exchange.
-    credential_passwords: Vec<(Option<[u8; 6]>, Vec<u8>)>,
+    credential_passwords_by_mac: HashMap<[u8; 6], Vec<u8>>,
+    wildcard_credential_password: Option<Vec<u8>>,
     /// A configured credential file is the complete access-control database.
     /// Never fall back to the JSON/CLI passphrase when it is true, including
     /// when the file is empty or unreadable (fail closed).
     credential_file_authoritative: bool,
+    /// A control-plane credential reload is being derived off-thread. New
+    /// authentications fail closed until the prepared database is installed.
+    credential_reload_pending: bool,
     /// Passphrase, retained for WPA3-SAE PWE derivation.
     password: Vec<u8>,
     /// When true, accept WPA3-SAE (H2E) authentication.
     sae_enabled: bool,
+    /// When true, the BSS additionally offers the PSK-SHA256 AKM (00-0F-AC:6).
+    psk_sha256: bool,
     /// When true, advertise WPA2/WPA3 transition mode (mixed PSK + SAE).
     transition: bool,
     boottime: Instant,
@@ -577,6 +749,23 @@ pub struct Ap {
     /// sent (and therefore before a PTK can be installed), and expires after
     /// `ANONCE_HOLD`.
     pending_anonce: HashMap<[u8; 6], PendingHandshake>,
+    /// Earliest expiry among SAE/SA Query/ANonce/PMKSA state. Expensive table
+    /// maintenance is performed only when this deadline is reached.
+    maintenance_deadline: Option<Instant>,
+    /// Per-station EAPOL deadlines. Stale entries are invalidated by the
+    /// station's generation counter, so the normal radio-loop tick is O(1).
+    eapol_deadlines: BinaryHeap<Reverse<(Instant, u64, [u8; 6])>>,
+    /// Stations removed from the portable state machine since the transport
+    /// last reconciled its kernel/VLAN bookkeeping.
+    removed_stations: Vec<[u8; 6]>,
+    /// Stations whose four-way handshake just completed and whose keys now need
+    /// installation/authorization by the transport.
+    key_ready_stations: Vec<[u8; 6]>,
+    /// Incremented whenever GTK/IGTK/BIGTK material rotates.
+    group_key_epoch: u64,
+    /// Optional Linux runtime SAE worker. Unit tests and raw-frame mode retain
+    /// the synchronous path unless explicitly enabled.
+    async_sae: Option<AsyncSae>,
     /// Process-wide monotonically increasing EAPOL replay counter. It starts at
     /// a random non-zero value so frames from an earlier AP lifetime cannot be
     /// valid in a new lifetime.
@@ -647,12 +836,11 @@ fn prepend_radiotap(frame: Vec<u8>) -> Vec<u8> {
     f
 }
 
-fn expected_key_descriptor_version(sha256: bool, owe: bool) -> u16 {
-    if sha256 || owe {
-        0
-    } else {
-        2
-    }
+/// The Key Descriptor Version an EAPOL-Key from this station must carry. It is
+/// exactly the version of the MIC algorithm its AKM selects (2 for HMAC-SHA1,
+/// 0 for SAE/OWE, 3 for PSK-SHA256).
+fn expected_key_descriptor_version(mic: dot11::KeyMic) -> u16 {
+    u16::from(mic.version())
 }
 
 fn key_info_matches(key_info: u16, expected: u16) -> bool {
@@ -715,10 +903,14 @@ mod sae_auth;
 impl Drop for Ap {
     fn drop(&mut self) {
         self.pmk.zeroize();
-        for (_, pmk) in &mut self.psk_candidates {
-            pmk.zeroize();
+        for candidates in self.psk_candidates_by_mac.values_mut() {
+            candidates.zeroize();
         }
-        for (_, password) in &mut self.credential_passwords {
+        self.wildcard_psk_candidates.zeroize();
+        for password in self.credential_passwords_by_mac.values_mut() {
+            password.zeroize();
+        }
+        if let Some(password) = self.wildcard_credential_password.as_mut() {
             password.zeroize();
         }
         self.password.zeroize();

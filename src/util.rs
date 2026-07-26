@@ -1,5 +1,15 @@
 //! Small shared helpers.
 
+/// Whether verbose nl80211/frame diagnostics were requested at process start.
+///
+/// This is read from several receive and handshake hot paths. Environment
+/// lookup allocates an `OsString` and takes the process-environment lock, so
+/// resolve it once instead of paying that cost for every frame.
+pub fn netlink_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUSTAP_NL_DEBUG").is_some())
+}
+
 /// Encode bytes as lowercase hex.
 pub fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);

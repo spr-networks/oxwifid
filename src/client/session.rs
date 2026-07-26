@@ -7,6 +7,14 @@ impl Client {
     /// SSID, BSSID, CCMP cipher, AKM, and PMF requirements are checked before
     /// sending any authentication frame.
     pub(super) fn beacon_matches(&self, frame: &dot11::Dot11) -> bool {
+        // The existing MLD association template is SAE + mandatory PMF. Reusing
+        // it for an AKM6-configured station would put SAE in the Association
+        // Request after open-system authentication and either fail negotiation
+        // or run with the wrong PMF policy. Stay fail-closed until the AKM6 MLO
+        // IGTK/robust-management path is implemented.
+        if self.psk_sha256 && self.mld_mac.is_some() {
+            return false;
+        }
         if frame.addr1 != [0xff; 6] || frame.addr2 != frame.addr3 || frame.body.len() < 12 {
             return false;
         }
@@ -39,7 +47,7 @@ impl Client {
                 && dot11::rsn_has_akm(rsn, 8)
                 && dot11::rsn_has_mfpc(rsn)
         } else if self.psk_sha256 {
-            dot11::validate_psk_sha256_rsn(rsn).is_ok()
+            dot11::validate_psk_sha256_rsn_for_cipher(rsn, self.pairwise_cipher).is_ok()
         } else {
             dot11::validate_assoc_rsn_for_cipher(rsn, self.security_mode(), self.pairwise_cipher)
                 .is_ok()
@@ -71,7 +79,9 @@ impl Client {
         self.tk.zeroize();
         self.pairwise_tk.zeroize();
         self.gtk.zeroize();
+        self.gtk_set = false;
         self.ptk_installed = false;
+        self.pending_ptk = None; // zeroized by PendingPtk::drop
         self.client_pn = 1;
         self.last_rx_pn = [0; 17];
         self.last_rx_gpn = [0; 17];
@@ -137,6 +147,15 @@ impl Client {
     }
 
     pub(super) fn valid_m3(&self, ek: &dot11::EapolKey) -> bool {
+        // The ANonce must belong either to the message 1 we are currently
+        // answering (a first handshake or an in-flight rekey) or to the PTK
+        // already installed (the AP retransmitting message 3 after losing our
+        // message 4). Anything else is not part of a handshake we started.
+        let nonce_matches = self
+            .pending_ptk
+            .as_ref()
+            .is_some_and(|p| ek.key_nonce == p.anonce)
+            || (self.ptk_installed && ek.key_nonce == self.anonce);
         ek.is_pairwise()
             && ek.key_ack()
             && ek.install()
@@ -147,8 +166,32 @@ impl Client {
             && ek.encrypted_key_data()
             && ek.descriptor_version() == self.key_mic().version()
             && usize::from(ek.key_length) == self.pairwise_cipher.key_len()
-            && ek.key_nonce == self.anonce
+            && nonce_matches
             && !ek.key_data.is_empty()
+    }
+
+    /// Whether this message 1 is an exact retransmission of the one we are
+    /// already answering, rather than a new handshake.
+    pub(super) fn is_m1_retry(&self, ek: &dot11::EapolKey) -> bool {
+        self.pending_ptk
+            .as_ref()
+            .is_some_and(|p| ek.key_replay_counter == p.replay && ek.key_nonce == p.anonce)
+    }
+
+    /// Whether this message 1 starts a handshake newer than anything we have
+    /// *authenticated* — an authenticator-initiated PTK rekey, or the AP
+    /// restarting the 4-way. Nothing is installed from it until its message 3
+    /// verifies, so acting on it costs at most one wasted derivation.
+    ///
+    /// The bound is `self.eapol_replay`, which only ever advances on a
+    /// MIC-verified message 3, and deliberately *not* the counter of any
+    /// candidate already pending: message 1 carries no MIC, so a forged one
+    /// claiming a counter of `u64::MAX` would otherwise raise the bar past every
+    /// genuine rekey the AP could ever send and permanently wedge the station.
+    /// Last message 1 wins instead — an injected one costs an in-flight
+    /// handshake, never the installed key or the session.
+    pub(super) fn is_m1_fresh(&self, ek: &dot11::EapolKey) -> bool {
+        ek.key_replay_counter > self.eapol_replay
     }
 
     pub(super) fn valid_group_m1(&self, ek: &dot11::EapolKey) -> bool {

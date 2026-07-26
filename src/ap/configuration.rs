@@ -37,11 +37,15 @@ impl Ap {
             phy_mode: dot11::PhyMode::Vht,
             pairwise_cipher: dot11::DataCipher::Ccmp128,
             pmk: [0u8; 32],
-            psk_candidates: Vec::new(),
-            credential_passwords: Vec::new(),
+            psk_candidates_by_mac: HashMap::new(),
+            wildcard_psk_candidates: Vec::new(),
+            credential_passwords_by_mac: HashMap::new(),
+            wildcard_credential_password: None,
             credential_file_authoritative: false,
+            credential_reload_pending: false,
             password: Vec::new(),
             sae_enabled: false,
+            psk_sha256: false,
             transition: false,
             boottime: Instant::now(),
             sc: 0,
@@ -71,6 +75,12 @@ impl Ap {
             sa_query_id: 0,
             pmksa_cache: HashMap::new(),
             pending_anonce: HashMap::new(),
+            maintenance_deadline: None,
+            eapol_deadlines: BinaryHeap::new(),
+            removed_stations: Vec::new(),
+            key_ready_stations: Vec::new(),
+            group_key_epoch: 0,
+            async_sae: None,
             eapol_replay_counter: random_nonzero_u64(),
             sae_token_key: random_bytes(),
             request_rates: HashMap::new(),
@@ -110,6 +120,15 @@ impl Ap {
         self.sae_enabled = true;
     }
 
+    /// Advertise and accept the PSK-SHA256 AKM (00-0F-AC:6) alongside plain
+    /// WPA2-PSK. A station selecting AKM 6 gets a SHA-256-derived PTK and an
+    /// AES-128-CMAC EAPOL-Key MIC at Key Descriptor Version 3; stations
+    /// selecting AKM 2 are unaffected. Mutually exclusive with SAE/OWE, which
+    /// bring their own key hierarchies.
+    pub fn enable_psk_sha256(&mut self) {
+        self.psk_sha256 = true;
+    }
+
     /// Enable WPA2/WPA3 transition mode (accept both PSK and SAE clients).
     pub fn enable_transition(&mut self) {
         self.sae_enabled = true;
@@ -135,6 +154,8 @@ impl Ap {
             dot11::SecurityMode::Transition
         } else if self.sae_enabled {
             dot11::SecurityMode::Wpa3Sae
+        } else if self.psk_sha256 {
+            dot11::SecurityMode::Wpa2PskSha256
         } else {
             dot11::SecurityMode::Wpa2
         }
@@ -209,6 +230,46 @@ impl Ap {
 
     pub fn set_mld_links(&mut self, links: Vec<MldLink>) {
         self.mld_links = links;
+    }
+
+    /// Fill in affiliated-link BSSIDs that were left unspecified in the config
+    /// (sentinel `00:00:00:00:00:00`) using the reference AP's
+    /// `random_mac_addr_keep_oui()` rule: retain the MLD address's first three
+    /// octets, randomize the final three, and force locally-administered unicast.
+    ///
+    /// Generate each missing address once during AP bring-up. Explicit link
+    /// BSSIDs are preserved. The uniqueness check makes the reference behavior
+    /// fail-safe against the extremely unlikely random collision.
+    pub fn derive_missing_mld_link_macs(&mut self) {
+        let base = self.mld_mac;
+        let mut used = self
+            .mld_links
+            .iter()
+            .filter_map(|link| (link.mac != [0u8; 6]).then_some(link.mac))
+            .collect::<HashSet<_>>();
+        used.insert(base);
+
+        for link in &mut self.mld_links {
+            if link.mac == [0u8; 6] {
+                loop {
+                    let mut mac = base;
+                    mac[3..].copy_from_slice(&random_bytes::<3>());
+                    mac[0] = (mac[0] & 0xfe) | 0x02;
+                    if used.insert(mac) {
+                        link.mac = mac;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// BSSID of the affiliated link with the given Link ID, if present.
+    pub fn mld_link_mac(&self, link_id: u8) -> Option<[u8; 6]> {
+        self.mld_links
+            .iter()
+            .find(|l| l.link_id == link_id)
+            .map(|l| l.mac)
     }
 
     /// Advertise one active-link set for every QoS TID in both directions.
@@ -292,31 +353,51 @@ impl Ap {
         if self.static_credential {
             return;
         }
-        // Reload is a revocation boundary: cached SAE PMKs were authenticated
-        // under the old credential database and must not survive replacement.
-        self.pmksa_cache.clear();
-        for (_, pmk) in &mut self.psk_candidates {
-            pmk.zeroize();
+        let prepared = PreparedPskFile::derive(&self.ssid, entries);
+        self.install_prepared_psk_file(prepared);
+    }
+
+    /// Atomically adopt a credential database whose PBKDF2 work was completed
+    /// off the radio thread.
+    pub(crate) fn install_prepared_psk_file(&mut self, mut prepared: PreparedPskFile) {
+        if self.static_credential {
+            return;
         }
-        for (_, password) in &mut self.credential_passwords {
+        self.pmksa_cache.clear();
+        for candidates in self.psk_candidates_by_mac.values_mut() {
+            candidates.zeroize();
+        }
+        self.wildcard_psk_candidates.zeroize();
+        for password in self.credential_passwords_by_mac.values_mut() {
             password.zeroize();
         }
-        self.psk_candidates.clear();
-        self.credential_passwords.clear();
+        if let Some(password) = self.wildcard_credential_password.as_mut() {
+            password.zeroize();
+        }
+        self.psk_candidates_by_mac.clear();
+        self.wildcard_psk_candidates.clear();
+        self.credential_passwords_by_mac.clear();
+        self.wildcard_credential_password = None;
         self.credential_file_authoritative = true;
-        let ssid = String::from_utf8_lossy(&self.ssid).to_string();
-        self.psk_candidates = entries
-            .iter()
-            .map(|(m, pass)| (*m, crypto::pbkdf2_pmk(pass, &ssid)))
-            .collect();
-        self.credential_passwords = entries
-            .iter()
-            .map(|(m, pass)| (*m, pass.as_bytes().to_vec()))
-            .collect();
+        self.credential_reload_pending = false;
+        self.psk_candidates_by_mac = std::mem::take(&mut prepared.candidates_by_mac);
+        self.wildcard_psk_candidates = std::mem::take(&mut prepared.wildcard_candidates);
+        self.credential_passwords_by_mac = std::mem::take(&mut prepared.passwords_by_mac);
+        self.wildcard_credential_password = std::mem::take(&mut prepared.wildcard_password);
         // The file is authoritative, so the JSON passphrase is no longer a
         // fallback and should not remain resident.
         self.pmk.zeroize();
         self.password.zeroize();
+    }
+
+    pub(crate) fn begin_psk_reload(&mut self) {
+        if !self.static_credential {
+            self.credential_reload_pending = true;
+        }
+    }
+
+    pub(crate) fn cancel_psk_reload(&mut self) {
+        self.credential_reload_pending = false;
     }
 
     /// Select an SAE credential using reference AP's non-AP MLD identity rules. An
@@ -329,19 +410,14 @@ impl Ap {
         identity: &[u8; 6],
         link_identity: Option<&[u8; 6]>,
     ) -> Option<&[u8]> {
-        let exact = |wanted: &[u8; 6]| {
-            self.credential_passwords
-                .iter()
-                .find(|(mac, _)| mac.as_ref() == Some(wanted))
-        };
-        exact(identity)
-            .or_else(|| link_identity.and_then(exact))
-            .or_else(|| {
-                self.credential_passwords
-                    .iter()
-                    .find(|(mac, _)| mac.is_none())
-            })
-            .map(|(_, password)| password.as_slice())
+        if self.credential_reload_pending {
+            return None;
+        }
+        self.credential_passwords_by_mac
+            .get(identity)
+            .or_else(|| link_identity.and_then(|link| self.credential_passwords_by_mac.get(link)))
+            .or(self.wildcard_credential_password.as_ref())
+            .map(Vec::as_slice)
             .or_else(|| (!self.credential_file_authoritative).then_some(self.password.as_slice()))
     }
 

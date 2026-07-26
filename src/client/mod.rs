@@ -30,6 +30,37 @@ impl ClientOut {
     }
 }
 
+/// A PTK derived from a message 1 but not yet authenticated.
+///
+/// Message 1 carries no MIC, so anything derived from it is attacker-influenced
+/// until the matching message 3 verifies under the derived KCK. Holding it aside
+/// — rather than overwriting the live keys at message 2 — is what makes an
+/// authenticator-initiated PTK rekey safe: the existing PTK keeps carrying data
+/// throughout, a forged message 1 costs one wasted derivation instead of the
+/// working session, and the replay counter only advances on an authenticated
+/// message 3 (so a forged counter of `u64::MAX` cannot wedge the supplicant).
+struct PendingPtk {
+    anonce: [u8; 32],
+    snonce: [u8; 32],
+    /// Replay counter of the message 1 this candidate answers.
+    replay: u64,
+    kck: [u8; 16],
+    kek: [u8; 16],
+    tk: [u8; 16],
+    pairwise_tk: [u8; 32],
+}
+
+impl Drop for PendingPtk {
+    fn drop(&mut self) {
+        self.anonce.zeroize();
+        self.snonce.zeroize();
+        self.kck.zeroize();
+        self.kek.zeroize();
+        self.tk.zeroize();
+        self.pairwise_tk.zeroize();
+    }
+}
+
 pub struct Client {
     pub mac: [u8; 6],
     ssid: Vec<u8>,
@@ -52,7 +83,14 @@ pub struct Client {
     /// protected management frames (otherwise a forged "NULL-key" Deauth would
     /// be accepted mid-handshake once SAE/OWE has set `sae_pmk`/PMF).
     ptk_installed: bool,
+    /// PTK candidate derived from the message 1 currently being answered, held
+    /// until its message 3 authenticates it. See [`PendingPtk`].
+    pending_ptk: Option<PendingPtk>,
     gtk: [u8; 16],
+    /// Whether `gtk` holds a real installed key. Used as the "is set" marker by
+    /// the key-reinstallation guard, so an all-zero initial value is never
+    /// mistaken for a key the AP just re-delivered.
+    gtk_set: bool,
     /// The CCMP key index the current GTK is installed at (1 or 2, toggled by the
     /// AP on each group rekey), so group-addressed downlink is matched to it.
     gtk_key_id: u8,
@@ -115,7 +153,7 @@ pub struct Client {
     mld_mac: Option<[u8; 6]>,
     link1_mac: Option<[u8; 6]>,
     ap_mld_mac: Option<[u8; 6]>,
-    /// PSK-SHA256 (AKM 00-0F-AC:6): SHA-256 PTK + AES-CMAC v3 MIC (MLO-capable PSK).
+    /// PSK-SHA256 (AKM 00-0F-AC:6): SHA-256 PTK + AES-CMAC v3 MIC.
     psk_sha256: bool,
     /// Pause at EAPOL message 3: decrypt + log each m3 (incl. retransmissions) but
     /// never send m4, so the AP keeps rebuilding/retransmitting m3 (UAF leak window).

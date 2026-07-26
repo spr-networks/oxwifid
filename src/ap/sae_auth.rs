@@ -133,10 +133,16 @@ impl Ap {
     }
 
     pub(super) fn incomplete_sae_count(&self) -> usize {
-        self.stations
+        let established = self
+            .stations
             .values()
             .filter(|s| s.sae.is_some() && !s.sae_confirmed)
-            .count()
+            .count();
+        established
+            + self
+                .async_sae
+                .as_ref()
+                .map_or(0, |worker| worker.pending.len())
     }
 
     /// Drive the SAE (Dragonfly) exchange. Commit (seq 1) yields our commit +
@@ -149,7 +155,7 @@ impl Ap {
         payload: &[u8],
         out: &mut Outgoing,
     ) {
-        if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+        if crate::util::netlink_debug_enabled() {
             let grp = if seq == 1 && payload.len() >= 2 {
                 u16::from_le_bytes([payload[0], payload[1]])
             } else {
@@ -208,6 +214,17 @@ impl Ap {
                 self.record_failure(sta, crate::failures::FailureKind::Sae);
                 return;
             };
+            // A duplicate can arrive while the worker is still deriving the
+            // PWE. It is already represented by the queued job, so coalesce it
+            // instead of consuming another queue slot/CPU pass.
+            if self
+                .async_sae
+                .as_ref()
+                .and_then(|worker| worker.pending.get(sta))
+                .is_some_and(|pending| pending.commit_payload == commit_payload)
+            {
+                return;
+            }
             // Idempotent retry: if the STA re-sends the identical commit while
             // SAE is still in progress, resend the cached commit+confirm instead
             // of resetting our scalar. A lost response on a flaky medium then
@@ -229,7 +246,11 @@ impl Ap {
                 .stations
                 .get(sta)
                 .map(|s| s.sae.is_some() && !s.sae_confirmed)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || self
+                    .async_sae
+                    .as_ref()
+                    .is_some_and(|worker| worker.pending.contains_key(sta));
             if !existing_exchange && incomplete >= SAE_INCOMPLETE_MAX {
                 // Do no ECC work and allocate no state while the hard cap is
                 // full. Expiration in tick/prune_idle makes this self-healing.
@@ -248,6 +269,17 @@ impl Ap {
                     self.request_sae_token(sta, h2e, &commit_payload, out);
                     return;
                 }
+            }
+            // A worker may already be inside an uncancellable scalar
+            // multiplication for this MAC. Even a valid token must not let one
+            // peer enqueue a train of replacement jobs behind it; the peer will
+            // retry after the bounded in-flight job completes.
+            if self
+                .async_sae
+                .as_ref()
+                .is_some_and(|worker| worker.pending.contains_key(sta))
+            {
+                return;
             }
             // Pick the PWE method the STA advertised: status 126 = Hash-to-Element
             // (the preferred, side-channel-free derivation), otherwise legacy
@@ -283,7 +315,7 @@ impl Ap {
             // A reference AP-style credential file may bind a different SAE
             // password to each link-addressed station. Select and own it before
             // mutably borrowing the SAE/station state below.
-            let Some(mut password) = self
+            let Some(password) = self
                 .sae_password_for(&sae_sta, peer_mld.as_ref().map(|_| sta))
                 .map(<[u8]>::to_vec)
             else {
@@ -317,189 +349,394 @@ impl Ap {
                 crate::util::bytes_to_mac(&sae_sta),
                 crate::util::bytes_to_mac(&sae_ap),
             );
-            let mut sae = if h2e {
-                sae::Sae::new_h2e(&self.ssid, &password, None, &sae_ap, &sae_sta)
+            let job = SaeCommitJob {
+                id: 0,
+                sta: *sta,
+                h2e,
+                ssid: self.ssid.clone(),
+                password,
+                sae_ap,
+                sae_sta,
+                peer_mld,
+                commit_payload,
+            };
+            if self.async_sae.is_some() {
+                self.queue_sae_commit(job, out);
             } else {
-                match sae::Sae::new_hunting_pecking(&password, &sae_ap, &sae_sta) {
-                    Some(s) => s,
-                    None => {
-                        password.zeroize();
-                        return;
+                let result = Self::compute_sae_commit(job);
+                self.finish_sae_commit(result, None, out);
+            }
+        } else if seq == 2 {
+            if let Some(pending) = self
+                .async_sae
+                .as_mut()
+                .and_then(|worker| worker.pending.get_mut(sta))
+            {
+                // Worker completion and the peer's confirm are two independent
+                // inputs. Hold the confirm so completion is applied first even
+                // on very fast clients / slow CPUs.
+                pending.pending_confirm = Some(payload.to_vec());
+                return;
+            }
+            self.finish_sae_confirm(sta, payload);
+        }
+    }
+
+    /// Move SAE's PWE/ECC work off the caller's frame-receive thread. The queue
+    /// is deliberately bounded like the reference implementation's commit
+    /// queue; duplicate commits are coalesced in `handle_sae_auth`.
+    pub fn enable_async_sae(&mut self) {
+        if self.async_sae.is_some() {
+            return;
+        }
+        const SAE_WORK_QUEUE_MAX: usize = 15;
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel(SAE_WORK_QUEUE_MAX);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("rustap-sae".to_string())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let result = Self::compute_sae_commit(job);
+                    if result_tx.send(result).is_err() {
+                        break;
                     }
                 }
-            };
-            password.zeroize();
-            if let Err(err) = sae.parse_peer_commit(&commit_payload) {
-                eprintln!(
-                    "AP: SAE commit parse failed from {}: {err:?}",
-                    crate::util::bytes_to_mac(sta)
-                );
-                self.record_failure(sta, crate::failures::FailureKind::Sae);
-                return;
+            });
+        match spawn {
+            Ok(_) => {
+                self.async_sae = Some(AsyncSae {
+                    jobs: job_tx,
+                    results: result_rx,
+                    pending: HashMap::new(),
+                    next_id: 1,
+                });
             }
-            let rejected_groups = sae.peer_rejected_groups();
-            if !rejected_groups.is_empty() {
-                eprintln!(
-                    "AP: SAE H2E peer {} rejected groups {}; applying negotiated key salt",
-                    crate::util::bytes_to_mac(&sae_sta),
-                    rejected_groups
-                        .iter()
-                        .map(u16::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+            Err(err) => {
+                eprintln!("AP: cannot start SAE worker; using synchronous SAE: {err}");
             }
-            sae.prepare_commit(None);
-            // Reject a reflected commit (peer echoing our own scalar + element).
-            if sae.is_reflection() {
-                eprintln!(
-                    "AP: SAE reflected commit from {}",
-                    crate::util::bytes_to_mac(sta)
-                );
-                self.record_failure(sta, crate::failures::FailureKind::Sae);
-                return;
-            }
-            if let Err(err) = sae.process_commit() {
-                eprintln!(
-                    "AP: SAE commit processing failed from {}: {err:?}",
-                    crate::util::bytes_to_mac(sta)
-                );
-                self.record_failure(sta, crate::failures::FailureKind::Sae);
-                return;
-            }
+        }
+    }
 
-            let mut commit_body = sae.write_commit();
-            let Ok(mut confirm_body) = sae.write_confirm() else {
-                return;
-            };
-            if peer_mld.is_some() {
-                let ml = dot11::multi_link_auth(&self.mld_mac);
-                commit_body.extend_from_slice(&ml);
-                confirm_body.extend_from_slice(&ml);
+    fn queue_sae_commit(&mut self, mut job: SaeCommitJob, out: &mut Outgoing) {
+        let queued_at = Instant::now();
+        let (id, sta, commit_payload, send) = {
+            let worker = self.async_sae.as_mut().expect("worker enabled");
+            job.id = worker.next_id;
+            worker.next_id = worker.next_id.wrapping_add(1).max(1);
+            let id = job.id;
+            let sta = job.sta;
+            let commit_payload = job.commit_payload.clone();
+            (id, sta, commit_payload, worker.jobs.try_send(job))
+        };
+        match send {
+            Ok(()) => {
+                let worker = self.async_sae.as_mut().expect("worker enabled");
+                worker.pending.insert(
+                    sta,
+                    PendingSaeCommit {
+                        id,
+                        commit_payload,
+                        queued_at,
+                        pending_confirm: None,
+                    },
+                );
+                self.schedule_maintenance(queued_at + SAE_AUTH_TIMEOUT);
             }
-            let resp_status = if h2e {
-                dot11::STATUS_SAE_H2E
-            } else {
-                dot11::STATUS_SUCCESS
-            };
+            Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                self.request_sae_token(&job.sta, job.h2e, &job.commit_payload, out);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
+                eprintln!("AP: SAE worker stopped; rejecting commit");
+                self.record_failure(&job.sta, crate::failures::FailureKind::Sae);
+                self.async_sae = None;
+            }
+        }
+    }
 
-            self.sc = -1;
-            let sc1 = self.next_sc();
-            let commit = dot11::build_sae_auth(
-                sta,
-                &self.mac,
-                &self.mac,
-                0,
-                sc1,
-                1,
-                resp_status,
-                &commit_body,
+    fn compute_sae_commit(job: SaeCommitJob) -> SaeCommitResult {
+        let mut sae = if job.h2e {
+            sae::Sae::new_h2e(&job.ssid, &job.password, None, &job.sae_ap, &job.sae_sta)
+        } else {
+            let Some(sae) = sae::Sae::new_hunting_pecking(&job.password, &job.sae_ap, &job.sae_sta)
+            else {
+                return SaeCommitResult {
+                    id: job.id,
+                    sta: job.sta,
+                    h2e: job.h2e,
+                    peer_mld: job.peer_mld,
+                    commit_payload: job.commit_payload.clone(),
+                    outcome: SaeCommitOutcome::Failed(
+                        "hunting-and-pecking found no password element".to_string(),
+                    ),
+                };
+            };
+            sae
+        };
+        if let Err(err) = sae.parse_peer_commit(&job.commit_payload) {
+            return SaeCommitResult {
+                id: job.id,
+                sta: job.sta,
+                h2e: job.h2e,
+                peer_mld: job.peer_mld,
+                commit_payload: job.commit_payload.clone(),
+                outcome: SaeCommitOutcome::Failed(format!("commit parse failed: {err:?}")),
+            };
+        }
+        let rejected_groups = sae.peer_rejected_groups();
+        sae.prepare_commit(None);
+        if sae.is_reflection() {
+            return SaeCommitResult {
+                id: job.id,
+                sta: job.sta,
+                h2e: job.h2e,
+                peer_mld: job.peer_mld,
+                commit_payload: job.commit_payload.clone(),
+                outcome: SaeCommitOutcome::Reflection,
+            };
+        }
+        if let Err(err) = sae.process_commit() {
+            return SaeCommitResult {
+                id: job.id,
+                sta: job.sta,
+                h2e: job.h2e,
+                peer_mld: job.peer_mld,
+                commit_payload: job.commit_payload.clone(),
+                outcome: SaeCommitOutcome::Failed(format!("commit processing failed: {err:?}")),
+            };
+        }
+        let commit_body = sae.write_commit();
+        let confirm_body = match sae.write_confirm() {
+            Ok(body) => body,
+            Err(err) => {
+                return SaeCommitResult {
+                    id: job.id,
+                    sta: job.sta,
+                    h2e: job.h2e,
+                    peer_mld: job.peer_mld,
+                    commit_payload: job.commit_payload.clone(),
+                    outcome: SaeCommitOutcome::Failed(format!(
+                        "confirm generation failed: {err:?}"
+                    )),
+                };
+            }
+        };
+        SaeCommitResult {
+            id: job.id,
+            sta: job.sta,
+            h2e: job.h2e,
+            peer_mld: job.peer_mld,
+            commit_payload: job.commit_payload.clone(),
+            outcome: SaeCommitOutcome::Complete {
+                sae: Box::new(sae),
+                commit_body,
+                confirm_body,
+                rejected_groups,
+            },
+        }
+    }
+
+    pub(super) fn poll_sae_work(&mut self, out: &mut Outgoing) {
+        while let Some(worker) = self.async_sae.as_ref() {
+            let result = match worker.results.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("AP: SAE worker result channel closed");
+                    self.async_sae = None;
+                    break;
+                }
+            };
+            let pending_confirm = {
+                let worker = self.async_sae.as_mut().expect("worker present");
+                let matches = worker.pending.get(&result.sta).is_some_and(|pending| {
+                    pending.id == result.id && pending.commit_payload == result.commit_payload
+                });
+                if !matches {
+                    continue;
+                }
+                worker
+                    .pending
+                    .remove(&result.sta)
+                    .and_then(|pending| pending.pending_confirm)
+            };
+            self.finish_sae_commit(result, pending_confirm, out);
+        }
+    }
+
+    fn finish_sae_commit(
+        &mut self,
+        result: SaeCommitResult,
+        pending_confirm: Option<Vec<u8>>,
+        out: &mut Outgoing,
+    ) {
+        let SaeCommitResult {
+            sta,
+            h2e,
+            peer_mld,
+            commit_payload,
+            outcome,
+            ..
+        } = result;
+        let SaeCommitOutcome::Complete {
+            sae,
+            mut commit_body,
+            mut confirm_body,
+            rejected_groups,
+        } = outcome
+        else {
+            match outcome {
+                SaeCommitOutcome::Reflection => {
+                    eprintln!(
+                        "AP: SAE reflected commit from {}",
+                        crate::util::bytes_to_mac(&sta)
+                    );
+                }
+                SaeCommitOutcome::Failed(err) => {
+                    eprintln!(
+                        "AP: SAE commit failed from {}: {err}",
+                        crate::util::bytes_to_mac(&sta)
+                    );
+                }
+                SaeCommitOutcome::Complete { .. } => unreachable!(),
+            }
+            self.record_failure(&sta, crate::failures::FailureKind::Sae);
+            return;
+        };
+        if !rejected_groups.is_empty() {
+            eprintln!(
+                "AP: SAE H2E peer {} rejected groups {}; applying negotiated key salt",
+                crate::util::bytes_to_mac(&peer_mld.unwrap_or(sta)),
+                rejected_groups
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
-            let sc2 = self.next_sc();
-            let confirm = dot11::build_sae_auth(
-                sta,
-                &self.mac,
-                &self.mac,
-                0,
-                sc2,
-                2,
-                dot11::STATUS_SUCCESS,
-                &confirm_body,
-            );
+        }
+        if peer_mld.is_some() {
+            let ml = dot11::multi_link_auth(&self.mld_mac);
+            commit_body.extend_from_slice(&ml);
+            confirm_body.extend_from_slice(&ml);
+        }
+        let resp_status = if h2e {
+            dot11::STATUS_SAE_H2E
+        } else {
+            dot11::STATUS_SUCCESS
+        };
+        self.sc = -1;
+        let sc1 = self.next_sc();
+        let commit = dot11::build_sae_auth(
+            &sta,
+            &self.mac,
+            &self.mac,
+            0,
+            sc1,
+            1,
+            resp_status,
+            &commit_body,
+        );
+        let sc2 = self.next_sc();
+        let confirm = dot11::build_sae_auth(
+            &sta,
+            &self.mac,
+            &self.mac,
+            0,
+            sc2,
+            2,
+            dot11::STATUS_SUCCESS,
+            &confirm_body,
+        );
 
-            let mut pmk = [0u8; 32];
-            pmk.copy_from_slice(&sae.pmk);
-            let entry = self
-                .stations
-                .entry(*sta)
-                .or_insert_with(|| Station::new(*sta));
-            entry.sae = Some(sae);
-            entry.set_pmk(Some(pmk));
+        let mut pmk = [0u8; 32];
+        pmk.copy_from_slice(&sae.pmk);
+        let now = Instant::now();
+        let entry = self
+            .stations
+            .entry(sta)
+            .or_insert_with(|| Station::new(sta));
+        entry.sae = Some(*sae);
+        entry.set_pmk(Some(pmk));
+        pmk.zeroize();
+        entry.sae_confirmed = false;
+        entry.sae_h2e = h2e;
+        entry.sha256 = true;
+        entry.psk_sha256 = false;
+        entry.pmf = true;
+        if let Some(mld) = peer_mld {
+            entry.client_mld_mac = Some(mld);
+        }
+        entry.sae_resp = vec![commit.clone(), confirm.clone()];
+        entry.sae_commit = commit_payload;
+        entry.last_activity = now;
+        self.schedule_maintenance(now + SAE_AUTH_TIMEOUT);
+        out.tx(commit);
+        out.tx(confirm);
+        if let Some(payload) = pending_confirm {
+            self.finish_sae_confirm(&sta, &payload);
+        }
+    }
+
+    fn finish_sae_confirm(&mut self, sta: &[u8; 6], payload: &[u8]) {
+        eprintln!(
+            "AP: SAE confirm received from {} payload_len={}",
+            crate::util::bytes_to_mac(sta),
+            payload.len(),
+        );
+        let confirm_result = self
+            .stations
+            .get_mut(sta)
+            .and_then(|s| s.sae.as_mut())
+            .map(|sae| sae.check_confirm(payload));
+        match confirm_result {
+            Some(Ok(())) => {}
+            Some(Err(sae::SaeError::ReplayedConfirm)) => return,
+            Some(Err(err)) => {
+                eprintln!(
+                    "AP: SAE confirm verification failed from {}: {err:?}",
+                    crate::util::bytes_to_mac(sta)
+                );
+                self.record_failure(sta, crate::failures::FailureKind::Sae);
+                return;
+            }
+            None => {
+                eprintln!(
+                    "AP: SAE confirm from {} has no matching commit state",
+                    crate::util::bytes_to_mac(sta)
+                );
+                return;
+            }
+        }
+        let confirmed = self
+            .stations
+            .get(sta)
+            .and_then(|s| s.sae.as_ref())
+            .map(|sae| (sae.pmkid.clone(), sae.pmk.clone()));
+        let identity = self
+            .stations
+            .get(sta)
+            .and_then(|s| s.client_mld_mac)
+            .unwrap_or(*sta);
+        if let Some(s) = self.stations.get_mut(sta) {
+            s.sae_confirmed = true;
+        }
+        eprintln!(
+            "AP: SAE confirm verified for {}",
+            crate::util::bytes_to_mac(sta),
+        );
+        if let Some((pmkid, mut pmk)) = confirmed {
+            if crate::util::netlink_debug_enabled() {
+                let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                eprintln!("AP: SAE confirmed pmkid={} pmk={}", hex(&pmkid), hex(&pmk));
+            }
+            if pmkid.len() == 16 && pmk.len() == 32 {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&pmkid);
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&pmk);
+                self.cache_pmksa(id, identity, k, true);
+                k.zeroize();
+            }
             pmk.zeroize();
-            entry.sae_confirmed = false;
-            entry.sae_h2e = h2e;
-            entry.sha256 = true; // WPA3-SAE uses SHA-256 key descriptors + PMF
-            if let Some(mld) = peer_mld {
-                entry.client_mld_mac = Some(mld);
-            }
-            // Cache this response so an identical retried commit is answered
-            // idempotently (see the guard above).
-            entry.sae_resp = vec![commit.clone(), confirm.clone()];
-            entry.sae_commit = commit_payload;
-            entry.last_activity = Instant::now();
-
-            out.tx(commit);
-            out.tx(confirm);
-        } else if seq == 2 {
-            eprintln!(
-                "AP: SAE confirm received from {} payload_len={}",
-                crate::util::bytes_to_mac(sta),
-                payload.len(),
-            );
-            // Verify the peer's confirm. Only a verified confirm completes SAE:
-            // it gates association (see `handle_assoc_req`) and is the point at
-            // which the PMK becomes mutually authenticated, so the PMKSA is
-            // cached *here*, not on the unconfirmed commit.
-            let confirm_result = self
-                .stations
-                .get_mut(sta)
-                .and_then(|s| s.sae.as_mut())
-                .map(|sae| sae.check_confirm(payload));
-            match confirm_result {
-                Some(Ok(())) => {}
-                // An authenticated duplicate/lower counter is a replay, not a
-                // password failure. Drop it without advancing state or logging
-                // a false credential alert.
-                Some(Err(sae::SaeError::ReplayedConfirm)) => return,
-                // Confirm present but invalid -> wrong password / forged confirm.
-                Some(Err(err)) => {
-                    eprintln!(
-                        "AP: SAE confirm verification failed from {}: {err:?}",
-                        crate::util::bytes_to_mac(sta)
-                    );
-                    self.record_failure(sta, crate::failures::FailureKind::Sae);
-                    return;
-                }
-                None => {
-                    eprintln!(
-                        "AP: SAE confirm from {} has no matching commit state",
-                        crate::util::bytes_to_mac(sta)
-                    );
-                    return;
-                }
-            }
-            let confirmed = self
-                .stations
-                .get(sta)
-                .and_then(|s| s.sae.as_ref())
-                .map(|sae| (sae.pmkid.clone(), sae.pmk.clone()));
-            let identity = self
-                .stations
-                .get(sta)
-                .and_then(|s| s.client_mld_mac)
-                .unwrap_or(*sta);
-            if let Some(s) = self.stations.get_mut(sta) {
-                s.sae_confirmed = true;
-            }
-            eprintln!(
-                "AP: SAE confirm verified for {}",
-                crate::util::bytes_to_mac(sta),
-            );
-            if let Some((pmkid, mut pmk)) = confirmed {
-                if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
-                    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-                    eprintln!("AP: SAE confirmed pmkid={} pmk={}", hex(&pmkid), hex(&pmk));
-                }
-                if pmkid.len() == 16 && pmk.len() == 32 {
-                    let mut id = [0u8; 16];
-                    id.copy_from_slice(&pmkid);
-                    let mut k = [0u8; 32];
-                    k.copy_from_slice(&pmk);
-                    self.cache_pmksa(id, identity, k, true);
-                    k.zeroize();
-                }
-                pmk.zeroize();
-            }
         }
     }
 

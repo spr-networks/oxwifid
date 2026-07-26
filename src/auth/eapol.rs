@@ -82,6 +82,7 @@ pub(crate) fn eapol_data_header_tods(bssid: &[u8; 6], sta: &[u8; 6], sc: u16) ->
 // Station-side management & EAPOL frames (uplink / to-DS)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields.
 pub fn build_eapol_m2(
     bssid: &[u8; 6],
     sta: &[u8; 6],
@@ -217,6 +218,7 @@ pub fn build_eapol_m1_mld(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields.
 fn build_eapol_m1_with_key_data(
     bssid: &[u8; 6],
     sta: &[u8; 6],
@@ -241,6 +243,7 @@ fn build_eapol_m1_with_key_data(
 
 /// MAC Address KDE (00-0F-AC:3), used by 802.11be MLD EAPOL-Key messages to
 /// carry the AP or STA MLD MAC address.
+#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields/KDEs.
 pub fn build_eapol_m3(
     bssid: &[u8; 6],
     sta: &[u8; 6],
@@ -347,7 +350,7 @@ pub fn build_eapol_m3_for_key_length_with_rsc(
     if let Some((oc, ch)) = oci {
         plain.extend_from_slice(&oci_kde(oc, ch)); // OCV
     }
-    if std::env::var_os("RUSTAP_NL_DEBUG").is_some() {
+    if crate::util::netlink_debug_enabled() {
         eprintln!(
             "AP: m3 plaintext KDEs ({}B)={}",
             plain.len(),
