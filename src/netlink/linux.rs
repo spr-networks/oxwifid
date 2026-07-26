@@ -3140,16 +3140,15 @@ pub fn run_offload_ap(
                 continue;
             }
 
-            if !base_station_cleanup.contains_key(&core_sta) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                base_station_cleanup.entry(core_sta)
+            {
                 if let Some(&kernel_sta) = kernel_stations.get(&core_sta) {
-                    base_station_cleanup.insert(
-                        core_sta,
-                        BaseStationCleanup {
-                            kernel_sta,
-                            cleanup_id: None,
-                            retry_at: now,
-                        },
-                    );
+                    entry.insert(BaseStationCleanup {
+                        kernel_sta,
+                        cleanup_id: None,
+                        retry_at: now,
+                    });
                 } else {
                     // NEW_STATION never succeeded, so there is no kernel
                     // resource to retire and no identifier to reserve.

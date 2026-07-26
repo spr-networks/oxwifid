@@ -6,6 +6,7 @@ use crate::group_keys::{gtk_kde, igtk_kde, mlo_bigtk_kde, mlo_gtk_kde_with_pn, m
 use crate::structures::security::{KeyInfo, KeyMic};
 use zeroize::Zeroize;
 
+#[allow(clippy::too_many_arguments)] // Parameters map directly to EAPOL-Key fields/KDEs.
 pub fn build_group_key_msg1(
     bssid: &[u8; 6],
     sta: &[u8; 6],

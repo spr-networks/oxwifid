@@ -110,6 +110,7 @@ fn encrypt_data_payload(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Inputs are the authenticated cipher operation tuple.
 fn decrypt_data_payload(
     cipher: DataCipher,
     tk: &[u8],
