@@ -170,12 +170,14 @@ impl Client {
             && !ek.key_data.is_empty()
     }
 
-    /// Whether this message 1 is an exact retransmission of the one we are
-    /// already answering, rather than a new handshake.
+    /// Whether this message 1 retries the handshake we are already answering.
+    ///
+    /// An authenticator may advance the replay counter on a retry while keeping
+    /// the same ANonce. In that case, preserve the existing SNonce/PTK candidate.
     pub(super) fn is_m1_retry(&self, ek: &dot11::EapolKey) -> bool {
         self.pending_ptk
             .as_ref()
-            .is_some_and(|p| ek.key_replay_counter == p.replay && ek.key_nonce == p.anonce)
+            .is_some_and(|p| ek.key_replay_counter >= p.replay && ek.key_nonce == p.anonce)
     }
 
     /// Whether this message 1 starts a handshake newer than anything we have

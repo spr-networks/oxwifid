@@ -55,6 +55,26 @@ fn wrap_eapol(body: &[u8]) -> Vec<u8> {
     frame
 }
 
+fn rewrite_m3_replay(frame: &[u8], replay: u64, kck: &[u8]) -> Vec<u8> {
+    let mut rewritten = frame.to_vec();
+    let radiotap_len = usize::from(u16::from_le_bytes([rewritten[2], rewritten[3]]));
+    let eapol_start = radiotap_len + 24 + 8;
+    let body_start = eapol_start + 4;
+    let body_len = usize::from(u16::from_be_bytes([
+        rewritten[eapol_start + 2],
+        rewritten[eapol_start + 3],
+    ]));
+    let eapol_end = body_start + body_len;
+    let replay_offset = body_start + 5;
+    let mic_offset = body_start + 77;
+
+    rewritten[replay_offset..replay_offset + 8].copy_from_slice(&replay.to_be_bytes());
+    rewritten[mic_offset..mic_offset + 16].fill(0);
+    let mic = dot11::KeyMic::HmacSha1.compute(kck, &rewritten[eapol_start..eapol_end]);
+    rewritten[mic_offset..mic_offset + 16].copy_from_slice(&mic);
+    rewritten
+}
+
 fn drive(ap: &mut Ap, station: &mut Client, max_rounds: usize) -> Vec<Vec<u8>> {
     let mut captured_from_station = Vec::new();
     let mut to_station = vec![ap.beacon_frame()];
@@ -197,12 +217,22 @@ fn completed_handshake_frames_cannot_reinstall_a_pairwise_key() {
 }
 
 #[test]
-fn duplicate_message_3_is_reacked_without_resetting_pairwise_pn() {
+fn newer_message_3_retry_is_reacked_without_resetting_pairwise_pn() {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
     let mut ap = Ap::new("secure-net", "device-password", ap_mac, 1);
     let mut station = Client::new("secure-net", "device-password", sta_mac);
+    let snonce = [0x42; 32];
+    station.set_test_snonce(snonce);
     let m3 = connect_and_capture_m3(&mut ap, &mut station);
+    let m3_key = parse(&m3)
+        .eapol_key_body()
+        .and_then(dot11::EapolKey::parse)
+        .expect("captured M3");
+    let pmk = crypto::pbkdf2_pmk("device-password", "secure-net");
+    let ptk = crypto::custom_prf512(&pmk, &ap_mac, &sta_mac, &m3_key.key_nonce, &snonce);
+    let newer_replay = m3_key.key_replay_counter + 1;
+    let newer_m3 = rewrite_m3_replay(&m3, newer_replay, &ptk[..16]);
 
     let eth = [
         ap_mac.as_slice(),
@@ -214,8 +244,13 @@ fn duplicate_message_3_is_reacked_without_resetting_pairwise_pn() {
     let first = station.encrypt_uplink(&eth).expect("first protected frame");
     let first_pn = parse(&first).ccmp_pn().expect("first packet number");
 
-    let retry = station.handle_incoming(&m3);
-    assert_eq!(retry.frames.len(), 1, "duplicate M3 must be re-ACKed");
+    let retry = station.handle_incoming(&newer_m3);
+    assert_eq!(retry.frames.len(), 1, "newer M3 retry must be re-ACKed");
+    let retry_key = parse(&retry.frames[0])
+        .eapol_key_body()
+        .and_then(dot11::EapolKey::parse)
+        .expect("M4 retry");
+    assert_eq!(retry_key.key_replay_counter, newer_replay);
 
     let second = station
         .encrypt_uplink(&eth)
@@ -224,7 +259,12 @@ fn duplicate_message_3_is_reacked_without_resetting_pairwise_pn() {
     assert_eq!(
         second_pn,
         first_pn + 1,
-        "duplicate M3 must not reinstall the PTK or reset its transmit PN"
+        "M3 retry must not reinstall the PTK or reset its transmit PN"
+    );
+
+    assert!(
+        station.handle_incoming(&m3).frames.is_empty(),
+        "the older M3 must be rejected after authenticating the newer counter"
     );
 }
 

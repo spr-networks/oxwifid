@@ -269,6 +269,33 @@ pub fn build_deauth(bssid: &[u8; 6], dst: &[u8; 6], reason: u16) -> Vec<u8> {
     v
 }
 
+/// Rebuild a management MPDU around a plaintext body.
+///
+/// nl80211/mac80211 owns pairwise management-frame encryption whenever the
+/// PTK is installed in the kernel. Userspace still marks the frame as robust
+/// through its subtype/category, but must hand the kernel a plaintext body
+/// with the Protected bit clear. The kernel sets that bit, allocates the PN,
+/// and encrypts from the same packet-number space used by data traffic.
+#[cfg(target_os = "linux")]
+pub(crate) fn rebuild_plaintext_mgmt(
+    frame: &Dot11,
+    addresses: Option<([u8; 6], [u8; 6], [u8; 6])>,
+    body: &[u8],
+) -> Vec<u8> {
+    let (a1, a2, a3) = addresses.unwrap_or((frame.addr1, frame.addr2, frame.addr3));
+    let mut rebuilt = dot11_header(
+        TYPE_MGMT,
+        frame.subtype(),
+        frame.fc1 & !FC_PROTECTED,
+        &a1,
+        &a2,
+        &a3,
+        frame.sc,
+    );
+    rebuilt.extend_from_slice(body);
+    rebuilt
+}
+
 pub fn build_assoc_resp_comeback(
     bssid: &[u8; 6],
     sta: &[u8; 6],

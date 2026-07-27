@@ -2,9 +2,38 @@
 
 use super::*;
 
+/// Which component verified/decrypted a protected management frame.
+#[derive(Clone, Copy)]
+pub(crate) enum ManagementRx {
+    /// Monitor/raw-frame mode: the protocol engine verifies the MIC and PN.
+    Userspace,
+    /// nl80211 mode: mac80211 already verified, replay-checked, and decrypted
+    /// the body while retaining the Protected bit in the 802.11 header.
+    #[cfg(target_os = "linux")]
+    Kernel,
+}
+
 impl Ap {
     /// Process one received frame (radiotap-prefixed) and return what to do.
     pub fn handle_incoming(&mut self, radiotap_frame: &[u8]) -> Outgoing {
+        self.handle_incoming_from(radiotap_frame, ManagementRx::Userspace)
+    }
+
+    /// Process an nl80211-delivered frame.
+    ///
+    /// This is deliberately a separate transport boundary: treating a
+    /// kernel-decrypted robust frame as raw CCMP would parse its plaintext
+    /// action/reason bytes as a CCMP header and drop every PMF exchange.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn handle_kernel_incoming(&mut self, radiotap_frame: &[u8]) -> Outgoing {
+        self.handle_incoming_from(radiotap_frame, ManagementRx::Kernel)
+    }
+
+    fn handle_incoming_from(
+        &mut self,
+        radiotap_frame: &[u8],
+        management_rx: ManagementRx,
+    ) -> Outgoing {
         let mut out = Outgoing::default();
         if dot11::radiotap_bad_fcs(radiotap_frame) {
             return out;
@@ -60,8 +89,10 @@ impl Ap {
                 dot11::SUBTYPE_ASSOC_REQ | dot11::SUBTYPE_REASSOC_REQ => {
                     self.handle_assoc_req(&frame, &mut out)
                 }
-                dot11::SUBTYPE_DEAUTH | dot11::SUBTYPE_DISASSOC => self.handle_robust_mgmt(&frame),
-                dot11::SUBTYPE_ACTION => self.handle_action(&frame, &mut out),
+                dot11::SUBTYPE_DEAUTH | dot11::SUBTYPE_DISASSOC => {
+                    self.handle_robust_mgmt(&frame, management_rx)
+                }
+                dot11::SUBTYPE_ACTION => self.handle_action(&frame, management_rx, &mut out),
                 _ => {}
             }
         }

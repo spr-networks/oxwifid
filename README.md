@@ -29,7 +29,7 @@ barely-ap --config FILE.json [--ssid NAME] [--mac AA:BB:CC:DD:EE:FF]
 
 The config file (see `barely-ap.example.json`) keeps shared settings such as
 `ssid`, credentials, `key_mgmt`, `pairwise_cipher`, country, and policy toggles
-at the top level. Per-radoi settings (`interface`, `mac`, `band`, `channel`,
+at the top level. Per-radio settings (`interface`, `mac`, `band`, `channel`,
 `width`, `phy`, and `ctrl_path`)
 
 For the AP, non-default pairwise ciphers use Linux/mac80211
@@ -37,7 +37,8 @@ authenticated-encryption offload and therefore require `mode: "netlink"`.
 `barely-cli` also implements WPA2 single-link CCMP/GCMP protection in userspace
 (GCMP uses RustCrypto `aes-gcm`) for reverse-direction interop. 
 
-Unknown keys and type mismatches are hard errors. See [`src/config.rs`](src/config.rs).
+Unknown keys and type mismatches are hard errors. See
+[`src/config/`](src/config/).
 Passwords are accepted only through the JSON `passphrase` or `psk_file`
 settings;
 
@@ -118,12 +119,11 @@ drives any of them:
 | `netlink` | nl80211 generic netlink (`netlink`)      | Linux    |
 
 The raw-frame transports live under `src/raw_frames/`; the nl80211 transport
-lives under `src/netlink/`. The netlink message-encoding layer
-(`netlink::msg`) is platform-independent and unit-tested (`cargo test`), while
-the socket layer is Linux-only. nl80211 mode configures the radio (interface
-type + channel) and carries **management** frames via `NL80211_CMD_FRAME`;
-userspace-encrypted CCMP **data** frames still use the monitor path. The
-Linux-only code is type-checked here via
+lives under `src/netlink/`. Its ABI constants, helper policy, and message
+encoding are separate platform-independent modules, while socket and AP runtime
+code live under `src/netlink/linux/`. nl80211 mode configures the radio,
+publishes stations and keys, sends control-port EAPOL, and leaves the protected
+data plane to mac80211. The Linux-only code is type-checked here via
 `cargo check --target x86_64-unknown-linux-gnu` but not run on non-Linux hosts.
 
 Unlike the threaded Python original, the AP is a single-threaded state machine:

@@ -1,5 +1,6 @@
 //! Protected management enforcement and action-frame handling.
 
+use super::receive::ManagementRx;
 use super::*;
 
 impl Ap {
@@ -73,7 +74,7 @@ impl Ap {
 
     /// PMF enforcement for received Deauth/Disassoc: under PMF only a valid
     /// CCMP-protected frame tears the station down; unprotected ones are dropped.
-    pub(super) fn handle_robust_mgmt(&mut self, frame: &dot11::Dot11) {
+    pub(super) fn handle_robust_mgmt(&mut self, frame: &dot11::Dot11, management_rx: ManagementRx) {
         let sta = frame.addr2;
         let pmf = match self.stations.get(&sta) {
             Some(s) => s.pmf,
@@ -89,54 +90,37 @@ impl Ap {
             self.disconnect(&sta, reason);
             return;
         }
-        // PMF: only a CCMP-valid frame from a station that has *completed the
-        // 4-way* (real PTK installed) tears it down. `installed_tk` returns None
-        // before the handshake finishes, so we never attempt CCMP with the
-        // all-zero placeholder key — which would let a spoofed "NULL-key"
-        // frame decrypt and kill a station mid-handshake.
-        if frame.protected() {
-            if let Some(tk) = self.installed_pairwise_key(&sta) {
-                // Reject a replayed protected frame (PN must strictly increase)
-                // before acting on it.
-                let Some(pn) = frame.ccmp_pn() else { return };
-                if self
-                    .stations
-                    .get(&sta)
-                    .map(|s| pn <= s.last_rx_mgmt_pn)
-                    .unwrap_or(true)
-                {
-                    return;
-                }
-                if let Some(plain) = dot11::decrypt_protected_mgmt_sec(
-                    self.pairwise_cipher,
-                    frame,
-                    &tk[..self.pairwise_cipher.key_len()],
-                    self.mld_mgmt_rx_sec_addrs(&sta),
-                ) {
-                    let reason = plain
-                        .get(..2)
-                        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                        .unwrap_or(0);
-                    eprintln!(
-                        "AP: protected {} from {} reason={reason}",
-                        if frame.subtype() == dot11::SUBTYPE_DEAUTH {
-                            "deauth"
-                        } else {
-                            "disassoc"
-                        },
-                        crate::util::bytes_to_mac(&sta),
-                    );
-                    self.disconnect(&sta, reason);
-                } else {
-                    self.record_failure(&sta, crate::failures::FailureKind::ProtectedMgmt);
-                }
-            }
-        }
+        // PMF: only a protected frame from a station that completed the 4-way
+        // may tear down the association. `protected_mgmt_body` gives exactly
+        // one component ownership of MIC/replay validation: this protocol
+        // engine in raw mode, mac80211 in nl80211 mode.
+        let Some(plain) = self.protected_mgmt_body(frame, management_rx) else {
+            return;
+        };
+        let reason = plain
+            .get(..2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .unwrap_or(0);
+        eprintln!(
+            "AP: protected {} from {} reason={reason}",
+            if frame.subtype() == dot11::SUBTYPE_DEAUTH {
+                "deauth"
+            } else {
+                "disassoc"
+            },
+            crate::util::bytes_to_mac(&sta),
+        );
+        self.disconnect(&sta, reason);
     }
 
     /// Handle a (PMF-protected) SA Query Action frame: respond to a Request, and
     /// accept a Response as proof the station is alive.
-    pub(super) fn handle_action(&mut self, frame: &dot11::Dot11, out: &mut Outgoing) {
+    pub(super) fn handle_action(
+        &mut self,
+        frame: &dot11::Dot11,
+        management_rx: ManagementRx,
+        out: &mut Outgoing,
+    ) {
         let sta = frame.addr2;
         // 802.11v BTM Response (unprotected, e.g. WPA2): the client's reply to
         // our steering request.
@@ -162,6 +146,13 @@ impl Ap {
                 }
                 return;
             }
+            if self.stations.get(&sta).is_some_and(|station| station.pmf)
+                && dot11::parse_btm_response(&frame.body).is_some()
+            {
+                // WNM/BTM is a robust action category. A PMF station's
+                // unprotected response is unauthenticated and must be ignored.
+                return;
+            }
             if let Some((token, status)) = dot11::parse_btm_response(&frame.body) {
                 eprintln!(
                     "AP: BTM Response from {} token={token} status={status}",
@@ -170,35 +161,11 @@ impl Ap {
             }
             return;
         }
-        // Everything below is a robust Action frame, which under PMF must be
-        // protected; the unprotected cases all returned above.
-        // Only attempt CCMP with a fully-installed PTK (never the all-zero
-        // placeholder of a station that skipped ahead before keying).
-        let Some(tk) = self.installed_pairwise_key(&sta) else {
+        // Everything below is robust. In raw mode this verifies CCMP/GCMP and
+        // advances the replay window; in nl80211 mode mac80211 already did so.
+        let Some(plain) = self.protected_mgmt_body(frame, management_rx) else {
             return;
         };
-        // Reject a replayed protected action frame (PN must strictly increase).
-        let Some(rx_pn) = frame.ccmp_pn() else { return };
-        if self
-            .stations
-            .get(&sta)
-            .map(|s| rx_pn <= s.last_rx_mgmt_pn)
-            .unwrap_or(true)
-        {
-            return;
-        }
-        let Some(plain) = dot11::decrypt_protected_mgmt_sec(
-            self.pairwise_cipher,
-            frame,
-            &tk[..self.pairwise_cipher.key_len()],
-            self.mld_mgmt_rx_sec_addrs(&sta),
-        ) else {
-            self.record_failure(&sta, crate::failures::FailureKind::ProtectedMgmt);
-            return;
-        };
-        if let Some(s) = self.stations.get_mut(&sta) {
-            s.last_rx_mgmt_pn = rx_pn;
-        }
         if let Some((action, trans)) = dot11::parse_sa_query(&plain) {
             if action == dot11::SA_QUERY_RESPONSE {
                 // The station proved it still holds the PTK, so whatever
@@ -215,6 +182,9 @@ impl Ap {
                 return;
             }
             if action == dot11::SA_QUERY_REQUEST {
+                let Some(tk) = self.installed_pairwise_key(&sta) else {
+                    return;
+                };
                 let Some(pn) = self.stations.get_mut(&sta).unwrap().next_client_pn() else {
                     return;
                 };
@@ -234,5 +204,55 @@ impl Ap {
                 ));
             }
         }
+    }
+
+    /// Return an authenticated robust-management body.
+    ///
+    /// Keeping this decision in one function prevents the former split where
+    /// Action and Deauth each implemented subtly different PN/MIC handling
+    /// (including a Deauth path that verified a PN but never advanced it).
+    fn protected_mgmt_body(
+        &mut self,
+        frame: &dot11::Dot11,
+        management_rx: ManagementRx,
+    ) -> Option<Vec<u8>> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = management_rx;
+        if !frame.protected() {
+            return None;
+        }
+        let sta = frame.addr2;
+        // Even on the kernel path, require a completed userspace association.
+        // This prevents a protected-looking event for an unknown/half-keyed
+        // peer from changing protocol state.
+        self.installed_pairwise_key(&sta)?;
+
+        #[cfg(target_os = "linux")]
+        if matches!(management_rx, ManagementRx::Kernel) {
+            return Some(frame.body.clone());
+        }
+
+        let pn = frame.ccmp_pn()?;
+        if self
+            .stations
+            .get(&sta)
+            .is_none_or(|station| pn <= station.last_rx_mgmt_pn)
+        {
+            return None;
+        }
+        let tk = self.installed_pairwise_key(&sta)?;
+        let Some(plain) = dot11::decrypt_protected_mgmt_sec(
+            self.pairwise_cipher,
+            frame,
+            &tk[..self.pairwise_cipher.key_len()],
+            self.mld_mgmt_rx_sec_addrs(&sta),
+        ) else {
+            self.record_failure(&sta, crate::failures::FailureKind::ProtectedMgmt);
+            return None;
+        };
+        if let Some(station) = self.stations.get_mut(&sta) {
+            station.last_rx_mgmt_pn = pn;
+        }
+        Some(plain)
     }
 }

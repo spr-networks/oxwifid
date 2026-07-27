@@ -162,14 +162,13 @@ impl Client {
     ) {
         let Some(bssid) = self.bssid else { return };
 
-        // A lower counter is stale. A counter equal to the already-installed M3
-        // is a retry after M4 loss: it must be re-ACKed without reinstalling any
-        // key or resetting a packet number. The explicit debug pause retains its
-        // diagnostic behavior.
-        let duplicate_m3 = !self.pause_m3
+        // A lower counter is stale. An authenticated M3 with the installed
+        // ANonce and a newer-or-equal counter is a retry after M4 loss: re-ACK
+        // it without reinstalling keys or resetting packet numbers.
+        let retry_m3 = !self.pause_m3
             && self.eapol_state == 2
             && self.ptk_installed
-            && ek.key_replay_counter == self.eapol_replay;
+            && ek.key_replay_counter >= self.eapol_replay;
         // A fresh M3 needs a candidate to verify it against, and its counter must
         // be at least the M1 that candidate answers (the authenticator advances
         // the counter between M1 and M3) and newer than anything we have already
@@ -180,14 +179,14 @@ impl Client {
             .as_ref()
             .is_some_and(|p| ek.key_replay_counter >= p.replay)
             && (self.pause_m3 || ek.key_replay_counter > self.eapol_replay);
-        if !self.pause_m3 && !duplicate_m3 && !fresh_m3 {
+        if !self.pause_m3 && !retry_m3 && !fresh_m3 {
             return;
         }
 
-        // Verify the AP's MIC over message 3. A duplicate is checked with the
+        // Verify the AP's MIC over message 3. A retry is checked with the
         // installed KCK; a fresh M3 with the pending candidate's KCK, which is
         // precisely what proves the candidate came from the real AP.
-        let kck = if duplicate_m3 {
+        let kck = if retry_m3 {
             self.kck
         } else {
             match self.pending_ptk.as_ref() {
@@ -210,9 +209,11 @@ impl Client {
             return; // bad MIC, drop
         }
 
-        // A duplicate M3 is authenticated above, then goes straight to the M4
+        // An M3 retry is authenticated above, then goes straight to the M4
         // response below. In particular, it never unwraps or reinstalls the GTK.
-        if !duplicate_m3 {
+        if retry_m3 {
+            self.eapol_replay = ek.key_replay_counter;
+        } else {
             let kek = match self.pending_ptk.as_ref() {
                 Some(p) => p.kek,
                 None => return,
