@@ -29,11 +29,22 @@ pub fn channel_to_freq(channel: u8) -> u16 {
 }
 
 /// The Channel Center Frequency Segment-0 channel for the wide (40/80/160/320
-/// MHz) block containing the primary `channel`, on the 5 GHz (base 36) or 6 GHz
-/// (base 1) band. For 20 MHz this is the primary channel itself.
+/// MHz) block containing the primary `channel`. The 5 GHz UNII-1/2 blocks are
+/// anchored at 36/100, while UNII-3 is anchored at 149; treating all of 5 GHz
+/// as one channel-number grid produces invalid centers such as 154 instead of
+/// 155 for an 80 MHz channel 149 AP. The 6 GHz grid is anchored at channel 1.
+/// For 20 MHz this is the primary channel itself.
 pub fn center_channel(channel: u8, width_mhz: u16, band6: bool) -> u8 {
-    let base: i32 = if band6 { 1 } else { 36 };
     let p = channel as i32;
+    let base: i32 = if band6 {
+        1
+    } else if channel >= 149 {
+        149
+    } else if channel >= 100 {
+        100
+    } else {
+        36
+    };
     let c = match width_mhz {
         // HT40+: primary is the lower 20 MHz of the pair; HT40-: the upper.
         40 => {

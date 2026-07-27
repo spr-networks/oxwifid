@@ -1419,12 +1419,18 @@ fn center_channel_math() {
     assert_eq!(center_channel(36, 80, false), 42);
     assert_eq!(center_channel(48, 80, false), 42);
     assert_eq!(center_channel(52, 80, false), 58);
+    // UNII-3 starts at channel 149 rather than aligning to the channel-36
+    // grid: 149-161 has center channel 155 (5775 MHz), not 154.
+    assert_eq!(center_channel(149, 80, false), 155);
+    assert_eq!(center_channel(161, 80, false), 155);
     // 5 GHz 160 MHz: 36-64 -> 50, 100-128 -> 114
     assert_eq!(center_channel(36, 160, false), 50);
     assert_eq!(center_channel(100, 160, false), 114);
     // 5 GHz 40 MHz: HT40+ (36 -> 38), HT40- (40 -> 38)
     assert_eq!(center_channel(36, 40, false), 38);
     assert_eq!(center_channel(40, 40, false), 38);
+    assert_eq!(center_channel(149, 40, false), 151);
+    assert_eq!(center_channel(153, 40, false), 151);
     // 6 GHz 80 MHz: 1-13 -> 7; 320 MHz: 1-61 -> 31
     assert_eq!(center_channel(1, 80, true), 7);
     assert_eq!(center_channel(1, 320, true), 31);
