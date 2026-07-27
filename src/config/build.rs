@@ -73,22 +73,7 @@ impl Config {
         if self.guest {
             ap.enable_guest();
         }
-        if let Some(path) = &self.psk_file {
-            // A configured credential file is authoritative even when startup
-            // cannot read it. Mark it active with an empty set first so an I/O
-            // or parse error fails closed instead of enabling the test/default
-            // JSON passphrase.
-            ap.set_psk_file(&[]);
-            match parse_psk_file(path) {
-                Ok(mut entries) => {
-                    ap.set_psk_file(&entries);
-                    for (_, password) in &mut entries {
-                        password.zeroize();
-                    }
-                }
-                Err(e) => eprintln!("barely-ap: psk_file {path:?}: {e}"),
-            }
-        }
+        load_credential_files(&mut ap, self);
         ap
     }
 
@@ -163,26 +148,45 @@ impl Config {
         // Credentials, SPR ExtraBSS semantics: an entry with its own passphrase
         // is a static guest password the device credential database must never
         // override (reference AP: `wpa_psk_file=/dev/null` + `wpa_passphrase`).
-        // Without one, the BSS authenticates against the same `psk_file` as the
-        // primary (or its inherited passphrase when none is configured).
+        // Without one, the BSS authenticates against the same separate WPA2 and
+        // SAE databases as the primary.
         if bss.own_passphrase {
             ap.set_static_credential();
-        } else if let Some(path) = &self.psk_file {
-            // Same fail-closed order as `build_ap`: mark the file authoritative
-            // before reading it, so an I/O or parse error cannot fall back to
-            // the inherited JSON passphrase.
-            ap.set_psk_file(&[]);
-            match parse_psk_file(path) {
-                Ok(mut entries) => {
-                    ap.set_psk_file(&entries);
-                    for (_, password) in &mut entries {
-                        password.zeroize();
-                    }
-                }
-                Err(e) => eprintln!("barely-ap: psk_file {path:?}: {e}"),
-            }
+        } else {
+            load_credential_files(&mut ap, self);
         }
         ap
+    }
+}
+
+fn load_credential_files(ap: &mut Ap, config: &Config) {
+    if let Some(path) = &config.wpa_psk_file {
+        // Mark each configured domain authoritative before I/O so a missing or
+        // malformed file fails closed instead of falling back to a passphrase.
+        ap.set_wpa_psk_file(&[]);
+        match parse_psk_file(path) {
+            Ok(mut entries) => {
+                ap.set_wpa_psk_file(&entries);
+                zeroize_entries(&mut entries);
+            }
+            Err(error) => eprintln!("barely-ap: wpa_psk_file {path:?}: {error}"),
+        }
+    }
+    if let Some(path) = &config.sae_psk_file {
+        ap.set_sae_password_file(&[]);
+        match parse_psk_file(path) {
+            Ok(mut entries) => {
+                ap.set_sae_password_file(&entries);
+                zeroize_entries(&mut entries);
+            }
+            Err(error) => eprintln!("barely-ap: sae_psk_file {path:?}: {error}"),
+        }
+    }
+}
+
+fn zeroize_entries(entries: &mut [(Option<[u8; 6]>, String)]) {
+    for (_, password) in entries {
+        password.zeroize();
     }
 }
 

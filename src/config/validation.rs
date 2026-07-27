@@ -107,14 +107,27 @@ impl Config {
     }
 
     fn validate_radio(&self) -> Result<(), String> {
-        // WPA2-PSK / WPA3-SAE passphrases are 8..=63 characters; OWE has none.
-        if self.key_mgmt != KeyMgmt::Owe && !(self.passphrase.is_empty() && self.psk_file.is_some())
-        {
+        // A literal passphrase can serve either personal AKM. Otherwise each
+        // enabled AKM needs its own authoritative SPR credential database.
+        if !self.passphrase.is_empty() {
             let n = self.passphrase.len();
             if !(8..=63).contains(&n) {
                 return Err(format!(
-                    "PSK/SAE requires passphrase (8..=63 characters) or psk_file (got {n})"
+                    "PSK/SAE passphrase must be 8..=63 characters (got {n})"
                 ));
+            }
+        }
+        if self.passphrase.is_empty() {
+            let needs_wpa = matches!(
+                self.key_mgmt,
+                KeyMgmt::Psk | KeyMgmt::PskSha256 | KeyMgmt::SaeTransition
+            );
+            let needs_sae = matches!(self.key_mgmt, KeyMgmt::Sae | KeyMgmt::SaeTransition);
+            if needs_wpa && self.wpa_psk_file.is_none() {
+                return Err("WPA2 requires passphrase or wpa_psk_file".to_string());
+            }
+            if needs_sae && self.sae_psk_file.is_none() {
+                return Err("SAE requires passphrase or sae_psk_file".to_string());
             }
         }
         // 6 GHz is Wi-Fi 6E/7 only and mandates WPA3 (SAE) or OWE — WPA2-PSK is
@@ -232,9 +245,17 @@ impl Config {
         // distinct from the primary and every other BSS (one radio, many MACs).
         let mut macs = vec![self.mac];
         for b in &self.bss {
-            // A BSS without its own (static guest) passphrase may instead ride
-            // on the primary's authoritative credential file.
-            let uses_device_db = !b.own_passphrase && self.psk_file.is_some();
+            // A BSS without its own static passphrase may use the matching
+            // primary credential databases.
+            let uses_device_db = !b.own_passphrase
+                && match b.key_mgmt {
+                    KeyMgmt::Psk | KeyMgmt::PskSha256 => self.wpa_psk_file.is_some(),
+                    KeyMgmt::Sae => self.sae_psk_file.is_some(),
+                    KeyMgmt::SaeTransition => {
+                        self.wpa_psk_file.is_some() && self.sae_psk_file.is_some()
+                    }
+                    KeyMgmt::Owe => true,
+                };
             if b.key_mgmt != KeyMgmt::Owe
                 && !uses_device_db
                 && !(8..=63).contains(&b.passphrase.len())

@@ -95,11 +95,10 @@ pub struct Config {
     /// interoperable advertised-TTLM form supported by current mac80211 and
     /// reference AP; `None` leaves link selection to the peer/driver.
     pub mld_default_links: Option<Vec<u8>>,
-    /// One authoritative credential file. RustAP accepts SPR's WPA form
-    /// (`MAC passphrase`, all-zero wildcard) and SAE form
-    /// (`passphrase|mac=MAC`, all-ones wildcard) so the same pending-device flow
-    /// works without a JSON passphrase fallback.
-    pub psk_file: Option<String>,
+    /// Authoritative WPA2 and SAE credential databases. SPR intentionally keeps
+    /// them separate because a device may be enrolled for only one AKM.
+    pub wpa_psk_file: Option<String>,
+    pub sae_psk_file: Option<String>,
     /// WMM (Wi-Fi Multimedia / WME QoS): advertise the WMM parameter element and
     /// exchange QoS Data frames with stations that negotiate it. Default on.
     pub wmm: bool,
@@ -137,9 +136,9 @@ pub struct BssConfig {
     pub key_mgmt: KeyMgmt,
     pub mac: [u8; 6],
     /// The entry supplied its own passphrase — a static guest password (SPR
-    /// `GuestPassword`). The device credential database (`psk_file`) then never
-    /// applies to this BSS. When false, the BSS authenticates against the
-    /// primary's `psk_file` (or its inherited passphrase if none is set).
+    /// `GuestPassword`). The device credential databases then never apply to
+    /// this BSS. When false, it inherits the primary's relevant WPA/SAE database
+    /// (or its passphrase if no database is configured).
     pub own_passphrase: bool,
     /// Opt out of the default guest isolation (SPR `DisableIsolation`):
     /// extra BSSes otherwise get `ap_isolate` + `per_sta_vif`.
@@ -205,10 +204,10 @@ impl Default for Config {
         Config {
             ssid: "turtlenet".to_string(),
             // No production credential default: PSK/SAE configurations must
-            // supply `passphrase` or an authoritative `psk_file`.
+            // supply `passphrase` or the required authoritative credential file.
             passphrase: String::new(),
             // Secure-by-default: WPA3-SAE implies mandatory PMF. Operators must
-            // still supply a credential or authoritative psk_file.
+            // still supply a credential or authoritative credential file.
             key_mgmt: KeyMgmt::Sae,
             pairwise_cipher: DataCipher::Ccmp128,
             country: *b"US",
@@ -230,7 +229,8 @@ impl Default for Config {
             link_id: 0,
             mld_links: Vec::new(),
             mld_default_links: None,
-            psk_file: None,
+            wpa_psk_file: None,
+            sae_psk_file: None,
             wmm: true,
             ctrl_path: None,
             spr_api_socket: None,

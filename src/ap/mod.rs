@@ -20,8 +20,8 @@ mod station;
 
 pub use output::{ApEvent, MldLink, Outgoing};
 pub use state::Ap;
-pub(crate) use station::PreparedPskFile;
-pub use station::Station;
+pub(crate) use station::PreparedCredentials;
+pub use station::{CredentialEntry, Station};
 
 use runtime::{
     AsyncSae, PendingHandshake, PendingSaeCommit, PmksaEntry, RequestRate, SaeCommitJob,

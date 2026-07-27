@@ -428,14 +428,17 @@ pub use server::ControlServer;
 #[cfg(unix)]
 mod server {
     use super::{handle_command_with_context, Ap, StationControlInfo};
-    use crate::ap::PreparedPskFile;
+    use crate::ap::PreparedCredentials;
     use std::io;
     use std::os::unix::net::UnixDatagram;
     use std::path::PathBuf;
 
+    type CredentialCounts = (usize, usize);
+    type CredentialReloadResult = Result<(CredentialCounts, PreparedCredentials), String>;
+
     struct CredentialReload {
         requests: std::sync::mpsc::SyncSender<Vec<u8>>,
-        results: std::sync::mpsc::Receiver<Result<(usize, PreparedPskFile), String>>,
+        results: std::sync::mpsc::Receiver<CredentialReloadResult>,
         pending: bool,
     }
 
@@ -444,14 +447,20 @@ mod server {
         sock: UnixDatagram,
         path: PathBuf,
         ifname: String,
-        psk_file: Option<PathBuf>,
+        wpa_psk_file: Option<PathBuf>,
+        sae_psk_file: Option<PathBuf>,
         reload: Option<CredentialReload>,
         attached: Vec<PathBuf>,
     }
 
     impl ControlServer {
         /// Bind the control socket at `path` (replacing any stale socket file).
-        pub fn bind(path: &str, ifname: &str, psk_file: Option<&str>) -> io::Result<ControlServer> {
+        pub fn bind(
+            path: &str,
+            ifname: &str,
+            wpa_psk_file: Option<&str>,
+            sae_psk_file: Option<&str>,
+        ) -> io::Result<ControlServer> {
             if let Some(parent) = std::path::Path::new(path).parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -464,44 +473,76 @@ mod server {
             // the same way, via directory ownership + mode.)
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            let psk_path = psk_file.map(PathBuf::from);
-            let reload = psk_path.as_ref().and_then(|reload_path| {
-                let reload_path = reload_path.clone();
-                let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-                let (result_tx, result_rx) = std::sync::mpsc::channel();
-                std::thread::Builder::new()
-                    .name("rustap-credential-reload".to_string())
-                    .spawn(move || {
-                        use zeroize::Zeroize;
-                        while let Ok(ssid) = request_rx.recv() {
-                            let result = crate::config::parse_psk_file(
-                                reload_path.to_string_lossy().as_ref(),
-                            )
-                            .map(|mut entries| {
-                                let count = entries.len();
-                                let prepared = PreparedPskFile::derive(&ssid, &entries);
-                                for (_, password) in &mut entries {
-                                    password.zeroize();
+            let wpa_path = wpa_psk_file.map(PathBuf::from);
+            let sae_path = sae_psk_file.map(PathBuf::from);
+            let reload = (wpa_path.is_some() || sae_path.is_some())
+                .then(|| {
+                    let reload_wpa = wpa_path.clone();
+                    let reload_sae = sae_path.clone();
+                    let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+                    let (result_tx, result_rx) = std::sync::mpsc::channel();
+                    std::thread::Builder::new()
+                        .name("rustap-credential-reload".to_string())
+                        .spawn(move || {
+                            use zeroize::Zeroize;
+                            while let Ok(ssid) = request_rx.recv() {
+                                let load = |path: Option<&PathBuf>| {
+                                    path.map(|path| {
+                                        crate::config::parse_psk_file(
+                                            path.to_string_lossy().as_ref(),
+                                        )
+                                    })
+                                    .transpose()
+                                };
+                                let zeroize =
+                                    |entries: &mut Option<Vec<crate::config::PskEntry>>| {
+                                        if let Some(entries) = entries {
+                                            for (_, password) in entries {
+                                                password.zeroize();
+                                            }
+                                        }
+                                    };
+                                let result = (|| {
+                                    let mut wpa_entries = load(reload_wpa.as_ref())?;
+                                    let mut sae_entries = match load(reload_sae.as_ref()) {
+                                        Ok(entries) => entries,
+                                        Err(error) => {
+                                            zeroize(&mut wpa_entries);
+                                            return Err(error);
+                                        }
+                                    };
+                                    let counts = (
+                                        wpa_entries.as_ref().map(Vec::len).unwrap_or(0),
+                                        sae_entries.as_ref().map(Vec::len).unwrap_or(0),
+                                    );
+                                    let prepared = PreparedCredentials::derive(
+                                        &ssid,
+                                        wpa_entries.as_deref(),
+                                        sae_entries.as_deref(),
+                                    );
+                                    zeroize(&mut wpa_entries);
+                                    zeroize(&mut sae_entries);
+                                    Ok((counts, prepared))
+                                })();
+                                if result_tx.send(result).is_err() {
+                                    break;
                                 }
-                                (count, prepared)
-                            });
-                            if result_tx.send(result).is_err() {
-                                break;
                             }
-                        }
-                    })
-                    .ok()
-                    .map(|_| CredentialReload {
-                        requests: request_tx,
-                        results: result_rx,
-                        pending: false,
-                    })
-            });
+                        })
+                        .ok()
+                        .map(|_| CredentialReload {
+                            requests: request_tx,
+                            results: result_rx,
+                            pending: false,
+                        })
+                })
+                .flatten();
             Ok(ControlServer {
                 sock,
                 path: PathBuf::from(path),
                 ifname: ifname.to_string(),
-                psk_file: psk_path,
+                wpa_psk_file: wpa_path,
+                sae_psk_file: sae_path,
                 reload,
                 attached: Vec::new(),
             })
@@ -516,23 +557,15 @@ mod server {
                     Ok(result) => {
                         reload.pending = false;
                         match result {
-                            Ok((count, prepared)) => {
-                                ap.install_prepared_psk_file(prepared);
-                                if let Some(path) = self.psk_file.as_ref() {
-                                    eprintln!(
-                                        "netlink AP: reloaded {count} credential(s) from {}",
-                                        path.display()
-                                    );
-                                }
+                            Ok(((wpa_count, sae_count), prepared)) => {
+                                ap.install_prepared_credentials(prepared);
+                                eprintln!(
+                                    "netlink AP: reloaded {wpa_count} WPA2 and {sae_count} SAE credential(s)"
+                                );
                             }
                             Err(err) => {
                                 ap.cancel_psk_reload();
-                                if let Some(path) = self.psk_file.as_ref() {
-                                    eprintln!(
-                                        "netlink AP: credential reload from {} failed: {err}",
-                                        path.display()
-                                    );
-                                }
+                                eprintln!("netlink AP: credential reload failed: {err}");
                             }
                         }
                     }
@@ -587,7 +620,7 @@ mod server {
                     }
                     // A static-credential (guest) BSS keeps its static password:
                     // reloading the device credential database must not touch it
-                    // (the set_psk_file guard would ignore it anyway; answer
+                    // (the credential install guard would ignore it anyway; answer
                     // without reading the file).
                     "RELOAD_WPA_PSK" | "RELOAD" if ap.static_credential() => "OK\n".to_string(),
                     "RELOAD_WPA_PSK" | "RELOAD" => match self.reload.as_mut() {
@@ -605,8 +638,8 @@ mod server {
                                 "FAIL reload worker stopped\n".to_string()
                             }
                         },
-                        None if self.psk_file.is_none() => {
-                            "FAIL no psk_file configured\n".to_string()
+                        None if self.wpa_psk_file.is_none() && self.sae_psk_file.is_none() => {
+                            "FAIL no credential files configured\n".to_string()
                         }
                         None => "FAIL reload worker unavailable\n".to_string(),
                     },

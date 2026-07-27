@@ -62,10 +62,11 @@ pub struct Ap {
     /// MIC later in the exchange.
     pub(super) credential_passwords_by_mac: HashMap<[u8; 6], Vec<u8>>,
     pub(super) wildcard_credential_password: Option<Vec<u8>>,
-    /// A configured credential file is the complete access-control database.
-    /// Never fall back to the JSON/CLI passphrase when it is true, including
-    /// when the file is empty or unreadable (fail closed).
-    pub(super) credential_file_authoritative: bool,
+    /// Each configured credential file is authoritative for its own AKM. SPR
+    /// deliberately maintains separate WPA2 and SAE databases; combining them
+    /// makes transition-mode clients authenticate against the wrong set.
+    pub(super) wpa_credentials_authoritative: bool,
+    pub(super) sae_credentials_authoritative: bool,
     /// A control-plane credential reload is being derived off-thread. New
     /// authentications fail closed until the prepared database is installed.
     pub(super) credential_reload_pending: bool,
@@ -113,9 +114,9 @@ pub struct Ap {
     /// the userspace data path drops station-to-station deliveries.
     pub(super) guest: bool,
     /// The BSS credential is a static guest password (SPR `GuestPassword`):
-    /// the device credential database never applies to this BSS, so
-    /// `set_psk_file` — including a control-socket RELOAD — is a no-op. The
-    /// reference AP equivalent is `wpa_psk_file=/dev/null` + `wpa_passphrase`.
+    /// device credential databases never apply to this BSS, so a control-socket
+    /// RELOAD is a no-op. The reference AP equivalent is
+    /// `wpa_psk_file=/dev/null` + `wpa_passphrase`.
     pub(super) static_credential: bool,
     /// The affiliated link the management frame being processed arrived on
     /// (netlink MLD path; set per frame by the driver loop). A probe response

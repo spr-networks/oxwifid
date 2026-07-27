@@ -440,7 +440,7 @@ fn parses_dbdc_radios_with_shared_security_and_per_radio_overrides() {
                 "ssid": "s5210",
                 "key_mgmt": "sae",
                 "mode": "netlink",
-                "psk_file": "/configs/wifi/sae_passwords",
+                "sae_psk_file": "/configs/wifi/sae_passwords",
                 "per_sta_vif": true,
                 "ocv": false,
                 "spr_api_socket": "/state/wifi/apisock",
@@ -474,7 +474,10 @@ fn parses_dbdc_radios_with_shared_security_and_per_radio_overrides() {
     let low = cfg.for_radio(&cfg.radios[0]);
     let high = cfg.for_radio(&cfg.radios[1]);
     assert_eq!(low.ssid, "s5210");
-    assert_eq!(low.psk_file.as_deref(), Some("/configs/wifi/sae_passwords"));
+    assert_eq!(
+        low.sae_psk_file.as_deref(),
+        Some("/configs/wifi/sae_passwords")
+    );
     assert_eq!(low.spr_api_socket.as_deref(), Some("/state/wifi/apisock"));
     assert_eq!(low.iface, "wlan1");
     assert_eq!(low.band, Band::Ghz2_4);
@@ -699,6 +702,30 @@ fn transition_enables_both() {
 }
 
 #[test]
+fn transition_without_a_literal_password_requires_both_credential_files() {
+    let mut c = Config::default();
+    c.key_mgmt = KeyMgmt::SaeTransition;
+    c.passphrase.clear();
+
+    c.wpa_psk_file = Some("/configs/wifi/wpa2pskfile".to_string());
+    assert!(
+        c.validate().unwrap_err().contains("sae_psk_file"),
+        "the WPA2 database cannot substitute for the SAE database"
+    );
+
+    c.wpa_psk_file = None;
+    c.sae_psk_file = Some("/configs/wifi/sae_passwords".to_string());
+    assert!(
+        c.validate().unwrap_err().contains("wpa_psk_file"),
+        "the SAE database cannot substitute for the WPA2 database"
+    );
+
+    c.wpa_psk_file = Some("/configs/wifi/wpa2pskfile".to_string());
+    c.validate()
+        .expect("transition mode accepts independent WPA2 and SAE databases");
+}
+
+#[test]
 fn malformed_json_is_an_error() {
     assert!(Config::from_json("not json").is_err());
     assert!(Config::from_json("[1,2,3]").is_err()); // not an object
@@ -788,6 +815,11 @@ fn psk_file_parses_wildcard_and_per_mac() {
             "sae-device".to_string()
         )
     );
-    let c = Config::from_json(r#"{"psk_file": "/x"}"#).unwrap();
-    assert_eq!(c.psk_file.as_deref(), Some("/x"));
+    let c = Config::from_json(r#"{"wpa_psk_file":"/wpa","sae_psk_file":"/sae"}"#).unwrap();
+    assert_eq!(c.wpa_psk_file.as_deref(), Some("/wpa"));
+    assert_eq!(c.sae_psk_file.as_deref(), Some("/sae"));
+    assert!(
+        Config::from_json(r#"{"psk_file":"/old"}"#).is_err(),
+        "the ambiguous shared credential path is no longer accepted"
+    );
 }

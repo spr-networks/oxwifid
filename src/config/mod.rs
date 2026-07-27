@@ -10,7 +10,8 @@
 //! ```json
 //! {
 //!   "ssid": "turtlenet",
-//!   "psk_file": "/run/secrets/wifi-credentials",
+//!   "wpa_psk_file": "/run/secrets/wpa2-credentials",
+//!   "sae_psk_file": "/run/secrets/sae-credentials",
 //!   "key_mgmt": "sae",
 //!   "mode": "netlink",
 //!   "radios": [

@@ -350,7 +350,8 @@ impl Config {
                 }
                 self.mld_default_links = Some(links);
             }
-            "psk_file" => self.psk_file = Some(as_str(key, val)?.to_string()),
+            "wpa_psk_file" => self.wpa_psk_file = Some(as_str(key, val)?.to_string()),
+            "sae_psk_file" => self.sae_psk_file = Some(as_str(key, val)?.to_string()),
             "wmm" | "wme" => self.wmm = as_bool(key, val)?,
             "ctrl_path" | "ctrl_interface" => self.ctrl_path = Some(as_str(key, val)?.to_string()),
             "spr_api_socket" | "spr_socket" => {

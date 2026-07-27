@@ -8,10 +8,7 @@ pub fn run_offload_ap(
     ap: crate::ap::Ap,
     iface: &str,
     channel: u8,
-    ctrl_path: Option<&str>,
-    psk_file: Option<&str>,
-    spr_api_socket: Option<&str>,
-    spr_dhcp_helper: Option<&str>,
+    paths: ApRuntimePaths<'_>,
 ) -> io::Result<()> {
     let StartedRadio {
         ap,
@@ -49,25 +46,24 @@ pub fn run_offload_ap(
 
     // Optional reference AP-style runtime control socket (STATUS / STA-DUMP / DEAUTH /
     // FAILURES / ATTACH) carrying live AP-STA-* events to attached clients.
-    let control =
-        ctrl_path.and_then(
-            |p| match crate::control::ControlServer::bind(p, iface, psk_file) {
-                Ok(c) => {
-                    eprintln!("netlink AP: control interface on {p}");
-                    Some(c)
-                }
-                Err(e) => {
-                    eprintln!("netlink AP: control interface bind {p} failed: {e}");
-                    None
-                }
-            },
-        );
-    let notifier = spr_api_socket.map(|path| {
+    let control = paths.ctrl.and_then(|p| {
+        match crate::control::ControlServer::bind(p, iface, paths.wpa_psk, paths.sae_psk) {
+            Ok(c) => {
+                eprintln!("netlink AP: control interface on {p}");
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("netlink AP: control interface bind {p} failed: {e}");
+                None
+            }
+        }
+    });
+    let notifier = paths.spr_api.map(|path| {
         eprintln!("netlink AP: direct SPR events on Unix socket {path}");
-        if let Some(helper) = spr_dhcp_helper {
+        if let Some(helper) = paths.spr_dhcp_helper {
             eprintln!("netlink AP: SPR DHCP/XDP helper {helper}");
         }
-        crate::spr::SprNotifier::new(path, spr_dhcp_helper.map(std::path::PathBuf::from))
+        crate::spr::SprNotifier::new(path, paths.spr_dhcp_helper.map(std::path::PathBuf::from))
     });
 
     RadioRuntime {

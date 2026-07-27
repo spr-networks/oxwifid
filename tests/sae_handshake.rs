@@ -433,7 +433,7 @@ fn mld_ap_sae_uses_sta_mld_from_auth_element() {
     ap.enable_sae();
     ap.mld = true;
     ap.mld_mac = ap_mld;
-    ap.set_psk_file(&[
+    ap.set_sae_password_file(&[
         (Some(sta_air), "wrong-link-password".to_string()),
         (Some(sta_mld), "password1234".to_string()),
         (None, "wrong-wildcard-password".to_string()),
@@ -496,7 +496,7 @@ fn mld_sae_uses_identity_learned_from_prior_pmksa_assoc_attempt() {
 
     let mut ap = mld_ap_for_tests();
     ap.enable_sae();
-    ap.set_psk_file(&[(Some(sta_mld), "password1234".to_string())]);
+    ap.set_sae_password_file(&[(Some(sta_mld), "password1234".to_string())]);
 
     // Model Apple's stale-PMKSA sequence: the first association attempt tells
     // the AP the stable MLD identity but cannot succeed because its PMKID is no

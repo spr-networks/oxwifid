@@ -17,7 +17,7 @@ mod link;
 mod scan;
 mod socket;
 
-pub use ap::{run_offload_ap, run_offload_aps};
+pub use ap::{run_offload_ap, run_offload_aps, ApRuntimePaths};
 pub(super) use interface::{iface_set_mac, iface_set_state, iface_set_up};
 pub use link::NetlinkLink;
 pub use scan::{scan_interface, set_interface_frequency, ScanResult};

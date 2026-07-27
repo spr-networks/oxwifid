@@ -126,7 +126,7 @@ fn sae_pair(mac: [u8; 6]) -> (Ap, Client) {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     let mut ap = Ap::new("secure-net", "unused-fallback", ap_mac, 1);
     ap.enable_sae();
-    ap.set_psk_file(&[(Some(mac), "device-password".to_string())]);
+    ap.set_sae_password_file(&[(Some(mac), "device-password".to_string())]);
     let mut station = Client::new("secure-net", "device-password", mac);
     station.enable_sae();
     assert!(!drive(&mut ap, &mut station, 50).is_empty());
@@ -354,7 +354,7 @@ fn credential_reload_and_pmksa_expiry_revoke_fast_reconnect() {
     let mac = mac_to_bytes("02:00:00:00:00:33");
     let (mut ap, mut station) = sae_pair(mac);
     disconnect_pair(&mut ap, &mut station, mac);
-    ap.set_psk_file(&[]);
+    ap.set_sae_password_file(&[]);
     drive(&mut ap, &mut station, 50);
     assert_ne!(station.connected, 4, "removed credential must stay revoked");
     assert!(!ap.is_associated(&mac));

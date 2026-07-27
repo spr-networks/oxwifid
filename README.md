@@ -39,7 +39,8 @@ authenticated-encryption offload and therefore require `mode: "netlink"`.
 
 Unknown keys and type mismatches are hard errors. See
 [`src/config/`](src/config/).
-Passwords are accepted only through the JSON `passphrase` or `psk_file`
+Passwords are accepted only through the JSON `passphrase`, `wpa_psk_file`, or
+`sae_psk_file`
 settings;
 
 ### stdio mode (default, all platforms)
@@ -415,7 +416,7 @@ level, then override the identity and channel settings in each
   "country": "US",
   "mode": "netlink",
   "key_mgmt": "sae",
-  "psk_file": "/configs/wifi/sae_passwords",
+  "sae_psk_file": "/configs/wifi/sae_passwords",
   "per_sta_vif": true,
   "ocv": false,
   "spr_api_socket": "/state/wifi/apisock",

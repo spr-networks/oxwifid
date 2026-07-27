@@ -56,7 +56,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut ssid = "turtlenet".to_string();
     let mut psk = String::new();
-    let mut configured_psk_file: Option<String> = None;
+    let mut configured_credential_file: Option<String> = None;
     let mut configured_key_mgmt: Option<KeyMgmt> = None;
     let mut configured_iface: Option<String> = None;
     let mut configured_mode: Option<String> = None;
@@ -86,8 +86,13 @@ fn main() {
             ssid = cfg.ssid.clone();
             psk.zeroize();
             psk = cfg.passphrase.clone();
-            configured_psk_file = cfg.psk_file.clone();
-            configured_key_mgmt = Some(cfg.effective_key_mgmt());
+            let key_mgmt = cfg.effective_key_mgmt();
+            configured_credential_file = match key_mgmt {
+                KeyMgmt::Sae | KeyMgmt::SaeTransition => cfg.sae_psk_file.clone(),
+                KeyMgmt::Psk | KeyMgmt::PskSha256 => cfg.wpa_psk_file.clone(),
+                KeyMgmt::Owe => None,
+            };
+            configured_key_mgmt = Some(key_mgmt);
             configured_iface = Some(cfg.iface.clone());
             configured_mode = Some(cfg.mode.clone());
             configured_channel = Some(cfg.channel);
@@ -298,9 +303,9 @@ fn main() {
     };
 
     if psk.is_empty() {
-        if let Some(path) = configured_psk_file.as_deref() {
+        if let Some(path) = configured_credential_file.as_deref() {
             let mut entries = parse_psk_file(path).unwrap_or_else(|e| {
-                eprintln!("barely-cli: psk_file {path:?}: {e}");
+                eprintln!("barely-cli: credential file {path:?}: {e}");
                 std::process::exit(1);
             });
             let selected = entries
@@ -313,7 +318,7 @@ fn main() {
                     password.zeroize();
                 }
                 eprintln!(
-                    "barely-cli: psk_file {path:?} has no credential for {}",
+                    "barely-cli: credential file {path:?} has no credential for {}",
                     barely_ap::util::bytes_to_mac(&mac)
                 );
                 std::process::exit(1);

@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 use zeroize::Zeroize;
 
+pub type CredentialEntry = (Option<[u8; 6]>, String);
+
 #[derive(Clone)]
 pub(super) struct PtkCandidate {
     pub(super) m3_replay_counter: u64,
@@ -13,60 +15,80 @@ pub(super) struct PtkCandidate {
     pub(super) tk: [u8; 32],
 }
 
-pub(crate) struct PreparedPskFile {
-    pub(super) candidates_by_mac: HashMap<[u8; 6], Vec<[u8; 32]>>,
-    pub(super) wildcard_candidates: Vec<[u8; 32]>,
-    pub(super) passwords_by_mac: HashMap<[u8; 6], Vec<u8>>,
-    pub(super) wildcard_password: Option<Vec<u8>>,
+pub(super) struct PreparedWpaCredentials {
+    pub(super) by_mac: HashMap<[u8; 6], Vec<[u8; 32]>>,
+    pub(super) wildcard: Vec<[u8; 32]>,
 }
 
-impl PreparedPskFile {
-    pub(crate) fn derive(ssid: &[u8], entries: &[(Option<[u8; 6]>, String)]) -> PreparedPskFile {
+pub(super) struct PreparedSaeCredentials {
+    pub(super) by_mac: HashMap<[u8; 6], Vec<u8>>,
+    pub(super) wildcard: Option<Vec<u8>>,
+}
+
+pub(crate) struct PreparedCredentials {
+    pub(super) wpa: Option<PreparedWpaCredentials>,
+    pub(super) sae: Option<PreparedSaeCredentials>,
+}
+
+impl PreparedCredentials {
+    pub(crate) fn derive(
+        ssid: &[u8],
+        wpa_entries: Option<&[CredentialEntry]>,
+        sae_entries: Option<&[CredentialEntry]>,
+    ) -> PreparedCredentials {
         let ssid = String::from_utf8_lossy(ssid);
-        let mut prepared = PreparedPskFile {
-            candidates_by_mac: HashMap::new(),
-            wildcard_candidates: Vec::new(),
-            passwords_by_mac: HashMap::new(),
-            wildcard_password: None,
-        };
-        for (mac, pass) in entries {
-            let pmk = crypto::pbkdf2_pmk(pass, &ssid);
-            match mac {
-                Some(mac) => {
-                    prepared
-                        .candidates_by_mac
-                        .entry(*mac)
-                        .or_default()
-                        .push(pmk);
-                    // SAE must choose before a MIC can identify among duplicate
-                    // entries, matching the prior first-entry behavior.
-                    prepared
-                        .passwords_by_mac
-                        .entry(*mac)
-                        .or_insert_with(|| pass.as_bytes().to_vec());
-                }
-                None => {
-                    prepared.wildcard_candidates.push(pmk);
-                    if prepared.wildcard_password.is_none() {
-                        prepared.wildcard_password = Some(pass.as_bytes().to_vec());
+        PreparedCredentials {
+            wpa: wpa_entries.map(|entries| {
+                let mut by_mac = HashMap::<[u8; 6], Vec<[u8; 32]>>::new();
+                let mut wildcard = Vec::new();
+                for (mac, pass) in entries {
+                    let pmk = crypto::pbkdf2_pmk(pass, &ssid);
+                    match mac {
+                        Some(mac) => by_mac.entry(*mac).or_default().push(pmk),
+                        None => wildcard.push(pmk),
                     }
                 }
-            }
+                PreparedWpaCredentials { by_mac, wildcard }
+            }),
+            sae: sae_entries.map(|entries| {
+                let mut by_mac = HashMap::new();
+                let mut wildcard = None;
+                for (mac, pass) in entries {
+                    match mac {
+                        Some(mac) => {
+                            // SAE selects before a MIC can disambiguate duplicate
+                            // entries, matching the reference's first match.
+                            by_mac
+                                .entry(*mac)
+                                .or_insert_with(|| pass.as_bytes().to_vec());
+                        }
+                        None if wildcard.is_none() => {
+                            wildcard = Some(pass.as_bytes().to_vec());
+                        }
+                        None => {}
+                    }
+                }
+                PreparedSaeCredentials { by_mac, wildcard }
+            }),
         }
-        prepared
     }
 }
 
-impl Drop for PreparedPskFile {
+impl Drop for PreparedWpaCredentials {
     fn drop(&mut self) {
-        for candidates in self.candidates_by_mac.values_mut() {
+        for candidates in self.by_mac.values_mut() {
             candidates.zeroize();
         }
-        self.wildcard_candidates.zeroize();
-        for password in self.passwords_by_mac.values_mut() {
+        self.wildcard.zeroize();
+    }
+}
+
+impl Drop for PreparedSaeCredentials {
+    fn drop(&mut self) {
+        for password in self.by_mac.values_mut() {
             password.zeroize();
         }
-        if let Some(password) = self.wildcard_password.as_mut() {
+        if let Some(password) = self.wildcard.as_mut() {
             password.zeroize();
         }
     }

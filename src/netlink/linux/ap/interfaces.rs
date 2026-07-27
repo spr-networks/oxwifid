@@ -1,5 +1,14 @@
 use super::*;
 
+#[derive(Clone, Copy, Default)]
+pub struct ApRuntimePaths<'a> {
+    pub ctrl: Option<&'a str>,
+    pub wpa_psk: Option<&'a str>,
+    pub sae_psk: Option<&'a str>,
+    pub spr_api: Option<&'a str>,
+    pub spr_dhcp_helper: Option<&'a str>,
+}
+
 /// Remove a station from the kernel. An already-absent station is success so
 /// cleanup retries remain idempotent.
 pub(super) fn nl_del_station(
@@ -129,16 +138,12 @@ pub(super) fn nl_create_ap_bss(
 /// [`run_offload_ap`] on its own thread — its own 4-way, keys, and stations —
 /// so the verified single-BSS path is reused unchanged. The primary runs in the
 /// caller's thread (and owns the control interface).
-#[allow(clippy::too_many_arguments)]
 pub fn run_offload_aps(
     primary: crate::ap::Ap,
     extra: Vec<crate::ap::Ap>,
     iface: &str,
     channel: u8,
-    ctrl_path: Option<&str>,
-    psk_file: Option<&str>,
-    spr_api_socket: Option<&str>,
-    spr_dhcp_helper: Option<&str>,
+    paths: ApRuntimePaths<'_>,
 ) -> io::Result<()> {
     // The creator socket must outlive the BSSes it makes: each extra netdev is
     // SOCKET_OWNER-tied to it, so the kernel deletes the netdev when this socket
@@ -171,10 +176,11 @@ pub fn run_offload_aps(
                 String::from_utf8_lossy(&ap.ssid),
                 crate::util::bytes_to_mac(&mac)
             );
-            let spr_api_socket = spr_api_socket.map(str::to_owned);
-            let spr_dhcp_helper = spr_dhcp_helper.map(str::to_owned);
-            let psk_file = psk_file.map(str::to_owned);
-            let bss_ctrl = ctrl_path.and_then(|primary| {
+            let spr_api = paths.spr_api.map(str::to_owned);
+            let spr_dhcp_helper = paths.spr_dhcp_helper.map(str::to_owned);
+            let wpa_psk = paths.wpa_psk.map(str::to_owned);
+            let sae_psk = paths.sae_psk.map(str::to_owned);
+            let bss_ctrl = paths.ctrl.and_then(|primary| {
                 let path = std::path::Path::new(primary);
                 let dir = path.parent()?;
                 let expected_dir = format!("control_{iface}");
@@ -196,10 +202,13 @@ pub fn run_offload_aps(
                     ap,
                     &name,
                     channel,
-                    bss_ctrl.as_deref(),
-                    psk_file.as_deref(),
-                    spr_api_socket.as_deref(),
-                    spr_dhcp_helper.as_deref(),
+                    ApRuntimePaths {
+                        ctrl: bss_ctrl.as_deref(),
+                        wpa_psk: wpa_psk.as_deref(),
+                        sae_psk: sae_psk.as_deref(),
+                        spr_api: spr_api.as_deref(),
+                        spr_dhcp_helper: spr_dhcp_helper.as_deref(),
+                    },
                 ) {
                     eprintln!("netlink AP: BSS {name} exited: {e}");
                 }
@@ -207,13 +216,5 @@ pub fn run_offload_aps(
         }
         Some(setup)
     };
-    run_offload_ap(
-        primary,
-        iface,
-        channel,
-        ctrl_path,
-        psk_file,
-        spr_api_socket,
-        spr_dhcp_helper,
-    )
+    run_offload_ap(primary, iface, channel, paths)
 }

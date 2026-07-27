@@ -16,7 +16,7 @@ printf '00:00:00:00:00:00 onboardpass\n%s devicepass\n' "$STAMAC" > /tmp/pskfile
 cat > /tmp/ap.json <<EOF
 { "ssid": "psktest", "passphrase": "defaultpass", "key_mgmt": "psk",
   "band": 5, "channel": 36, "width": 80, "phy": "ax", "mode": "netlink",
-  "iface": "$AP", "per_sta_vif": true, "psk_file": "/tmp/pskfile" }
+  "iface": "$AP", "per_sta_vif": true, "wpa_psk_file": "/tmp/pskfile" }
 EOF
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up; ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null
 setsid "$B" --config /tmp/ap.json </dev/null >/tmp/pskmin2_ap.log 2>&1 &

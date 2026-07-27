@@ -36,5 +36,5 @@ use state::*;
 use vlan::*;
 use workers::*;
 
-pub use interfaces::run_offload_aps;
+pub use interfaces::{run_offload_aps, ApRuntimePaths};
 pub use radio::run_offload_ap;

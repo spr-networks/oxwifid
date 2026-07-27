@@ -32,6 +32,6 @@ pub use helpers::{chandef_is_dfs, fallback_channel};
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    run_offload_ap, run_offload_aps, scan_interface, set_interface_frequency, NetlinkLink,
-    ScanResult,
+    run_offload_ap, run_offload_aps, scan_interface, set_interface_frequency, ApRuntimePaths,
+    NetlinkLink, ScanResult,
 };

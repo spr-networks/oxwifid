@@ -293,7 +293,7 @@ impl Ap {
                 // four-way Message 2 enter the group-key parser and get dropped.
                 entry.group_rekeying = false;
                 entry.pending_eapol = None; // no stale m1/m3 to retransmit
-                                            // Drop any psk_file PMK pinned by a previous 4-way so the
+                                            // Drop any credential-file PMK pinned by a previous 4-way so the
                                             // candidate trial (per-MAC -> wildcard -> default) re-runs — a
                                             // re-onboarded device may use a different password now. (SAE uses
                                             // algorithm-3 auth and never reaches this open-auth reset; PMKSA

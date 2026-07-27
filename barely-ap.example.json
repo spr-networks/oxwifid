@@ -1,6 +1,6 @@
 {
   "ssid": "turtlenet",
-  "psk_file": "/run/secrets/wifi-credentials",
+  "sae_psk_file": "/run/secrets/sae-passwords",
   "key_mgmt": "sae",
   "country_code": "US",
   "mode": "netlink",
