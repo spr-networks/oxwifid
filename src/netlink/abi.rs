@@ -8,8 +8,10 @@ pub const NL80211_CMD_SET_BEACON: u8 = 14;
 pub const NL80211_CMD_START_AP: u8 = 15;
 pub const NL80211_CMD_STOP_AP: u8 = 16;
 pub const NL80211_CMD_GET_STATION: u8 = 17;
-pub const NL80211_CMD_RADAR_DETECT: u8 = 99;
-pub const NL80211_CMD_CHANNEL_SWITCH: u8 = 107;
+pub const NL80211_CMD_RADAR_DETECT: u8 = 94;
+pub const NL80211_CMD_CH_SWITCH_NOTIFY: u8 = 88;
+pub const NL80211_CMD_CH_SWITCH_STARTED_NOTIFY: u8 = 110;
+pub const NL80211_CMD_CHANNEL_SWITCH: u8 = 102;
 pub const NL80211_ATTR_RADAR_EVENT: u16 = 168;
 // nl80211_radar_event values.
 pub const NL80211_RADAR_DETECTED: u32 = 0;
@@ -109,6 +111,10 @@ pub const NL80211_ATTR_EHT_CAPABILITY: u16 = 310;
 pub const NL80211_ATTR_EML_CAPABILITY: u16 = 317;
 pub const NL80211_ATTR_MLD_CAPA_AND_OPS: u16 = 318;
 pub const NL80211_ATTR_IFTYPE_EXT_CAPA: u16 = 230;
+pub const NL80211_ATTR_EXT_FEATURES: u16 = 217;
+/// Bit index in `NL80211_ATTR_EXT_FEATURES`: firmware owns CAC, radar response,
+/// and the resulting channel switch.
+pub const NL80211_EXT_FEATURE_DFS_OFFLOAD: usize = 25;
 // BSS parameters reference AP submits immediately after every START_AP/SET_BEACON.
 pub const NL80211_ATTR_BSS_CTS_PROT: u16 = 28;
 pub const NL80211_ATTR_BSS_SHORT_PREAMBLE: u16 = 29;
@@ -118,6 +124,8 @@ pub const NL80211_ATTR_AP_ISOLATE: u16 = 96;
 pub const NL80211_ATTR_BSS_HT_OPMODE: u16 = 109;
 pub const NL80211_ATTR_SCAN_FREQUENCIES: u16 = 44;
 pub const NL80211_ATTR_SCAN_SSIDS: u16 = 45;
+pub const NL80211_ATTR_SCAN_FLAGS: u16 = 158;
+pub const NL80211_SCAN_FLAG_AP: u32 = 1 << 2;
 pub const NL80211_ATTR_BSS: u16 = 47;
 
 // NL80211_ATTR_BSS nested scan-result attributes.

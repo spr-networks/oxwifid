@@ -199,12 +199,13 @@ impl GroupKeyStore {
     }
 }
 
-/// Per-link addressing and capability data fixed for the lifetime of a radio.
+/// Per-link addressing, live channel routing, and radio capabilities.
 pub(super) struct RadioTopology {
     pub(super) ifindex: u32,
     pub(super) wdev: u64,
     pub(super) channel: u8,
     pub(super) frequency: u32,
+    pub(super) dfs_offload: bool,
     pub(super) links: HashMap<u8, (Mac, u32)>,
     pub(super) station_links: HashMap<Mac, u8>,
     pub(super) capabilities: HashMap<u8, WiphyCapabilities>,

@@ -2,6 +2,17 @@ use super::*;
 
 // Hot-path nl80211 event dispatch and protocol timers.
 
+fn channel_width_mhz(nl_width: u32) -> Option<u16> {
+    match nl_width {
+        0 | NL80211_CHAN_WIDTH_20 => Some(20),
+        NL80211_CHAN_WIDTH_40 => Some(40),
+        NL80211_CHAN_WIDTH_80 => Some(80),
+        NL80211_CHAN_WIDTH_160 => Some(160),
+        NL80211_CHAN_WIDTH_320 => Some(320),
+        _ => None,
+    }
+}
+
 impl RadioRuntime {
     pub(super) fn receive_events(&mut self) -> io::Result<()> {
         let ifindex = self.topology.ifindex;
@@ -158,9 +169,66 @@ impl RadioRuntime {
                     }
                     continue;
                 }
-                // DFS: radar on the operating channel — vacate within the move time.
+                // DFS-offload drivers perform their own radar-triggered channel
+                // switch. Keep the protocol/OCV view synchronized once it has
+                // completed; a channel number alone is ambiguous across bands.
+                if parsed.genl_cmd() == Some(NL80211_CMD_CH_SWITCH_NOTIFY) {
+                    let Some(frequency) =
+                        msg::find_attr(&attrs, NL80211_ATTR_WIPHY_FREQ).and_then(native_u32)
+                    else {
+                        continue;
+                    };
+                    let Some(channel) = msg::channel_for_freq(frequency) else {
+                        eprintln!(
+                            "netlink AP: ignoring channel-switch notification with invalid frequency {frequency} MHz"
+                        );
+                        continue;
+                    };
+                    let reported_link = msg::find_attr(&attrs, NL80211_ATTR_MLO_LINK_ID)
+                        .and_then(|value| value.first())
+                        .copied();
+                    let target_link = self
+                        .ap
+                        .mld
+                        .then_some(reported_link.unwrap_or(self.ap.link_id));
+                    let width = msg::find_attr(&attrs, NL80211_ATTR_CHANNEL_WIDTH)
+                        .and_then(native_u32)
+                        .and_then(channel_width_mhz);
+                    self.ap
+                        .set_operating_channel(target_link, channel, width, frequency >= 5935);
+                    if let Some(link_id) = target_link {
+                        if let Some((_, link_frequency)) = self.topology.links.get_mut(&link_id) {
+                            *link_frequency = frequency;
+                        }
+                        if link_id == self.ap.link_id {
+                            self.topology.channel = channel;
+                            self.topology.frequency = frequency;
+                        }
+                    } else {
+                        self.topology.channel = channel;
+                        self.topology.frequency = frequency;
+                    }
+                    eprintln!(
+                        "netlink AP: channel switch completed link={target_link:?} channel={channel} frequency={frequency} MHz"
+                    );
+                    continue;
+                }
+                if parsed.genl_cmd() == Some(NL80211_CMD_CH_SWITCH_STARTED_NOTIFY) {
+                    if crate::util::netlink_debug_enabled() {
+                        eprintln!("netlink AP: driver started a channel switch");
+                    }
+                    continue;
+                }
+                // Without DFS offload, userspace owns the radar response and
+                // must vacate the channel within the regulatory move time.
                 if parsed.genl_cmd() == Some(NL80211_CMD_RADAR_DETECT) {
                     if radar_event(&attrs) == Some(NL80211_RADAR_DETECTED) {
+                        if self.topology.dfs_offload {
+                            eprintln!(
+                                "netlink AP: radar detected; driver DFS offload owns the channel move"
+                            );
+                            continue;
+                        }
                         let fallback = fallback_channel(self.topology.channel);
                         eprintln!(
                         "netlink AP: RADAR DETECTED on {} MHz — vacating (DFS); restart on non-DFS channel {fallback}",

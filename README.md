@@ -480,21 +480,26 @@ cases) and config parsing unit tests.
 #### DFS — 5 GHz radar channels (CAC + radar response)
 
 Before beaconing on a DFS chandef (any 20 MHz subchannel in 52-64 / 100-144), the
-AP runs the Channel Availability Check: `NL80211_CMD_RADAR_DETECT` → wait for the
-`RADAR_CAC_FINISHED` event (60 s, or 600 s on ETSI weather channels) → `START_AP`.
+AP performs the reference AP's passive HT40 coexistence scan for a wide channel,
+then runs the Channel Availability Check: `NL80211_CMD_RADAR_DETECT` → wait for
+the `RADAR_CAC_FINISHED` event (60 s, or 600 s on ETSI weather channels) →
+`START_AP`.
+For an MLD, the CAC request and completion are scoped to the affected link with
+`NL80211_ATTR_MLO_LINK_ID`. Drivers advertising
+`NL80211_EXT_FEATURE_DFS_OFFLOAD` instead own CAC, radar response, and the channel
+move; the AP does not issue userspace CAC and synchronizes its live channel/OCV
+state from the driver's channel-switch notification.
+
 A `RADAR_DETECTED` event during operation vacates the channel (`STOP_AP`) within
 the move time and exits with a recommended non-DFS fallback channel
 (`fallback_channel`, UNII-1/UNII-3) named in the log + error, so a supervisor can
-restart there without a CAC. The kernel/driver performs the actual radar
-detection; userspace only orchestrates the CAC and the response — no radar DSP in
-userspace. `chandef_is_dfs` and `fallback_channel` are unit-tested.
-
-Two pieces are deliberately box-gated and not yet done: (1) the live
-`RADAR_DETECT` round-trip — the test radio returned `EOPNOTSUPP` (driver-dependent;
-needs an strace-diff against reference AP to confirm message vs. driver support); and
-(2) an *in-process* channel switch on radar (vs. the current vacate-and-exit),
-which would restructure the verified beaconing loop and is only worth doing once
-the CAC itself is confirmed on hardware.
+restart there without a CAC. On a DFS-offload radio, the driver performs that
+move in place instead. The kernel/driver performs the actual radar detection;
+userspace only orchestrates the non-offload CAC and response — no radar DSP in
+userspace. The DFS chandef, fallback, offload-bit parsing, and link-scoped CAC
+message are unit-tested. Stock `mac80211_hwsim` does not advertise radar-detect
+widths and returns `EOPNOTSUPP` for live CAC, so the kernel round trip requires a
+DFS-capable physical or specialized virtual radio.
 
 ### 6 GHz and 802.11be / MLD
 

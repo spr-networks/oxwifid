@@ -26,6 +26,7 @@ pub(super) struct WiphyCapabilities {
     pub(super) eht: Option<Vec<u8>>,
     pub(super) eml: Option<u16>,
     pub(super) mld: Option<u16>,
+    pub(super) dfs_offload: bool,
 }
 
 impl WiphyCapabilities {
@@ -237,7 +238,14 @@ pub(super) fn parse_wiphy_capabilities(
         eht,
         eml: None,
         mld: None,
+        dfs_offload: false,
     })
+}
+
+pub(super) fn ext_feature_enabled(attrs: &[(u16, &[u8])], feature: usize) -> bool {
+    msg::find_attr(attrs, NL80211_ATTR_EXT_FEATURES)
+        .and_then(|features| features.get(feature / 8))
+        .is_some_and(|byte| byte & (1 << (feature % 8)) != 0)
 }
 
 pub(super) fn parse_wiphy_mld_capabilities(attrs: &[(u16, &[u8])]) -> Option<(u16, u16)> {
@@ -286,13 +294,15 @@ pub(super) fn nl_get_wiphy_capabilities(
         if src.mld.is_some() {
             dst.mld = src.mld.take();
         }
+        dst.dfs_offload |= src.dfs_offload;
     }
 
-    fn merge_mld(dst: &mut WiphyCapabilities, attrs: &[(u16, &[u8])]) {
+    fn merge_global(dst: &mut WiphyCapabilities, attrs: &[(u16, &[u8])]) {
         if let Some((eml, mld)) = parse_wiphy_mld_capabilities(attrs) {
             dst.eml = Some(eml);
             dst.mld = Some(mld);
         }
+        dst.dfs_offload |= ext_feature_enabled(attrs, NL80211_EXT_FEATURE_DFS_OFFLOAD);
     }
 
     // Resolve the interface's wiphy first. The compact GET_WIPHY response also
@@ -326,7 +336,7 @@ pub(super) fn nl_get_wiphy_capabilities(
                 wiphy = msg::find_attr(&attrs, NL80211_ATTR_WIPHY)
                     .and_then(|v| v.get(..4))
                     .map(|v| u32::from_ne_bytes(v.try_into().unwrap()));
-                merge_mld(&mut caps, &attrs);
+                merge_global(&mut caps, &attrs);
                 if let Some(found) = parse_wiphy_capabilities(&attrs, band) {
                     merge(&mut caps, found);
                 }
@@ -375,7 +385,7 @@ pub(super) fn nl_get_wiphy_capabilities(
                 .map(|v| u32::from_ne_bytes(v.try_into().unwrap()) == wiphy)
                 .unwrap_or(false);
             if same_wiphy {
-                merge_mld(&mut caps, &attrs);
+                merge_global(&mut caps, &attrs);
                 if let Some(found) = parse_wiphy_capabilities(&attrs, band) {
                     merge(&mut caps, found);
                 }
@@ -544,5 +554,16 @@ mod wiphy_capability_tests {
             .to_bytes(1);
         let attrs = msg::parse_attrs(&message[20..]);
         assert_eq!(parse_wiphy_mld_capabilities(&attrs), Some((0x406b, 0x0024)));
+    }
+
+    #[test]
+    fn detects_driver_dfs_offload_extended_feature() {
+        let features = [0, 0, 0, 1 << (NL80211_EXT_FEATURE_DFS_OFFLOAD % 8)];
+        let attrs = [(NL80211_ATTR_EXT_FEATURES, features.as_slice())];
+        assert!(ext_feature_enabled(&attrs, NL80211_EXT_FEATURE_DFS_OFFLOAD));
+        assert!(!ext_feature_enabled(
+            &attrs,
+            NL80211_EXT_FEATURE_DFS_OFFLOAD - 1
+        ));
     }
 }

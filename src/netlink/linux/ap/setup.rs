@@ -47,6 +47,25 @@ pub(super) fn start_radio(
         resolve_mld_addresses(&mut ap, hw)?;
     }
     let mld_links = ap.active_mld_links();
+    let needs_pre_cac_scan = mld_links.iter().any(|link| {
+        !link.band6
+            && link.width >= 40
+            && chandef_is_dfs(
+                dot11::center_channel(link.channel, link.width, false),
+                link.width,
+            )
+    });
+    let scan_group = if needs_pre_cac_scan {
+        let (_, group) = resolve_family(&mut sock, "nl80211", "scan")?;
+        Some(group.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "nl80211 scan multicast group missing",
+            )
+        })?)
+    } else {
+        None
+    };
     // Primary frequency: 6 GHz is 5950 + 5*chan, otherwise the 2.4/5 GHz table.
     let band6 = ap.band6();
     // nl80211 reports HE/EHT capability blobs per band. An MLD spanning 5 and
@@ -215,6 +234,9 @@ pub(super) fn start_radio(
     if let Some(g) = mlme_group {
         let _ = sock.join_multicast(g);
     }
+    if let Some(g) = scan_group {
+        sock.join_multicast(g)?;
+    }
     // Create the complete MLD topology before installing any beacon template.
     // Every template contains the other affiliated link's profile, and ath12k
     // can accept START_AP while silently suppressing that beacon if its partner
@@ -235,8 +257,32 @@ pub(super) fn start_radio(
             );
         }
     }
+    // Match the reference AP's HT40 coexistence scan before starting CAC.
+    // Restrict this to wide DFS links: it is required before CAC on drivers
+    // such as ath12k, while narrow DFS and non-DFS startup need no scan delay.
+    for link in &mld_links {
+        let center_channel = dot11::center_channel(link.channel, link.width, link.band6);
+        if link.band6 || link.width < 40 || !chandef_is_dfs(center_channel, link.width) {
+            continue;
+        }
+        let secondary_channel = if link.channel % 8 == 4 {
+            link.channel + 4
+        } else {
+            link.channel - 4
+        };
+        do_pre_cac_scan(
+            &mut sock,
+            family_id,
+            ifindex,
+            msg::freq_for_channel(link.channel),
+            msg::freq_for_channel(secondary_channel),
+        )?;
+    }
     for link in &mld_links {
         let link_band6 = link.band6;
+        let link_caps = wiphy_caps_by_link
+            .get(&link.link_id)
+            .expect("capabilities collected for every active link");
         let link_freq: u32 = if link_band6 {
             5950 + 5 * link.channel as u32
         } else {
@@ -264,14 +310,22 @@ pub(super) fn start_radio(
             link.channel
         };
         if !link_band6 && chandef_is_dfs(link_center_chan, link_width) {
-            do_cac(
-                &mut sock,
-                family_id,
-                ifindex,
-                link_freq,
-                link_chan_width,
-                link_center_freq1,
-            )?;
+            if link_caps.dfs_offload {
+                eprintln!(
+                    "netlink AP: DFS offload — driver owns CAC and radar handling on {link_freq} MHz link={:?}",
+                    ap.mld.then_some(link.link_id)
+                );
+            } else {
+                do_cac(
+                    &mut sock,
+                    family_id,
+                    ifindex,
+                    link_freq,
+                    link_chan_width,
+                    link_center_freq1,
+                    ap.mld.then_some(link.link_id),
+                )?;
+            }
         }
         let beacon_rt = if ap.mld {
             ap.beacon_frame_unprotected_for_link(link)
@@ -281,9 +335,6 @@ pub(super) fn start_radio(
         let mut beacon = dot11::strip_radiotap(&beacon_rt)
             .map(<[u8]>::to_vec)
             .unwrap_or(beacon_rt);
-        let link_caps = wiphy_caps_by_link
-            .get(&link.link_id)
-            .expect("capabilities collected for every active link");
         apply_wiphy_capabilities(&mut beacon, link_caps);
         if ap.mld {
             eprintln!(
@@ -436,6 +487,9 @@ pub(super) fn start_radio(
         wdev,
         channel,
         frequency: freq,
+        dfs_offload: wiphy_caps_by_link
+            .values()
+            .any(|capabilities| capabilities.dfs_offload),
         links,
         station_links: HashMap::new(),
         capabilities: wiphy_caps_by_link,

@@ -307,6 +307,38 @@ impl Ap {
         self.channel_width = width;
     }
 
+    /// Synchronize protocol/beacon state after the driver completes a channel
+    /// switch. DFS-offload drivers own the move but report its result through
+    /// nl80211; OCV and subsequent management frames must use that live channel.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_operating_channel(
+        &mut self,
+        link_id: Option<u8>,
+        channel: u8,
+        width: Option<u16>,
+        band6: bool,
+    ) {
+        let target_link = link_id.unwrap_or(self.link_id);
+        if let Some(link) = self
+            .mld_links
+            .iter_mut()
+            .find(|link| link.link_id == target_link)
+        {
+            link.channel = channel;
+            link.band6 = band6;
+            if let Some(width) = width {
+                link.width = width;
+            }
+        }
+        if !self.mld || target_link == self.link_id {
+            self.channel = channel;
+            self.band6 = band6;
+            if let Some(width) = width {
+                self.channel_width = width;
+            }
+        }
+    }
+
     /// Set the PHY generation advertised on 2.4/5 GHz (ac/ax/be).
     pub fn set_phy(&mut self, phy: dot11::PhyMode) {
         self.phy_mode = phy;

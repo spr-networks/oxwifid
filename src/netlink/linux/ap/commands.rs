@@ -547,6 +547,140 @@ pub(super) fn radar_event(attrs: &[(u16, &[u8])]) -> Option<u32> {
         .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
 }
 
+pub(super) fn pre_cac_scan_message(
+    family: u16,
+    seq: u32,
+    ifindex: u32,
+    frequencies: &[u32],
+) -> GenlMessage {
+    let frequencies = frequencies
+        .iter()
+        .enumerate()
+        .map(|(index, frequency)| Attr::u32((index + 1) as u16, *frequency))
+        .collect::<Vec<_>>();
+    GenlMessage::new(family, NL80211_CMD_TRIGGER_SCAN, 0, seq)
+        .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
+        .attr(Attr::nested(NL80211_ATTR_SCAN_FREQUENCIES, &frequencies))
+        // The interface is already in AP mode but is not beaconing yet.
+        .attr(Attr::u32(NL80211_ATTR_SCAN_FLAGS, NL80211_SCAN_FLAG_AP))
+}
+
+/// Perform the passive HT40 coexistence scan the reference AP runs before
+/// enabling a wide channel. Some full-MAC drivers reject DFS CAC until this
+/// pre-beacon AP scan has initialized their channel context.
+pub(super) fn do_pre_cac_scan(
+    sock: &mut NetlinkSocket,
+    family: u16,
+    ifindex: u32,
+    primary_frequency: u32,
+    secondary_frequency: u32,
+) -> io::Result<()> {
+    fn consume_results(sock: &mut NetlinkSocket, family: u16, ifindex: u32) -> io::Result<()> {
+        // Match the reference AP's GET_SCAN after NEW_SCAN_RESULTS. Besides
+        // applying the coexistence check in userspace, this request/response is
+        // a driver serialization barrier: ath12k can emit the multicast event
+        // just before its scan channel context is ready for RADAR_DETECT.
+        let seq = sock.next_seq();
+        sock.send(
+            &GenlMessage::new(family, NL80211_CMD_GET_SCAN, msg::NLM_F_DUMP, seq)
+                .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
+                .to_bytes(sock.pid),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let Some(buf) = sock.recv(Duration::from_millis(500)) else {
+                continue;
+            };
+            for parsed in msg::parse_messages(&buf) {
+                if parsed.seq != seq {
+                    continue;
+                }
+                if parsed.typ == msg::NLMSG_DONE {
+                    return Ok(());
+                }
+                if let Some(code) = parsed.error_code() {
+                    if code == 0 {
+                        continue;
+                    }
+                    return Err(io::Error::from_raw_os_error(-code));
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "pre-CAC scan result dump did not complete",
+        ))
+    }
+
+    let frequencies = [primary_frequency, secondary_frequency];
+    let seq = sock.next_seq();
+    match sock.request_ack(pre_cac_scan_message(family, seq, ifindex, &frequencies)) {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("pre-CAC coexistence scan rejected: {error}"),
+            ))
+        }
+    }
+
+    eprintln!(
+        "netlink AP: DFS — passive coexistence scan on {primary_frequency}/{secondary_frequency} MHz"
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while Instant::now() < deadline {
+        let Some(buf) = sock.recv(Duration::from_millis(500)) else {
+            continue;
+        };
+        for parsed in msg::parse_messages(&buf) {
+            if parsed.typ != family {
+                continue;
+            }
+            let attrs = msg::parse_attrs(parsed.genl_attrs());
+            let event_ifindex = msg::find_attr(&attrs, NL80211_ATTR_IFINDEX)
+                .and_then(|value| value.get(..4))
+                .map(|value| u32::from_ne_bytes(value.try_into().unwrap()));
+            if event_ifindex != Some(ifindex) {
+                continue;
+            }
+            match parsed.genl_cmd() {
+                Some(NL80211_CMD_NEW_SCAN_RESULTS) => {
+                    return consume_results(sock, family, ifindex)
+                }
+                Some(NL80211_CMD_SCAN_ABORTED) => {
+                    return Err(io::Error::other("pre-CAC coexistence scan aborted"))
+                }
+                _ => {}
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "pre-CAC coexistence scan did not complete",
+    ))
+}
+
+pub(super) fn radar_detect_message(
+    family: u16,
+    seq: u32,
+    ifindex: u32,
+    freq: u32,
+    chan_width: u32,
+    center_freq1: u32,
+    link_id: Option<u8>,
+) -> GenlMessage {
+    let message = GenlMessage::new(family, NL80211_CMD_RADAR_DETECT, 0, seq)
+        .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
+        .attr(Attr::u32(NL80211_ATTR_WIPHY_FREQ, freq))
+        .attr(Attr::u32(NL80211_ATTR_CHANNEL_WIDTH, chan_width))
+        .attr(Attr::u32(NL80211_ATTR_CENTER_FREQ1, center_freq1));
+    match link_id {
+        Some(link_id) => message.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id)),
+        None => message,
+    }
+}
+
 /// Run the Channel Availability Check on a DFS channel: ask the kernel to start
 /// radar detection, then block until it reports CAC finished (channel clear) —
 /// the kernel won't let us `START_AP` on a radar channel before this. ~60 s.
@@ -557,22 +691,27 @@ pub(super) fn do_cac(
     freq: u32,
     chan_width: u32,
     center_freq1: u32,
+    link_id: Option<u8>,
 ) -> io::Result<()> {
     let seq = sock.next_seq();
-    sock.request_ack(
-        GenlMessage::new(family, NL80211_CMD_RADAR_DETECT, 0, seq)
-            .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
-            .attr(Attr::u32(NL80211_ATTR_WIPHY_FREQ, freq))
-            .attr(Attr::u32(NL80211_ATTR_CHANNEL_WIDTH, chan_width))
-            .attr(Attr::u32(NL80211_ATTR_CENTER_FREQ1, center_freq1)),
-    )
+    sock.request_ack(radar_detect_message(
+        family,
+        seq,
+        ifindex,
+        freq,
+        chan_width,
+        center_freq1,
+        link_id,
+    ))
     .map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!("DFS RADAR_DETECT rejected on {freq} MHz ({e}); the driver may not support userspace CAC"),
+            format!("DFS RADAR_DETECT rejected on {freq} MHz link={link_id:?} ({e})"),
         )
     })?;
-    eprintln!("netlink AP: DFS — running CAC (radar listen) on {freq} MHz, ~60 s...");
+    eprintln!(
+        "netlink AP: DFS — running CAC (radar listen) on {freq} MHz link={link_id:?}, ~60 s..."
+    );
     // Standard DFS CAC is 60 s; ETSI weather-radar channels (120-128) take 600 s.
     // Bound the wait at ~650 s so a legitimate weather CAC completes but a missed
     // event can't hang us forever.
@@ -584,7 +723,14 @@ pub(super) fn do_cac(
             if parsed.typ != family || parsed.genl_cmd() != Some(NL80211_CMD_RADAR_DETECT) {
                 continue;
             }
-            match radar_event(&msg::parse_attrs(parsed.genl_attrs())) {
+            let attrs = msg::parse_attrs(parsed.genl_attrs());
+            let event_link = msg::find_attr(&attrs, NL80211_ATTR_MLO_LINK_ID)
+                .and_then(|value| value.first())
+                .copied();
+            if link_id.is_some() && event_link.is_some() && event_link != link_id {
+                continue;
+            }
+            match radar_event(&attrs) {
                 Some(NL80211_RADAR_CAC_FINISHED) => {
                     eprintln!("netlink AP: CAC finished — channel clear, beaconing");
                     return Ok(());
@@ -607,6 +753,54 @@ pub(super) fn do_cac(
 #[cfg(test)]
 mod station_authorization_tests {
     use super::*;
+
+    fn attr(message: &GenlMessage, kind: u16) -> Option<&[u8]> {
+        message
+            .attrs
+            .iter()
+            .find(|attribute| attribute.typ & 0x3fff == kind)
+            .map(|attribute| attribute.data.as_slice())
+    }
+
+    #[test]
+    fn mld_radar_detection_is_scoped_to_the_link() {
+        let mld = radar_detect_message(42, 7, 343, 5500, NL80211_CHAN_WIDTH_80, 5530, Some(1));
+        assert_eq!(
+            mld.cmd, 94,
+            "nl80211 command numbers are a stable userspace ABI"
+        );
+        assert_eq!(
+            attr(&mld, NL80211_ATTR_IFINDEX),
+            Some(343u32.to_ne_bytes().as_slice())
+        );
+        assert_eq!(
+            attr(&mld, NL80211_ATTR_WIPHY_FREQ),
+            Some(5500u32.to_ne_bytes().as_slice())
+        );
+        assert_eq!(attr(&mld, NL80211_ATTR_MLO_LINK_ID), Some([1].as_slice()));
+
+        let legacy = radar_detect_message(42, 8, 343, 5500, NL80211_CHAN_WIDTH_80, 5530, None);
+        assert_eq!(attr(&legacy, NL80211_ATTR_MLO_LINK_ID), None);
+    }
+
+    #[test]
+    fn pre_cac_scan_is_passive_ap_scan_on_the_ht40_pair() {
+        let scan = pre_cac_scan_message(42, 9, 343, &[5500, 5520]);
+        assert_eq!(scan.cmd, NL80211_CMD_TRIGGER_SCAN);
+        assert_eq!(attr(&scan, NL80211_ATTR_SCAN_SSIDS), None);
+        assert_eq!(
+            attr(&scan, NL80211_ATTR_SCAN_FLAGS),
+            Some(NL80211_SCAN_FLAG_AP.to_ne_bytes().as_slice())
+        );
+        let frequencies = msg::parse_attrs(attr(&scan, NL80211_ATTR_SCAN_FREQUENCIES).unwrap());
+        assert_eq!(
+            frequencies,
+            [
+                (1, 5500u32.to_ne_bytes().as_slice()),
+                (2, 5520u32.to_ne_bytes().as_slice())
+            ]
+        );
+    }
 
     #[test]
     fn mld_authorization_uses_only_the_peer_mld_address() {
@@ -642,13 +836,6 @@ mod station_authorization_tests {
     fn bss_parameters_are_band_correct() {
         let two_ghz = set_bss_message(42, 1, 7, Some(0), 6, true, false);
         let five_ghz = set_bss_message(42, 2, 7, Some(1), 36, true, false);
-        fn attr(message: &GenlMessage, kind: u16) -> Option<&[u8]> {
-            message
-                .attrs
-                .iter()
-                .find(|attribute| attribute.typ == kind)
-                .map(|attribute| attribute.data.as_slice())
-        }
 
         assert_eq!(
             attr(&two_ghz, NL80211_ATTR_BSS_BASIC_RATES),

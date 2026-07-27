@@ -265,6 +265,22 @@ pub fn freq_for_channel(ch: u8) -> u32 {
     }
 }
 
+/// Convert an nl80211 operating frequency to its 802.11 channel number.
+///
+/// The band is intentionally determined by the frequency at the call site:
+/// channel 1 is valid in both 2.4 and 6 GHz.
+pub fn channel_for_freq(freq: u32) -> Option<u8> {
+    let channel = match freq {
+        2484 => 14,
+        2412..=2472 if (freq - 2407).is_multiple_of(5) => (freq - 2407) / 5,
+        5000..=5895 if (freq - 5000).is_multiple_of(5) => (freq - 5000) / 5,
+        5935 => 2,
+        5955..=7115 if (freq - 5950).is_multiple_of(5) => (freq - 5950) / 5,
+        _ => return None,
+    };
+    u8::try_from(channel).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +343,15 @@ mod tests {
         assert_eq!(freq_for_channel(11), 2462);
         assert_eq!(freq_for_channel(14), 2484);
         assert_eq!(freq_for_channel(36), 5180);
+    }
+
+    #[test]
+    fn frequency_to_channel_across_wifi_bands() {
+        assert_eq!(channel_for_freq(2412), Some(1));
+        assert_eq!(channel_for_freq(2484), Some(14));
+        assert_eq!(channel_for_freq(5500), Some(100));
+        assert_eq!(channel_for_freq(5955), Some(1));
+        assert_eq!(channel_for_freq(7115), Some(233));
+        assert_eq!(channel_for_freq(5501), None);
     }
 }
