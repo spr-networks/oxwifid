@@ -29,7 +29,7 @@ barely-ap --config FILE.json [--ssid NAME] [--mac AA:BB:CC:DD:EE:FF]
 
 The config file (see `barely-ap.example.json`) keeps shared settings such as
 `ssid`, credentials, `key_mgmt`, `pairwise_cipher`, country, and policy toggles
-at the top level. Per-radoi settings (`interface`, `mac`, `band`, `channel`,
+at the top level. Per-radio settings (`interface`, `mac`, `band`, `channel`,
 `width`, `phy`, and `ctrl_path`)
 
 For the AP, non-default pairwise ciphers use Linux/mac80211
@@ -37,8 +37,10 @@ authenticated-encryption offload and therefore require `mode: "netlink"`.
 `barely-cli` also implements WPA2 single-link CCMP/GCMP protection in userspace
 (GCMP uses RustCrypto `aes-gcm`) for reverse-direction interop. 
 
-Unknown keys and type mismatches are hard errors. See [`src/config.rs`](src/config.rs).
-Passwords are accepted only through the JSON `passphrase` or `psk_file`
+Unknown keys and type mismatches are hard errors. See
+[`src/config/`](src/config/).
+Passwords are accepted only through the JSON `passphrase`, `wpa_psk_file`, or
+`sae_psk_file`
 settings;
 
 ### stdio mode (default, all platforms)
@@ -118,12 +120,11 @@ drives any of them:
 | `netlink` | nl80211 generic netlink (`netlink`)      | Linux    |
 
 The raw-frame transports live under `src/raw_frames/`; the nl80211 transport
-lives under `src/netlink/`. The netlink message-encoding layer
-(`netlink::msg`) is platform-independent and unit-tested (`cargo test`), while
-the socket layer is Linux-only. nl80211 mode configures the radio (interface
-type + channel) and carries **management** frames via `NL80211_CMD_FRAME`;
-userspace-encrypted CCMP **data** frames still use the monitor path. The
-Linux-only code is type-checked here via
+lives under `src/netlink/`. Its ABI constants, helper policy, and message
+encoding are separate platform-independent modules, while socket and AP runtime
+code live under `src/netlink/linux/`. nl80211 mode configures the radio,
+publishes stations and keys, sends control-port EAPOL, and leaves the protected
+data plane to mac80211. The Linux-only code is type-checked here via
 `cargo check --target x86_64-unknown-linux-gnu` but not run on non-Linux hosts.
 
 Unlike the threaded Python original, the AP is a single-threaded state machine:
@@ -415,7 +416,7 @@ level, then override the identity and channel settings in each
   "country": "US",
   "mode": "netlink",
   "key_mgmt": "sae",
-  "psk_file": "/configs/wifi/sae_passwords",
+  "sae_psk_file": "/configs/wifi/sae_passwords",
   "per_sta_vif": true,
   "ocv": false,
   "spr_api_socket": "/state/wifi/apisock",
@@ -479,21 +480,26 @@ cases) and config parsing unit tests.
 #### DFS — 5 GHz radar channels (CAC + radar response)
 
 Before beaconing on a DFS chandef (any 20 MHz subchannel in 52-64 / 100-144), the
-AP runs the Channel Availability Check: `NL80211_CMD_RADAR_DETECT` → wait for the
-`RADAR_CAC_FINISHED` event (60 s, or 600 s on ETSI weather channels) → `START_AP`.
+AP performs the reference AP's passive HT40 coexistence scan for a wide channel,
+then runs the Channel Availability Check: `NL80211_CMD_RADAR_DETECT` → wait for
+the `RADAR_CAC_FINISHED` event (60 s, or 600 s on ETSI weather channels) →
+`START_AP`.
+For an MLD, the CAC request and completion are scoped to the affected link with
+`NL80211_ATTR_MLO_LINK_ID`. Drivers advertising
+`NL80211_EXT_FEATURE_DFS_OFFLOAD` instead own CAC, radar response, and the channel
+move; the AP does not issue userspace CAC and synchronizes its live channel/OCV
+state from the driver's channel-switch notification.
+
 A `RADAR_DETECTED` event during operation vacates the channel (`STOP_AP`) within
 the move time and exits with a recommended non-DFS fallback channel
 (`fallback_channel`, UNII-1/UNII-3) named in the log + error, so a supervisor can
-restart there without a CAC. The kernel/driver performs the actual radar
-detection; userspace only orchestrates the CAC and the response — no radar DSP in
-userspace. `chandef_is_dfs` and `fallback_channel` are unit-tested.
-
-Two pieces are deliberately box-gated and not yet done: (1) the live
-`RADAR_DETECT` round-trip — the test radio returned `EOPNOTSUPP` (driver-dependent;
-needs an strace-diff against reference AP to confirm message vs. driver support); and
-(2) an *in-process* channel switch on radar (vs. the current vacate-and-exit),
-which would restructure the verified beaconing loop and is only worth doing once
-the CAC itself is confirmed on hardware.
+restart there without a CAC. On a DFS-offload radio, the driver performs that
+move in place instead. The kernel/driver performs the actual radar detection;
+userspace only orchestrates the non-offload CAC and response — no radar DSP in
+userspace. The DFS chandef, fallback, offload-bit parsing, and link-scoped CAC
+message are unit-tested. Stock `mac80211_hwsim` does not advertise radar-detect
+widths and returns `EOPNOTSUPP` for live CAC, so the kernel round trip requires a
+DFS-capable physical or specialized virtual radio.
 
 ### 6 GHz and 802.11be / MLD
 

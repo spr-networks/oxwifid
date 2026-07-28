@@ -134,16 +134,20 @@ MAC24=$(cat "/sys/class/net/$AP24/address")
 MAC5=$(cat "/sys/class/net/$AP5/address")
 mkdir -p "$WORK/control-$AP24" "$WORK/control-$AP5"
 
-: >"$WORK/credentials"
+: >"$WORK/wpa-credentials"
+: >"$WORK/sae-credentials"
 for i in $(seq 0 $((CLIENTS - 1))); do
     printf '02:11:22:33:%02x:%02x password1234\n' $((i / 256)) $((i % 256)) \
-        >>"$WORK/credentials"
+        >>"$WORK/wpa-credentials"
+    printf 'password1234|mac=02:11:22:33:%02x:%02x\n' $((i / 256)) $((i % 256)) \
+        >>"$WORK/sae-credentials"
 done
 
 cat >"$WORK/ap.json" <<EOF
 {
   "ssid": "rustap-load",
-  "psk_file": "$WORK/credentials",
+  "wpa_psk_file": "$WORK/wpa-credentials",
+  "sae_psk_file": "$WORK/sae-credentials",
   "country": "US",
   "mode": "netlink",
   "key_mgmt": "sae-transition",

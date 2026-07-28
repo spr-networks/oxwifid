@@ -265,11 +265,11 @@ impl Ap {
             let mut v = Vec::with_capacity(
                 exact.len()
                     + self.wildcard_psk_candidates.len()
-                    + usize::from(!self.credential_file_authoritative),
+                    + usize::from(!self.wpa_credentials_authoritative),
             );
             v.extend_from_slice(exact);
             v.extend_from_slice(&self.wildcard_psk_candidates);
-            if !self.credential_file_authoritative {
+            if !self.wpa_credentials_authoritative {
                 v.push(self.pmk);
             }
             v

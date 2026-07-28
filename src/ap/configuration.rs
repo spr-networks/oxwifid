@@ -11,8 +11,8 @@ impl Ap {
     }
 
     /// Construct an AP with no fallback credential. Configuration-file callers
-    /// use this when credentials come exclusively from `psk_file` or the BSS is
-    /// OWE; authentication remains fail-closed until credentials are installed.
+    /// use this when credentials come exclusively from credential files or the
+    /// BSS is OWE; authentication remains fail-closed until they are installed.
     pub fn new_without_credential(ssid: &str, mac: [u8; 6], channel: u8) -> Ap {
         let mut gtk_full = random_bytes::<32>();
         let mut gtk = [0u8; 16];
@@ -41,7 +41,8 @@ impl Ap {
             wildcard_psk_candidates: Vec::new(),
             credential_passwords_by_mac: HashMap::new(),
             wildcard_credential_password: None,
-            credential_file_authoritative: false,
+            wpa_credentials_authoritative: false,
+            sae_credentials_authoritative: false,
             credential_reload_pending: false,
             password: Vec::new(),
             sae_enabled: false,
@@ -306,6 +307,38 @@ impl Ap {
         self.channel_width = width;
     }
 
+    /// Synchronize protocol/beacon state after the driver completes a channel
+    /// switch. DFS-offload drivers own the move but report its result through
+    /// nl80211; OCV and subsequent management frames must use that live channel.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_operating_channel(
+        &mut self,
+        link_id: Option<u8>,
+        channel: u8,
+        width: Option<u16>,
+        band6: bool,
+    ) {
+        let target_link = link_id.unwrap_or(self.link_id);
+        if let Some(link) = self
+            .mld_links
+            .iter_mut()
+            .find(|link| link.link_id == target_link)
+        {
+            link.channel = channel;
+            link.band6 = band6;
+            if let Some(width) = width {
+                link.width = width;
+            }
+        }
+        if !self.mld || target_link == self.link_id {
+            self.channel = channel;
+            self.band6 = band6;
+            if let Some(width) = width {
+                self.channel_width = width;
+            }
+        }
+    }
+
     /// Set the PHY generation advertised on 2.4/5 GHz (ac/ax/be).
     pub fn set_phy(&mut self, phy: dot11::PhyMode) {
         self.phy_mode = phy;
@@ -343,51 +376,55 @@ impl Ap {
         self.per_sta_vif = true;
     }
 
-    /// Install the reference AP-style credential-file candidates: `(mac, passphrase)`
-    /// pairs (`None` mac = wildcard onboarding entry). Each passphrase is turned
-    /// into a PMK against this AP's SSID. Once called, this file is authoritative:
-    /// the BSS passphrase is no longer an authentication fallback.
-    pub fn set_psk_file(&mut self, entries: &[(Option<[u8; 6]>, String)]) {
-        // A static-credential (guest) BSS never adopts the device credential
-        // database — not at startup and not via a control-socket RELOAD.
+    /// Install the authoritative WPA2 credential database. Passphrases are
+    /// converted to PMKs off the handshake hot path.
+    pub fn set_wpa_psk_file(&mut self, entries: &[CredentialEntry]) {
         if self.static_credential {
             return;
         }
-        let prepared = PreparedPskFile::derive(&self.ssid, entries);
-        self.install_prepared_psk_file(prepared);
+        let prepared = PreparedCredentials::derive(&self.ssid, Some(entries), None);
+        self.install_prepared_credentials(prepared);
     }
 
-    /// Atomically adopt a credential database whose PBKDF2 work was completed
-    /// off the radio thread.
-    pub(crate) fn install_prepared_psk_file(&mut self, mut prepared: PreparedPskFile) {
+    /// Install the authoritative SAE password database.
+    pub fn set_sae_password_file(&mut self, entries: &[CredentialEntry]) {
+        if self.static_credential {
+            return;
+        }
+        let prepared = PreparedCredentials::derive(&self.ssid, None, Some(entries));
+        self.install_prepared_credentials(prepared);
+    }
+
+    /// Atomically adopt either or both credential databases after file parsing
+    /// and PBKDF2 work have completed off the radio thread.
+    pub(crate) fn install_prepared_credentials(&mut self, mut prepared: PreparedCredentials) {
         if self.static_credential {
             return;
         }
         self.pmksa_cache.clear();
-        for candidates in self.psk_candidates_by_mac.values_mut() {
-            candidates.zeroize();
+        if let Some(mut wpa) = prepared.wpa.take() {
+            for candidates in self.psk_candidates_by_mac.values_mut() {
+                candidates.zeroize();
+            }
+            self.wildcard_psk_candidates.zeroize();
+            self.psk_candidates_by_mac = std::mem::take(&mut wpa.by_mac);
+            self.wildcard_psk_candidates = std::mem::take(&mut wpa.wildcard);
+            self.wpa_credentials_authoritative = true;
+            self.pmk.zeroize();
         }
-        self.wildcard_psk_candidates.zeroize();
-        for password in self.credential_passwords_by_mac.values_mut() {
-            password.zeroize();
+        if let Some(mut sae) = prepared.sae.take() {
+            for password in self.credential_passwords_by_mac.values_mut() {
+                password.zeroize();
+            }
+            if let Some(password) = self.wildcard_credential_password.as_mut() {
+                password.zeroize();
+            }
+            self.credential_passwords_by_mac = std::mem::take(&mut sae.by_mac);
+            self.wildcard_credential_password = sae.wildcard.take();
+            self.sae_credentials_authoritative = true;
+            self.password.zeroize();
         }
-        if let Some(password) = self.wildcard_credential_password.as_mut() {
-            password.zeroize();
-        }
-        self.psk_candidates_by_mac.clear();
-        self.wildcard_psk_candidates.clear();
-        self.credential_passwords_by_mac.clear();
-        self.wildcard_credential_password = None;
-        self.credential_file_authoritative = true;
         self.credential_reload_pending = false;
-        self.psk_candidates_by_mac = std::mem::take(&mut prepared.candidates_by_mac);
-        self.wildcard_psk_candidates = std::mem::take(&mut prepared.wildcard_candidates);
-        self.credential_passwords_by_mac = std::mem::take(&mut prepared.passwords_by_mac);
-        self.wildcard_credential_password = std::mem::take(&mut prepared.wildcard_password);
-        // The file is authoritative, so the JSON passphrase is no longer a
-        // fallback and should not remain resident.
-        self.pmk.zeroize();
-        self.password.zeroize();
     }
 
     pub(crate) fn begin_psk_reload(&mut self) {
@@ -418,7 +455,7 @@ impl Ap {
             .or_else(|| link_identity.and_then(|link| self.credential_passwords_by_mac.get(link)))
             .or(self.wildcard_credential_password.as_ref())
             .map(Vec::as_slice)
-            .or_else(|| (!self.credential_file_authoritative).then_some(self.password.as_slice()))
+            .or_else(|| (!self.sae_credentials_authoritative).then_some(self.password.as_slice()))
     }
 
     /// Whether per-station-VIF mode is enabled.
@@ -439,7 +476,7 @@ impl Ap {
     }
 
     /// Pin this BSS to its static (guest) passphrase: the device credential
-    /// database no longer applies, so `set_psk_file` becomes a no-op.
+    /// databases no longer apply, so credential-file updates become no-ops.
     pub fn set_static_credential(&mut self) {
         self.static_credential = true;
     }

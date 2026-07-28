@@ -3,7 +3,7 @@
   "country": "US",
   "mode": "netlink",
   "key_mgmt": "sae",
-  "psk_file": "/configs/wifi/sae_passwords",
+  "sae_psk_file": "/configs/wifi/sae_passwords",
   "per_sta_vif": true,
   "ocv": false,
   "spr_api_socket": "/state/wifi/apisock",

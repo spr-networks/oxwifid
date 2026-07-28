@@ -2,7 +2,7 @@
 # =============================================================================
 # HOW THIS E2E TEST RUNS  (read before touching it)
 # =============================================================================
-# WHAT it proves: a real barely-ap AP with a reference AP-style psk_file authenticates
+# WHAT it proves: a real barely-ap AP with a reference AP-style wpa_psk_file authenticates
 # clients by the right credential — MAC-specific entry, wildcard onboarding, the
 # wildcard *fallback*, and rejects a wrong password — over real mac80211_hwsim.
 #
@@ -40,7 +40,7 @@
 #    on-the-wire confirmation, not the primary test.
 # =============================================================================
 #
-# E2E: barely-ap psk_file (wildcard + per-MAC) + per_sta_vif. Each sub-test
+# E2E: barely-ap wpa_psk_file (wildcard + per-MAC) + per_sta_vif. Each sub-test
 # restarts the AP fresh (no stale station state) and drives one wpa_supplicant
 # connect. Writes /tmp/pskfile_result.txt. Run: sudo setsid bash pskfile_test.sh &
 B=/tmp/iopbin/barely-ap; NS=pskcli; R=/tmp/pskfile_result.txt
@@ -60,12 +60,12 @@ ip netns add "$NS"; iw phy "$(cat /sys/class/net/$STA/phy80211/name)" set netns 
 ip netns exec "$NS" iw reg set US 2>/dev/null; ip netns exec "$NS" ip link set lo up
 ip netns exec "$NS" ip link set "$STA" up; sleep 1
 
-# Start the AP ONCE with the full psk_file (wildcard + this STA's MAC entry).
+# Start the AP ONCE with the full wpa_psk_file (wildcard + this STA's MAC entry).
 printf '00:00:00:00:00:00 onboardpass\n%s devicepass\n' "$STAMAC" > /tmp/pskfile
 cat > /tmp/ap.json <<EOF
 { "ssid": "psktest", "passphrase": "defaultpass", "key_mgmt": "psk",
   "band": 5, "channel": 36, "width": 80, "phy": "ax", "mode": "netlink",
-  "iface": "$AP", "per_sta_vif": true, "psk_file": "/tmp/pskfile" }
+  "iface": "$AP", "per_sta_vif": true, "wpa_psk_file": "/tmp/pskfile" }
 EOF
 ip link set "$AP" down; iw dev "$AP" set type __ap; ip link set "$AP" up
 ip addr flush dev "$AP" 2>/dev/null; ip addr add 10.10.10.1/24 dev "$AP" 2>/dev/null

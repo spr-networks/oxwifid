@@ -44,18 +44,49 @@ fn try_connect(ap: &mut Ap, net: &mut FakeNet, sta: &mut Client) -> u8 {
 fn ap_with_file(entries: &[(Option<[u8; 6]>, &str)]) -> (Ap, FakeNet) {
     let ap_mac = mac_to_bytes("02:00:00:00:00:00");
     // The AP's own single passphrase is deliberately WRONG for these clients —
-    // only the psk_file entries can authenticate them.
+    // only the credential-file entries can authenticate them.
     let mut ap = Ap::new("pnet", "the-default-psk", ap_mac, 1);
     let owned: Vec<(Option<[u8; 6]>, String)> =
         entries.iter().map(|(m, p)| (*m, p.to_string())).collect();
-    ap.set_psk_file(&owned);
+    ap.set_wpa_psk_file(&owned);
     (ap, FakeNet::new(ap_mac, [10, 10, 10, 1]))
 }
 
 fn sae_ap_with_file(entries: &[(Option<[u8; 6]>, &str)]) -> (Ap, FakeNet) {
-    let (mut ap, net) = ap_with_file(entries);
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let mut ap = Ap::new("pnet", "the-default-psk", ap_mac, 1);
+    let owned: Vec<(Option<[u8; 6]>, String)> =
+        entries.iter().map(|(m, p)| (*m, p.to_string())).collect();
+    ap.set_sae_password_file(&owned);
     ap.enable_sae();
-    (ap, net)
+    (ap, FakeNet::new(ap_mac, [10, 10, 10, 1]))
+}
+
+#[test]
+fn transition_uses_independent_wpa_and_sae_credential_files() {
+    let ap_mac = mac_to_bytes("02:00:00:00:00:00");
+    let wpa_mac = mac_to_bytes("02:00:00:00:20:01");
+    let sae_mac = mac_to_bytes("02:00:00:00:20:02");
+    let mut ap = Ap::new("pnet", "unused-default", ap_mac, 1);
+    ap.enable_transition();
+    ap.set_wpa_psk_file(&[(Some(wpa_mac), "wpa-only-password".to_string())]);
+    ap.set_sae_password_file(&[(Some(sae_mac), "sae-only-password".to_string())]);
+    let mut net = FakeNet::new(ap_mac, [10, 10, 10, 1]);
+
+    let mut wpa = Client::new("pnet", "wpa-only-password", wpa_mac);
+    assert_eq!(
+        try_connect(&mut ap, &mut net, &mut wpa),
+        4,
+        "transition WPA2 must use wpa_psk_file, not sae_psk_file"
+    );
+
+    let mut sae = Client::new("pnet", "sae-only-password", sae_mac);
+    sae.enable_sae();
+    assert_eq!(
+        try_connect(&mut ap, &mut net, &mut sae),
+        4,
+        "transition SAE must use sae_psk_file, not wpa_psk_file"
+    );
 }
 
 #[test]

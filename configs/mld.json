@@ -1,6 +1,6 @@
 {
   "ssid": "mld-test",
-  "psk_file": "/run/secrets/wifi-credentials",
+  "sae_psk_file": "/run/secrets/wifi-credentials",
   "key_mgmt": "sae",
   "phy": "be",
   "mode": "netlink",

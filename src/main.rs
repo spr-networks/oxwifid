@@ -67,7 +67,7 @@ fn parse_args() -> Config {
             "--ssid" => cfg.ssid = next(i),
             "--psk" => {
                 eprintln!(
-                    "barely-ap: --psk was removed because process arguments expose secrets; put passphrase or psk_file in --config"
+                    "barely-ap: --psk was removed because process arguments expose secrets; put passphrase or credential files in --config"
                 );
                 std::process::exit(2);
             }
@@ -273,10 +273,13 @@ fn run_netlink_config(mut cfg: Config) -> Result<(), String> {
         extra,
         &cfg.iface,
         cfg.channel,
-        ctrl_path.as_deref(),
-        cfg.psk_file.as_deref(),
-        cfg.spr_api_socket.as_deref(),
-        cfg.spr_dhcp_helper.as_deref(),
+        barely_ap::netlink::ApRuntimePaths {
+            ctrl: ctrl_path.as_deref(),
+            wpa_psk: cfg.wpa_psk_file.as_deref(),
+            sae_psk: cfg.sae_psk_file.as_deref(),
+            spr_api: cfg.spr_api_socket.as_deref(),
+            spr_dhcp_helper: cfg.spr_dhcp_helper.as_deref(),
+        },
     )
     .map_err(|e| format!("netlink AP failed on {}: {e}", cfg.iface))
 }

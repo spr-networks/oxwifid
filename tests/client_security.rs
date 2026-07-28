@@ -13,6 +13,13 @@ fn framed(frame: Vec<u8>) -> Vec<u8> {
     out
 }
 
+fn parse_eapol_key(frame: &[u8]) -> dot11::EapolKey {
+    dot11::strip_radiotap(frame)
+        .and_then(dot11::Dot11::parse)
+        .and_then(|parsed| parsed.eapol_key_body().and_then(dot11::EapolKey::parse))
+        .expect("valid EAPOL-Key frame")
+}
+
 fn wpa2_pair() -> (Ap, Client, [u8; 6], [u8; 6]) {
     let ap_mac = mac_to_bytes("02:00:00:00:00:01");
     let sta_mac = mac_to_bytes("02:00:00:00:00:02");
@@ -320,13 +327,14 @@ fn station_rejects_malformed_or_foreign_eapol_message1() {
 }
 
 #[test]
-fn duplicate_message1_reuses_the_same_snonce_and_mic() {
+fn message1_retry_with_a_newer_counter_reuses_the_same_snonce() {
     let (mut ap, mut client, ap_mac, sta) = wpa2_pair();
     associate_without_eapol(&mut client, &mut ap, ap_mac, sta);
+    let anonce = [0x66; 32];
     let m1 = framed(dot11::build_eapol_m1(
         &ap_mac,
         &sta,
-        &[0x66; 32],
+        &anonce,
         7,
         0,
         dot11::KeyMic::HmacSha1,
@@ -344,6 +352,23 @@ fn duplicate_message1_reuses_the_same_snonce_and_mic() {
     assert_eq!(
         first_eapol, retry_eapol,
         "an AP retry must not cause a new SNonce/PTK candidate"
+    );
+
+    let newer_m1 = framed(dot11::build_eapol_m1(
+        &ap_mac,
+        &sta,
+        &anonce,
+        8,
+        0,
+        dot11::KeyMic::HmacSha1,
+    ));
+    let newer_m2 = client.handle_incoming(&newer_m1).frames.remove(0);
+    let first_key = dot11::EapolKey::parse(&first_eapol[4..]).expect("first M2");
+    let newer_key = parse_eapol_key(&newer_m2);
+    assert_eq!(newer_key.key_replay_counter, 8);
+    assert_eq!(
+        newer_key.key_nonce, first_key.key_nonce,
+        "a newer replay counter with the same ANonce must preserve the SNonce"
     );
 }
 
