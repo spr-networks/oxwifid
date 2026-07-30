@@ -192,7 +192,6 @@ impl Ap {
             let group = u16::from_le_bytes([group_bytes[0], group_bytes[1]]);
             if group != sae::SAE_GROUP_19 {
                 // SAE group negotiation depends on an explicit status 77:
-                // wpa_supplicant then advances to its next configured group.
                 // Silently dropping an unsupported commit leaves it retrying
                 // the same group until authentication times out.
                 let sc = self.next_sc();

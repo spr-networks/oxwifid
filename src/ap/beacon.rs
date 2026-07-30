@@ -20,7 +20,7 @@ impl Ap {
 
     pub fn beacon_frame_unprotected_for_link(&self, link: &MldLink) -> Vec<u8> {
         let ts = self.current_timestamp();
-        let tail = dot11::security_tail_for_cipher(self.security_mode(), self.pairwise_cipher);
+        let tail = self.advertised_security_tail();
         let mut frame = if link.band6 {
             dot11::build_beacon_6ghz(
                 &link.mac,
@@ -70,7 +70,7 @@ impl Ap {
 
     pub(super) fn beacon_frame_inner(&mut self, protect: bool) -> Vec<u8> {
         let ts = self.current_timestamp();
-        let tail = dot11::security_tail_for_cipher(self.security_mode(), self.pairwise_cipher);
+        let tail = self.advertised_security_tail();
         let mut frame = if self.band6 {
             dot11::build_beacon_6ghz(
                 &self.mac,

@@ -118,8 +118,7 @@ impl Ap {
         // channel/band IEs, its own MLE Link ID, and an RNR naming its
         // PARTNERS. Answering a partner link's probe with the association
         // link's content contradicts that link's beacon, and an MLO client
-        // (wpa_supplicant "Neighbor has unexpected link ID") then falls back
-        // to a single-link association.
+        // then falls back to a single-link association.
         let (link_id, link_mac, channel, width, band6) =
             match self.mgmt_rx_link.filter(|_| self.mld).and_then(|lid| {
                 self.active_mld_links()
@@ -144,7 +143,7 @@ impl Ap {
             channel,
             ts,
             sc,
-            &dot11::security_tail_for_cipher(self.security_mode(), self.pairwise_cipher),
+            &self.advertised_security_tail(),
             &self.country,
             width,
             band6,

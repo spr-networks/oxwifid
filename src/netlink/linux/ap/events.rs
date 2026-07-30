@@ -13,6 +13,40 @@ fn channel_width_mhz(nl_width: u32) -> Option<u16> {
     }
 }
 
+fn finalize_successful_association(
+    io: &mut RadioIo,
+    ap: &mut crate::ap::Ap,
+    topology: &RadioTopology,
+    group_keys: &mut GroupKeyStore,
+    vlans: &mut VlanRegistry,
+    stations: &mut StationRegistry,
+    tx_sta: Mac,
+) -> bool {
+    let core_sta = ap.station_link_for_peer(&tx_sta).unwrap_or(tx_sta);
+    let association_link = topology
+        .station_links
+        .get(&core_sta)
+        .copied()
+        .unwrap_or(ap.link_id);
+    if finalize_associated_station(
+        io,
+        ap,
+        topology,
+        group_keys,
+        vlans,
+        core_sta,
+        association_link,
+    ) {
+        return true;
+    }
+
+    stations.held_eapol.remove(&tx_sta);
+    ap.note_assoc_response_not_acked(&core_sta);
+    stations.begin_retirement(core_sta);
+    vlans.begin_retirement(&core_sta, Instant::now());
+    false
+}
+
 impl RadioRuntime {
     pub(super) fn receive_events(&mut self) -> io::Result<()> {
         let ifindex = self.topology.ifindex;
@@ -139,6 +173,17 @@ impl RadioRuntime {
                         );
                     }
                     if acked {
+                        if !finalize_successful_association(
+                            &mut self.io,
+                            &mut self.ap,
+                            &self.topology,
+                            &mut self.group_keys,
+                            &mut self.vlans,
+                            &mut self.stations,
+                            sta,
+                        ) {
+                            continue;
+                        }
                         if let Some(frame) = self.stations.held_eapol.remove(&sta) {
                             self.ap.note_eapol_transmitted(&core_sta);
                             let released = crate::ap::Outgoing {
@@ -149,9 +194,13 @@ impl RadioRuntime {
                                 &mut self.io,
                                 &released,
                                 &mut self.stations,
+                                &mut self.group_keys,
                                 &mut self.vlans,
                                 &mut self.ap,
-                                &self.topology,
+                                RouteEnvironment {
+                                    topology: &self.topology,
+                                    notifier: self.notifier.as_ref(),
+                                },
                             );
                         }
                     } else if self.ap.is_associated(&core_sta) {
@@ -394,6 +443,69 @@ impl RadioRuntime {
                                     .and_then(|v| v.first())
                             );
                         }
+                        // Immediately before constructing M3, read the live GTK
+                        // and IGTK sequence counters from this station's
+                        // AP_VLAN. A dynamic VLAN
+                        // has its own WPA group, so using the base BSS counter
+                        // advertises the wrong replay state to the supplicant.
+                        let is_m2 =
+                            eapol
+                                .get(4..)
+                                .and_then(dot11::EapolKey::parse)
+                                .is_some_and(|key| {
+                                    key.is_pairwise()
+                                        && key.has_key_mic()
+                                        && !key.install()
+                                        && !key.key_ack()
+                                        && !key.secure()
+                                        && !key.error()
+                                        && !key.request()
+                                });
+                        if is_m2 && self.vlans.enabled {
+                            if let Some(assignment) = self.vlans.map.get(&sta).cloned() {
+                                let gtk_id = self.ap.station_gtk_key_id(&sta);
+                                let gtk_sequence = match nl_get_key_sequence(
+                                    &mut self.io.commands,
+                                    self.io.family,
+                                    assignment.ifindex,
+                                    gtk_id,
+                                ) {
+                                    Ok(sequence) => Some(sequence),
+                                    Err(error) => {
+                                        eprintln!(
+                                            "netlink AP: GET_KEY GTK={} on {} failed: {error}",
+                                            gtk_id, assignment.ifname,
+                                        );
+                                        None
+                                    }
+                                };
+                                let igtk_sequence = if self.ap.station_uses_pmf(&sta) {
+                                    let igtk_id = self.ap.station_igtk_key_id(&sta) as u8;
+                                    match nl_get_key_sequence(
+                                        &mut self.io.commands,
+                                        self.io.family,
+                                        assignment.ifindex,
+                                        igtk_id,
+                                    ) {
+                                        Ok(sequence) => Some(sequence),
+                                        Err(error) => {
+                                            eprintln!(
+                                                "netlink AP: GET_KEY IGTK={} on {} failed: {error}",
+                                                igtk_id, assignment.ifname,
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                self.ap.set_station_vlan_group_sequences(
+                                    &sta,
+                                    gtk_sequence,
+                                    igtk_sequence,
+                                );
+                            }
+                        }
                         (reconstruct_eapol(&self.bssid, &sta, eapol), false)
                     }
                     _ => continue,
@@ -407,9 +519,13 @@ impl RadioRuntime {
                     &mut self.io,
                     &out,
                     &mut self.stations,
+                    &mut self.group_keys,
                     &mut self.vlans,
                     &mut self.ap,
-                    &self.topology,
+                    RouteEnvironment {
+                        topology: &self.topology,
+                        notifier: self.notifier.as_ref(),
+                    },
                 );
             }
         }
@@ -437,12 +553,23 @@ impl RadioRuntime {
         for sta in stalled_assoc {
             self.stations.pending_assoc.remove(&sta);
             let core_sta = self.ap.station_link_for_peer(&sta).unwrap_or(sta);
-            if let Some(frame) = self.stations.held_eapol.remove(&sta) {
-                eprintln!(
-                "netlink AP: ASSOC-RESP TX-STATUS missing for {}; releasing held EAPOL after {} ms",
+            eprintln!(
+                "netlink AP: ASSOC-RESP TX-STATUS missing for {}; finalizing association after {} ms",
                 crate::util::bytes_to_mac(&sta),
                 ASSOC_TX_STATUS_GRACE.as_millis(),
             );
+            if !finalize_successful_association(
+                &mut self.io,
+                &mut self.ap,
+                &self.topology,
+                &mut self.group_keys,
+                &mut self.vlans,
+                &mut self.stations,
+                sta,
+            ) {
+                continue;
+            }
+            if let Some(frame) = self.stations.held_eapol.remove(&sta) {
                 self.ap.note_eapol_transmitted(&core_sta);
                 let released = crate::ap::Outgoing {
                     frames: vec![frame],
@@ -452,9 +579,13 @@ impl RadioRuntime {
                     &mut self.io,
                     &released,
                     &mut self.stations,
+                    &mut self.group_keys,
                     &mut self.vlans,
                     &mut self.ap,
-                    &self.topology,
+                    RouteEnvironment {
+                        topology: &self.topology,
+                        notifier: self.notifier.as_ref(),
+                    },
                 );
             }
         }
@@ -471,9 +602,13 @@ impl RadioRuntime {
                 &mut self.io,
                 &tick_out,
                 &mut self.stations,
+                &mut self.group_keys,
                 &mut self.vlans,
                 &mut self.ap,
-                &self.topology,
+                RouteEnvironment {
+                    topology: &self.topology,
+                    notifier: self.notifier.as_ref(),
+                },
             );
         }
     }

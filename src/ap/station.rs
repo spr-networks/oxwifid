@@ -116,8 +116,10 @@ pub struct Station {
     pub tk: [u8; 16],
     /// Full negotiated pairwise TK. The first 16 bytes mirror `tk` for the
     /// legacy userspace CCMP-128 path; Linux netlink offload consumes 16 or 32
-    /// bytes according to `Ap::pairwise_cipher`.
+    /// bytes according to this station's selected pairwise suite.
     pub(super) pairwise_tk: [u8; 32],
+    /// Pairwise suite selected by this station's Association Request.
+    pub(super) pairwise_cipher: dot11::DataCipher,
     pub client_pn: u64,
     /// Highest received CCMP packet number (replay protection). CCMP replay
     /// counters are per traffic identifier — a transmitter keeps one PN sequence
@@ -134,8 +136,10 @@ pub struct Station {
     /// valid while awaiting M4 so reference AP-compatible changed-SNonce M2 retries
     /// can be evaluated without regressing to a new handshake.
     pub(super) m1_replay: u64,
-    /// PTKs derived from valid M2 retries in this one 4-way. They are not exposed
-    /// to the driver until one candidate's M4 verifies.
+    /// PTKs derived from valid M2 retries in this one 4-way. Netlink mode
+    /// installs the newest candidate after sending its M3, while keeping the
+    /// station unauthorized; M4 selects the candidate that becomes protocol
+    /// state and permits controlled-port authorization.
     pub(super) ptk_candidates: Vec<PtkCandidate>,
     pub last_auth: Option<Instant>,
     pub last_assoc: Option<Instant>,
@@ -166,11 +170,22 @@ pub struct Station {
     pub pmf: bool,
     /// Last time a frame was received from this station (inactivity timer).
     pub last_activity: Instant,
-    /// Per-station GTK *value*, used only in `per_sta_vif` mode so each station's
-    /// VLAN has its own group key (broadcast isolation). Ignored otherwise. The
-    /// key *index* is BSS-wide (`Ap::gtk_key_id`) and shared by every station —
-    /// only the value differs per station; that difference is what isolates them.
+    /// Group-key state owned by this station's private AP_VLAN. Every dynamic
+    /// VLAN has an independent WPA group: it starts in GTK/IGTK slots 1/4 when
+    /// the netdev is created, then rotates to slots 2/5 when the
+    /// first station is bound. These fields are ignored without `per_sta_vif`.
     pub gtk: [u8; 16],
+    pub(super) gtk_key_id: u8,
+    /// Highest packet number the AP_VLAN driver has transmitted under `gtk`.
+    /// This is read back with NL80211_CMD_GET_KEY immediately before M3.
+    pub(super) gtk_rsc: u64,
+    pub(super) igtk: [u8; 16],
+    pub(super) igtk_key_id: u16,
+    pub(super) igtk_ipn: [u8; 6],
+    /// Whether the private VLAN group's first-station initialization has run.
+    /// Association TX-status can be duplicated, so the transition must be
+    /// idempotent within one AP_VLAN lifetime.
+    pub(super) vlan_group_initialized: bool,
     /// Fingerprint of the client's association characteristics, for the failure
     /// log (set at association; 0 before then).
     pub traits: u64,
@@ -247,6 +262,7 @@ impl Station {
             kek: [0; 16],
             tk: [0; 16],
             pairwise_tk: [0; 32],
+            pairwise_cipher: dot11::DataCipher::Ccmp128,
             client_mld_mac: None,
             client_mld_links: Vec::new(),
             assoc_link_id: None,
@@ -271,6 +287,12 @@ impl Station {
             pmf: false,
             last_activity: Instant::now(),
             gtk: random_bytes::<16>(),
+            gtk_key_id: 1,
+            gtk_rsc: 0,
+            igtk: random_bytes::<16>(),
+            igtk_key_id: 4,
+            igtk_ipn: [0; 6],
+            vlan_group_initialized: false,
             traits: 0,
             wmm: false,
             assoc_ies: Vec::new(),
@@ -324,6 +346,7 @@ impl Drop for Station {
         self.tk.zeroize();
         self.pairwise_tk.zeroize();
         self.gtk.zeroize();
+        self.igtk.zeroize();
         if let Some(pmk) = self.pmk.as_mut() {
             pmk.zeroize();
         }

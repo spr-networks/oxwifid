@@ -27,6 +27,8 @@ pub(super) struct WiphyCapabilities {
     pub(super) eml: Option<u16>,
     pub(super) mld: Option<u16>,
     pub(super) dfs_offload: bool,
+    pub(super) vlan_offload: bool,
+    pub(super) full_ap_client_state: bool,
 }
 
 impl WiphyCapabilities {
@@ -191,8 +193,16 @@ pub(super) fn parse_wiphy_capabilities(
         if capa.len() < 4 || mcs.len() < 8 {
             return None;
         }
+        let mut capability_info =
+            u32::from_ne_bytes(capa[..4].try_into().expect("four VHT capability bytes"));
+        // An AP is a MU beamformer in the reference configuration, not a MU
+        // beamformee. GET_WIPHY reports everything the radio can do in any
+        // role, so copying that bitmap verbatim advertises the mutually wrong
+        // role and changes the station capability bitmap mt7996 receives.
+        const VHT_CAP_MU_BEAMFORMEE_CAPABLE: u32 = 1 << 20;
+        capability_info &= !VHT_CAP_MU_BEAMFORMEE_CAPABLE;
         let mut body = Vec::with_capacity(12);
-        body.extend_from_slice(&capa[..4]);
+        body.extend_from_slice(&capability_info.to_ne_bytes());
         body.extend_from_slice(&mcs[..8]);
         Some(body)
     })();
@@ -239,6 +249,8 @@ pub(super) fn parse_wiphy_capabilities(
         eml: None,
         mld: None,
         dfs_offload: false,
+        vlan_offload: false,
+        full_ap_client_state: false,
     })
 }
 
@@ -246,6 +258,13 @@ pub(super) fn ext_feature_enabled(attrs: &[(u16, &[u8])], feature: usize) -> boo
     msg::find_attr(attrs, NL80211_ATTR_EXT_FEATURES)
         .and_then(|features| features.get(feature / 8))
         .is_some_and(|byte| byte & (1 << (feature % 8)) != 0)
+}
+
+pub(super) fn feature_flag_enabled(attrs: &[(u16, &[u8])], feature: u32) -> bool {
+    msg::find_attr(attrs, NL80211_ATTR_FEATURE_FLAGS)
+        .and_then(|flags| flags.get(..4))
+        .map(|flags| u32::from_ne_bytes(flags.try_into().unwrap()))
+        .is_some_and(|flags| flags & feature != 0)
 }
 
 pub(super) fn parse_wiphy_mld_capabilities(attrs: &[(u16, &[u8])]) -> Option<(u16, u16)> {
@@ -295,6 +314,8 @@ pub(super) fn nl_get_wiphy_capabilities(
             dst.mld = src.mld.take();
         }
         dst.dfs_offload |= src.dfs_offload;
+        dst.vlan_offload |= src.vlan_offload;
+        dst.full_ap_client_state |= src.full_ap_client_state;
     }
 
     fn merge_global(dst: &mut WiphyCapabilities, attrs: &[(u16, &[u8])]) {
@@ -303,6 +324,9 @@ pub(super) fn nl_get_wiphy_capabilities(
             dst.mld = Some(mld);
         }
         dst.dfs_offload |= ext_feature_enabled(attrs, NL80211_EXT_FEATURE_DFS_OFFLOAD);
+        dst.vlan_offload |= ext_feature_enabled(attrs, NL80211_EXT_FEATURE_VLAN_OFFLOAD);
+        dst.full_ap_client_state |=
+            feature_flag_enabled(attrs, NL80211_FEATURE_FULL_AP_CLIENT_STATE);
     }
 
     // Resolve the interface's wiphy first. The compact GET_WIPHY response also
@@ -565,5 +589,32 @@ mod wiphy_capability_tests {
             &attrs,
             NL80211_EXT_FEATURE_DFS_OFFLOAD - 1
         ));
+    }
+
+    #[test]
+    fn detects_driver_vlan_offload_extended_feature() {
+        let mut features = [0; 5];
+        features[NL80211_EXT_FEATURE_VLAN_OFFLOAD / 8] =
+            1 << (NL80211_EXT_FEATURE_VLAN_OFFLOAD % 8);
+        let attrs = [(NL80211_ATTR_EXT_FEATURES, features.as_slice())];
+        assert!(ext_feature_enabled(
+            &attrs,
+            NL80211_EXT_FEATURE_VLAN_OFFLOAD
+        ));
+        assert!(!ext_feature_enabled(
+            &attrs,
+            NL80211_EXT_FEATURE_VLAN_OFFLOAD - 1
+        ));
+    }
+
+    #[test]
+    fn detects_full_ap_client_state_feature_flag() {
+        let flags = NL80211_FEATURE_FULL_AP_CLIENT_STATE.to_ne_bytes();
+        let attrs = [(NL80211_ATTR_FEATURE_FLAGS, flags.as_slice())];
+        assert!(feature_flag_enabled(
+            &attrs,
+            NL80211_FEATURE_FULL_AP_CLIENT_STATE
+        ));
+        assert!(!feature_flag_enabled(&attrs, 1 << 14));
     }
 }

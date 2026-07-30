@@ -46,7 +46,9 @@ pub fn build_sae_auth(
 
 /// Open-system authentication request (STA -> AP), seqnum 1.
 pub fn build_auth_req(bssid: &[u8; 6], sta: &[u8; 6], sc: u16) -> Vec<u8> {
-    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_AUTH, FC_TODS, bssid, sta, bssid, sc);
+    // ToDS/FromDS are meaningful only for Data frames. Real drivers may
+    // silently drop management injection when either DS bit is set.
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_AUTH, 0, bssid, sta, bssid, sc);
     v.extend_from_slice(&0u16.to_le_bytes()); // algo = open
     v.extend_from_slice(&1u16.to_le_bytes()); // seqnum
     v.extend_from_slice(&0u16.to_le_bytes()); // status
@@ -66,7 +68,7 @@ pub fn build_assoc_req_for_cipher(
     sc: u16,
     cipher: DataCipher,
 ) -> Vec<u8> {
-    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, FC_TODS, bssid, sta, bssid, sc);
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, 0, bssid, sta, bssid, sc);
     v.extend_from_slice(&CAP_3101);
     v.extend_from_slice(&STA_LISTEN_INTERVAL.to_le_bytes()); // listen interval
     v.extend_from_slice(&ie(0, ssid));
@@ -88,7 +90,7 @@ pub fn build_assoc_req_psk_sha256_for_cipher(
     sc: u16,
     cipher: DataCipher,
 ) -> Vec<u8> {
-    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, FC_TODS, bssid, sta, bssid, sc);
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, 0, bssid, sta, bssid, sc);
     v.extend_from_slice(&CAP_3101);
     v.extend_from_slice(&STA_LISTEN_INTERVAL.to_le_bytes());
     v.extend_from_slice(&ie(0, ssid));
@@ -114,7 +116,7 @@ pub fn build_assoc_req_sae_for_cipher(
     sc: u16,
     cipher: DataCipher,
 ) -> Vec<u8> {
-    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, FC_TODS, bssid, sta, bssid, sc);
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, 0, bssid, sta, bssid, sc);
     v.extend_from_slice(&CAP_3101);
     v.extend_from_slice(&STA_LISTEN_INTERVAL.to_le_bytes());
     v.extend_from_slice(&ie(0, ssid));
@@ -123,6 +125,4 @@ pub fn build_assoc_req_sae_for_cipher(
     v
 }
 
-// --- 802.11be MLD association (replicated from a real wpa_supplicant MLD assoc) ---
-// Captured IEs from a working reference AP-MLD assoc; reused verbatim so reference AP accepts
-// the 2-link MLD station. RSN AKM is set to PSK-SHA256 (00-0F-AC:6) + BIP-GMAC-256.
+

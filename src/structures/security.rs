@@ -18,6 +18,16 @@ pub enum DataCipher {
 }
 
 impl DataCipher {
+    pub const fn from_suite_type(suite_type: u8) -> Option<Self> {
+        match suite_type {
+            4 => Some(DataCipher::Ccmp128),
+            8 => Some(DataCipher::Gcmp128),
+            9 => Some(DataCipher::Gcmp256),
+            10 => Some(DataCipher::Ccmp256),
+            _ => None,
+        }
+    }
+
     /// IEEE 802.11 RSN suite type under OUI 00-0F-AC.
     pub const fn suite_type(self) -> u8 {
         match self {

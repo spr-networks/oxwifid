@@ -325,12 +325,8 @@ fn fresh_auth_cancels_stale_group_rekey_state() {
     assert!(ap.is_associated(&new_a.mac));
 }
 
-/// Per-STA-VIF: a group rekey must rotate EACH station's OWN per-station GTK
-/// *value* (so broadcast isolation is preserved) while every station shares the
-/// single BSS-wide GTK *index* (what the RSNE advertises). The index toggles
-/// once, together, for all stations — only the values differ. Regression test
-/// for the over-engineered per-STA-VIF rekey that wrongly gave each station its
-/// own key index.
+/// Per-STA-VIF: a group rekey rotates each private VLAN group's GTK material
+/// and advances its independent two-slot index.
 #[test]
 fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
     let (mut ap, mut net) = wpa3_ap();
@@ -342,22 +338,28 @@ fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
     connect(&mut ap, &mut net, &mut a);
     connect(&mut ap, &mut net, &mut b);
 
-    // Each station got its OWN distinct GTK value, but at the SAME BSS-wide
-    // index (the advertised key id, 1 initially).
+    // Each station starts with its own dynamic-VLAN group at slot 1.
     let a_gtk0 = ap.station_gtk(&a_mac);
     let b_gtk0 = ap.station_gtk(&b_mac);
+    let a_igtk0 = ap.station_igtk(&a_mac);
+    let b_igtk0 = ap.station_igtk(&b_mac);
     assert_ne!(
         a_gtk0, b_gtk0,
         "per-STA-VIF: stations have distinct GTK values"
     );
     assert_eq!(a.gtk(), a_gtk0, "station A installed its own GTK");
     assert_eq!(b.gtk(), b_gtk0, "station B installed its own GTK");
+    assert_ne!(a_igtk0, b_igtk0, "private VLANs have distinct IGTKs");
+    assert_eq!(a.igtk(), Some(a_igtk0));
+    assert_eq!(b.igtk(), Some(b_igtk0));
     assert_eq!(ap.station_gtk_key_id(&a_mac), 1);
     assert_eq!(ap.station_gtk_key_id(&b_mac), 1);
+    assert_eq!(ap.station_igtk_key_id(&a_mac), 4);
+    assert_eq!(ap.station_igtk_key_id(&b_mac), 4);
     assert_eq!(
         ap.station_gtk_key_id(&a_mac),
         ap.station_gtk_key_id(&b_mac),
-        "the GTK index is BSS-wide: every station shares the same key id",
+        "both newly-created groups start at slot 1",
     );
 
     // Rekey: one msg 1 per station, each carrying that station's own NEW value.
@@ -366,30 +368,34 @@ fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
 
     let a_gtk1 = ap.station_gtk(&a_mac);
     let b_gtk1 = ap.station_gtk(&b_mac);
+    let a_igtk1 = ap.station_igtk(&a_mac);
+    let b_igtk1 = ap.station_igtk(&b_mac);
     assert_ne!(a_gtk1, a_gtk0, "A's per-station GTK value rotated");
     assert_ne!(b_gtk1, b_gtk0, "B's per-station GTK value rotated");
     assert_ne!(
         a_gtk1, b_gtk1,
         "isolation preserved: rotated values still differ"
     );
-    // The per-station GTK index is a fixed constant (1): it does NOT toggle on
-    // rekey — only each station's own value rotates (above). The isolation is the
-    // distinct values, never a per-station or a moving index.
+    assert_ne!(a_igtk1, a_igtk0, "A's private IGTK rotated");
+    assert_ne!(b_igtk1, b_igtk0, "B's private IGTK rotated");
+    assert_ne!(a_igtk1, b_igtk1, "rotated IGTKs remain independent");
     assert_eq!(
         ap.station_gtk_key_id(&a_mac),
-        1,
-        "index stays at constant 1 after rekey"
+        2,
+        "A's private group advances to its alternate slot"
     );
     assert_eq!(
         ap.station_gtk_key_id(&b_mac),
-        1,
-        "index stays at constant 1 after rekey"
+        2,
+        "B's private group advances to its alternate slot"
     );
     assert_eq!(
         ap.station_gtk_key_id(&a_mac),
         ap.station_gtk_key_id(&b_mac),
-        "every station uses the same constant GTK index (1)",
+        "groups created together remain in phase without sharing state",
     );
+    assert_eq!(ap.station_igtk_key_id(&a_mac), 5);
+    assert_eq!(ap.station_igtk_key_id(&b_mac), 5);
 
     // Each station installs the key from ITS OWN msg 1 (not the other's).
     for m in &msgs {
@@ -398,6 +404,8 @@ fn per_sta_vif_rekey_rotates_each_stations_own_gtk() {
     }
     assert_eq!(a.gtk(), a_gtk1, "A installed its own rotated GTK");
     assert_eq!(b.gtk(), b_gtk1, "B installed its own rotated GTK");
+    assert_eq!(a.igtk(), Some(a_igtk1), "A installed its rotated IGTK");
+    assert_eq!(b.igtk(), Some(b_igtk1), "B installed its rotated IGTK");
     assert_ne!(
         a.gtk(),
         b.gtk(),

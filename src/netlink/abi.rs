@@ -1,6 +1,7 @@
 // nl80211 generic-netlink commands (resolved from the kernel header).
 pub const NL80211_CMD_GET_WIPHY: u8 = 1;
 pub const NL80211_CMD_GET_INTERFACE: u8 = 5;
+pub const NL80211_CMD_GET_KEY: u8 = 9;
 pub const NL80211_CMD_SET_KEY: u8 = 10;
 pub const NL80211_CMD_NEW_KEY: u8 = 11;
 pub const NL80211_CMD_DEL_KEY: u8 = 12;
@@ -44,12 +45,19 @@ pub const NL80211_CMD_SCAN_ABORTED: u8 = 35;
 /// regulatory domain. Waiting for it (rather than sleeping) confirms the
 /// requested country actually took effect and the 5/6 GHz no-IR flags cleared.
 pub const NL80211_CMD_REG_CHANGE: u8 = 36;
+/// Userspace-SME station authentication and association commands.
+pub const NL80211_CMD_AUTHENTICATE: u8 = 37;
+pub const NL80211_CMD_ASSOCIATE: u8 = 38;
+pub const NL80211_CMD_DEAUTHENTICATE: u8 = 39;
+pub const NL80211_CMD_DISASSOCIATE: u8 = 40;
 pub const NL80211_CMD_REGISTER_FRAME: u8 = 58;
 pub const NL80211_CMD_FRAME: u8 = 59;
 pub const NL80211_CMD_FRAME_TX_STATUS: u8 = 60;
 pub const NL80211_CMD_SET_CHANNEL: u8 = 65;
 pub const NL80211_CMD_CONTROL_PORT_FRAME: u8 = 129;
 pub const NL80211_CMD_CONTROL_PORT_FRAME_TX_STATUS: u8 = 139;
+/// Enable mac80211's per-station multicast-to-unicast delivery on an AP.
+pub const NL80211_CMD_SET_MULTICAST_TO_UNICAST: u8 = 121;
 
 // nl80211 attributes.
 pub const NL80211_ATTR_WIPHY: u16 = 1;
@@ -112,9 +120,17 @@ pub const NL80211_ATTR_EML_CAPABILITY: u16 = 317;
 pub const NL80211_ATTR_MLD_CAPA_AND_OPS: u16 = 318;
 pub const NL80211_ATTR_IFTYPE_EXT_CAPA: u16 = 230;
 pub const NL80211_ATTR_EXT_FEATURES: u16 = 217;
+/// Legacy nl80211 feature bitmap (`enum nl80211_feature_flags`).
+pub const NL80211_ATTR_FEATURE_FLAGS: u16 = 143;
+pub const NL80211_ATTR_VLAN_ID: u16 = 282;
+/// The driver supports explicit AUTHENTICATED/ASSOCIATED station transitions.
+pub const NL80211_FEATURE_FULL_AP_CLIENT_STATE: u32 = 1 << 15;
 /// Bit index in `NL80211_ATTR_EXT_FEATURES`: firmware owns CAC, radar response,
 /// and the resulting channel switch.
 pub const NL80211_EXT_FEATURE_DFS_OFFLOAD: usize = 25;
+/// Bit index in `NL80211_ATTR_EXT_FEATURES`: the driver accepts an explicit
+/// VLAN ID alongside station assignment and group-key operations.
+pub const NL80211_EXT_FEATURE_VLAN_OFFLOAD: usize = 39;
 // BSS parameters reference AP submits immediately after every START_AP/SET_BEACON.
 pub const NL80211_ATTR_BSS_CTS_PROT: u16 = 28;
 pub const NL80211_ATTR_BSS_SHORT_PREAMBLE: u16 = 29;
@@ -172,6 +188,7 @@ pub const NL80211_ATTR_STA_WME: u16 = 129;
 pub const NL80211_STA_WME_UAPSD_QUEUES: u16 = 1;
 pub const NL80211_STA_WME_MAX_SP: u16 = 2;
 pub const NL80211_ATTR_WIPHY_FREQ: u16 = 38;
+pub const NL80211_ATTR_IE: u16 = 42;
 /// ISO/IEC 3166-1 alpha-2 country code for [`NL80211_CMD_REQ_SET_REG`].
 pub const NL80211_ATTR_REG_ALPHA2: u16 = 33;
 pub const NL80211_ATTR_FRAME: u16 = 51;
@@ -196,7 +213,10 @@ pub const NL80211_ATTR_CHANNEL_WIDTH: u16 = 159;
 pub const NL80211_ATTR_CENTER_FREQ1: u16 = 160;
 pub const NL80211_ATTR_SPLIT_WIPHY_DUMP: u16 = 174;
 pub const NL80211_ATTR_SOCKET_OWNER: u16 = 204;
+pub const NL80211_ATTR_STA_SUPPORT_P2P_PS: u16 = 228;
 pub const NL80211_ATTR_CONTROL_PORT_OVER_NL80211: u16 = 264;
+pub const NL80211_ATTR_CONTROL_PORT_NO_PREAUTH: u16 = 286;
+pub const NL80211_P2P_PS_UNSUPPORTED: u8 = 0;
 pub const NL80211_CHAN_WIDTH_20: u32 = 1;
 // nl80211_chan_width values: the narrow widths (_5/_10/_1/_2/_4/_8/_16) sit
 // between _160 and _320 in the enum, so _320 is 13, not 6. Verified against the
@@ -212,6 +232,7 @@ pub const ETH_P_PAE: u16 = 0x888e; // 802.1X / EAPOL ethertype
 
 // interface types.
 pub const NL80211_IFTYPE_AP: u32 = 3;
+pub const NL80211_IFTYPE_STATION: u32 = 2;
 pub const NL80211_IFTYPE_AP_VLAN: u32 = 4;
 pub const NL80211_IFTYPE_MONITOR: u32 = 6;
 
@@ -223,6 +244,7 @@ pub const PER_STA_VLAN_ID_START: u32 = 4096;
 pub const NL80211_AUTHTYPE_OPEN_SYSTEM: u32 = 0;
 pub const NL80211_AUTHTYPE_SAE: u32 = 4;
 pub const NL80211_WPA_VERSION_2: u32 = 2;
+pub const NL80211_WPA_VERSION_3: u32 = 4;
 pub const WLAN_CIPHER_SUITE_CCMP: u32 = 0x000f_ac04;
 pub const WLAN_CIPHER_SUITE_GCMP: u32 = 0x000f_ac08;
 pub const WLAN_CIPHER_SUITE_GCMP_256: u32 = 0x000f_ac09;

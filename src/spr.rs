@@ -82,24 +82,37 @@ impl SprEvent {
 }
 
 pub struct SprNotifier {
-    tx: SyncSender<SprEvent>,
+    tx: SyncSender<SprNotification>,
+    dhcp_helper: Option<PathBuf>,
+}
+
+struct SprNotification {
+    event: SprEvent,
+    run_dhcp_helper: bool,
 }
 
 impl SprNotifier {
     pub fn new(socket_path: impl Into<PathBuf>, dhcp_helper: Option<PathBuf>) -> SprNotifier {
         let path = socket_path.into();
-        let (tx, rx) = mpsc::sync_channel::<SprEvent>(64);
+        let worker_dhcp_helper = dhcp_helper.clone();
+        let (tx, rx) = mpsc::sync_channel::<SprNotification>(64);
         let _ = std::thread::Builder::new()
             .name("rustap-spr-events".to_string())
             .spawn(move || {
-                while let Ok(event) = rx.recv() {
-                    if let Some(helper) = dhcp_helper.as_ref() {
-                        match run_dhcp_helper(helper, &event) {
-                            Ok(true) if std::env::var_os("RUSTAP_SPR_DEBUG").is_some() => {
-                                eprintln!("SPR DHCP/XDP helper completed")
+                while let Ok(notification) = rx.recv() {
+                    let SprNotification {
+                        event,
+                        run_dhcp_helper: should_run_dhcp_helper,
+                    } = notification;
+                    if should_run_dhcp_helper {
+                        if let Some(helper) = worker_dhcp_helper.as_ref() {
+                            match run_dhcp_helper(helper, &event) {
+                                Ok(true) if std::env::var_os("RUSTAP_SPR_DEBUG").is_some() => {
+                                    eprintln!("SPR DHCP/XDP helper completed")
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("SPR DHCP/XDP helper failed: {e}"),
                             }
-                            Ok(_) => {}
-                            Err(e) => eprintln!("SPR DHCP/XDP helper failed: {e}"),
                         }
                     }
                     match put_event_with_retry(&path, &event) {
@@ -111,12 +124,31 @@ impl SprNotifier {
                     }
                 }
             });
-        SprNotifier { tx }
+        SprNotifier { tx, dhcp_helper }
     }
 
-    /// Queue without blocking the AP's management/EAPOL event loop.
-    pub fn notify(&self, event: SprEvent) {
-        match self.tx.try_send(event) {
+    /// Prepare a newly-created AP_VLAN after publishing the station peer and
+    /// submitting its Authentication response. This is synchronous so the
+    /// following station-state transition cannot race ahead of bridge/XDP
+    /// setup.
+    pub fn prepare_data_path(&self, iface: &str, mac: &str) -> io::Result<bool> {
+        let Some(helper) = self.dhcp_helper.as_ref() else {
+            return Ok(false);
+        };
+        run_dhcp_helper(
+            helper,
+            &SprEvent::Connected {
+                iface: iface.to_string(),
+                mac: mac.to_string(),
+            },
+        )
+    }
+
+    fn enqueue(&self, event: SprEvent, run_dhcp_helper: bool) {
+        match self.tx.try_send(SprNotification {
+            event,
+            run_dhcp_helper,
+        }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => eprintln!("SPR event queue full; dropping event"),
             Err(TrySendError::Disconnected(_)) => {
@@ -124,11 +156,23 @@ impl SprNotifier {
             }
         }
     }
+
+    /// Queue without blocking the AP's management/EAPOL event loop.
+    pub fn notify(&self, event: SprEvent) {
+        self.enqueue(event, true);
+    }
+
+    /// Publish an event whose helper action was completed before association.
+    pub fn notify_without_dhcp_helper(&self, event: SprEvent) {
+        self.enqueue(event, false);
+    }
 }
 
 /// Reproduce wifid's action-script call to `spr_dhcp_helper`. The helper
 /// owns stale nft-map cleanup, generic-XDP attachment, and the new map element.
-/// It runs on the same background worker as HTTP delivery, never the AP loop.
+/// Normal events use the background worker; association-time AP_VLAN
+/// preparation invokes this synchronously to retain bridge-add ordering
+/// relative to station publication.
 /// A helper failure is reported but does not suppress the API event, matching
 /// action.sh (which continues to curl without `set -e`).
 fn run_dhcp_helper(helper: &PathBuf, event: &SprEvent) -> io::Result<bool> {
@@ -409,6 +453,38 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "add\nwlan3.4096\n02:00:00:00:00:01\nremove\nwlan3.4096\n02:00:00:00:00:01\n"
+        );
+        let _ = std::fs::remove_file(helper);
+        let _ = std::fs::remove_file(log);
+    }
+
+    #[test]
+    fn prepared_data_path_runs_helper_synchronously() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let helper = dir.join(format!("barely-ap-prepared-helper-{unique}.sh"));
+        let log = dir.join(format!("barely-ap-prepared-helper-{unique}.log"));
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {:?}\n", log),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let notifier = SprNotifier::new(
+            dir.join(format!("barely-ap-unused-{unique}.sock")),
+            Some(helper.clone()),
+        );
+        assert!(notifier
+            .prepare_data_path("wlan3.4096", "02:00:00:00:00:01")
+            .unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "add\nwlan3.4096\n02:00:00:00:00:01\n"
         );
         let _ = std::fs::remove_file(helper);
         let _ = std::fs::remove_file(log);

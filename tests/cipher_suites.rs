@@ -61,6 +61,29 @@ fn rsn_rejects_a_different_pairwise_suite() {
 }
 
 #[test]
+fn ccmp256_profile_advertises_ccmp128_fallback() {
+    let tail = dot11::security_tail_for_ciphers(
+        dot11::SecurityMode::Transition,
+        &[DataCipher::Ccmp256, DataCipher::Ccmp128],
+    );
+    assert_eq!(u16::from_le_bytes([tail[8], tail[9]]), 2);
+    assert_eq!(&tail[10..14], &[0x00, 0x0f, 0xac, 0x0a]);
+    assert_eq!(&tail[14..18], &[0x00, 0x0f, 0xac, 0x04]);
+
+    let selected =
+        dot11::security_tail_for_cipher(dot11::SecurityMode::Transition, DataCipher::Ccmp128);
+    let rsn_len = usize::from(selected[1]);
+    assert_eq!(
+        dot11::negotiate_assoc_pairwise_cipher(
+            &selected[2..2 + rsn_len],
+            dot11::SecurityMode::Transition,
+            &[DataCipher::Ccmp256, DataCipher::Ccmp128],
+        ),
+        Ok(DataCipher::Ccmp128)
+    );
+}
+
+#[test]
 fn data_cipher_key_lengths_and_nl80211_selectors_are_exact() {
     assert_eq!(DataCipher::Ccmp128.key_len(), 16);
     assert_eq!(DataCipher::Gcmp128.key_len(), 16);
@@ -227,6 +250,33 @@ fn ap_and_client_userspace_paths_use_every_negotiated_cipher() {
             "{cipher:?} downlink"
         );
     }
+}
+
+#[test]
+fn ccmp256_ap_accepts_a_ccmp128_fallback_station() {
+    let ap_mac = [0x02, 0, 0, 0, 0, 0];
+    let sta_mac = [0x02, 0, 0, 0, 0xab, 0xcd];
+    let mut ap = Ap::new("mixed-ccmp", "device-password", ap_mac, 1);
+    ap.set_pairwise_cipher(DataCipher::Ccmp256);
+    let mut client = Client::new("mixed-ccmp", "device-password", sta_mac);
+    client.set_pairwise_cipher(DataCipher::Ccmp128);
+
+    connect(&mut ap, &mut client);
+    assert_eq!(ap.station_pairwise_cipher(&sta_mac), DataCipher::Ccmp128);
+
+    let downlink = [
+        sta_mac.as_slice(),
+        ap_mac.as_slice(),
+        &[0x08, 0x00],
+        b"fallback",
+    ]
+    .concat();
+    let protected = ap.deliver_to_station(&downlink);
+    assert_eq!(protected.len(), 1);
+    assert_eq!(
+        client.handle_incoming(&protected[0]).to_network,
+        vec![downlink]
+    );
 }
 
 #[test]

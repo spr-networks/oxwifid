@@ -220,8 +220,14 @@ pub fn build_assoc_resp(
 ) -> Vec<u8> {
     let mut v = dot11_header(TYPE_MGMT, resp_subtype, 0, dst, bssid, bssid, sc);
     v.extend_from_slice(&ap_capability(channel, band6));
-    v.extend_from_slice(&0u16.to_le_bytes()); // status = success
-    v.extend_from_slice(&aid.to_le_bytes());
+    // Status = success.
+    v.extend_from_slice(&0u16.to_le_bytes());
+    // Association Response AID has bits 14 and 15 set on the wire. The kernel
+    // station API still receives the 14-bit numeric AID; only the management
+    // frame carries this required field encoding. Some clients accept a bare
+    // value but then fail to use TIM/power-save delivery correctly.
+    let wire_aid = (aid & 0x3fff) | 0xc000;
+    v.extend_from_slice(&wire_aid.to_le_bytes());
     // Association responses do not carry the RSN element (no RSN tail).
     v.extend_from_slice(&resp_ies(
         ssid,

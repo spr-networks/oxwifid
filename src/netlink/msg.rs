@@ -77,6 +77,17 @@ impl Attr {
             data,
         }
     }
+    /// Encode a nested attribute namespace without setting `NLA_F_NESTED`.
+    ///
+    /// Some nl80211 attributes, notably `NL80211_ATTR_KEY`, contain nested
+    /// attributes but are emitted unflagged by driver_nl80211.
+    pub fn nested_unflagged(typ: u16, attrs: &[Attr]) -> Attr {
+        let mut data = Vec::new();
+        for a in attrs {
+            a.encode(&mut data);
+        }
+        Attr { typ, data }
+    }
 
     fn encode(&self, out: &mut Vec<u8>) {
         let len = 4 + self.data.len();
@@ -103,11 +114,18 @@ impl GenlMessage {
         GenlMessage {
             family,
             cmd,
-            version: 1,
+            // nl80211 uses generic-netlink header version 0. Callers for
+            // families with another version (including nlctrl) opt in below.
+            version: 0,
             flags: flags | NLM_F_REQUEST,
             seq,
             attrs: Vec::new(),
         }
+    }
+
+    pub fn with_version(mut self, version: u8) -> GenlMessage {
+        self.version = version;
+        self
     }
 
     pub fn attr(mut self, a: Attr) -> GenlMessage {
@@ -288,9 +306,11 @@ mod tests {
     #[test]
     fn getfamily_request_roundtrips() {
         let msg = GenlMessage::new(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, NLM_F_ACK, 42)
+            .with_version(1)
             .attr(Attr::string(CTRL_ATTR_FAMILY_NAME, "nl80211"));
         let bytes = msg.to_bytes(0);
 
+        assert_eq!(bytes[17], 1, "nlctrl requests use family version 1");
         let parsed = parse_messages(&bytes);
         assert_eq!(parsed.len(), 1);
         let m = &parsed[0];
@@ -315,6 +335,7 @@ mod tests {
             ],
         );
         let msg = GenlMessage::new(GENL_ID_CTRL, 1, 0, 1)
+            .with_version(1)
             .attr(Attr::u16v(CTRL_ATTR_FAMILY_ID, 0x1c))
             .attr(Attr::nested(CTRL_ATTR_MCAST_GROUPS, &[group]));
         let bytes = msg.to_bytes(0);

@@ -83,8 +83,8 @@ fn beacon_5ghz_matches() {
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
     assert_eq!(
         &built[34..36],
-        &[0x11, 0x00],
-        "5 GHz AP capability must match reference AP (ESS + Privacy only)"
+        &[0x31, 0x10],
+        "5 GHz AP capability must advertise the expected RRM bits"
     );
 }
 
@@ -1010,6 +1010,11 @@ fn assoc_resp_matches() {
         0,
     );
     assert_eq!(to_hex(&with_radiotap(&built)), f["bytes"].as_str().unwrap());
+    assert_eq!(
+        u16::from_le_bytes([built[28], built[29]]),
+        0xc001,
+        "Association Response encodes the AID with required bits 14 and 15"
+    );
 }
 
 #[test]
@@ -1357,6 +1362,30 @@ fn parse_auth_req() {
     assert_eq!(frame.subtype(), dot11::SUBTYPE_AUTH);
     assert_eq!(bytes_to_mac(&frame.addr1), f["addr1"].as_str().unwrap());
     assert_eq!(bytes_to_mac(&frame.addr2), f["addr2"].as_str().unwrap());
+}
+
+#[test]
+fn station_management_requests_never_set_ds_bits() {
+    let bssid = mac6("02:00:00:00:00:00");
+    let sta = mac6("02:00:00:00:ab:cd");
+    let ssid = b"turtlenet";
+    let pmkid = [0x42; 16];
+    let requests = [
+        dot11::build_auth_req(&bssid, &sta, 0),
+        dot11::build_assoc_req(&bssid, &sta, ssid, 16),
+        dot11::build_assoc_req_psk_sha256(&bssid, &sta, ssid, 16),
+        dot11::build_assoc_req_sae(&bssid, &sta, ssid, 16),
+        dot11::build_assoc_req_owe(&bssid, &sta, ssid, &[], 16),
+        dot11::build_assoc_req_pmkid(&bssid, &sta, ssid, &pmkid, 16),
+    ];
+
+    for request in requests {
+        assert_eq!(
+            request[1] & (dot11::FC_TODS | dot11::FC_FROMDS),
+            0,
+            "ToDS/FromDS are invalid on Authentication and Association management frames"
+        );
+    }
 }
 
 #[test]

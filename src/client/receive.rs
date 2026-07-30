@@ -19,7 +19,7 @@ impl Client {
         // carries EAPOL inside protected data, so an unprotected, MIC-less
         // pairwise key message at that point cannot have come from the AP —
         // drop it rather than let it churn the handshake state of a working
-        // session. Gated on PMF, matching hostapd: without PMF an attacker can
+        // session. Gated on PMF: without PMF an attacker can
         // simply deauthenticate instead, so refusing costs interoperability for
         // no gain.
         if !protected
@@ -86,10 +86,34 @@ impl Client {
 
     pub fn handle_incoming(&mut self, radiotap_frame: &[u8]) -> ClientOut {
         let mut out = ClientOut::default();
-        if dot11::radiotap_bad_fcs(radiotap_frame) {
+        let bad_fcs = dot11::radiotap_bad_fcs(radiotap_frame);
+        let stripped = dot11::strip_radiotap(radiotap_frame);
+        if std::env::var_os("RUSTAP_CLIENT_RX_DEBUG").is_some() {
+            if let Some(raw) = stripped {
+                let is_raw_beacon = raw.len() >= 24 && raw[0] & 0xfc == 0x80;
+                let is_target = self
+                    .target_bssid
+                    .is_none_or(|target| raw.get(16..22) == Some(target.as_slice()));
+                if is_raw_beacon && is_target {
+                    eprintln!(
+                        "client raw RX target beacon radiotap_len={} dot11_len={} bad_fcs={bad_fcs} radiotap={}",
+                        radiotap_frame.len().saturating_sub(raw.len()),
+                        raw.len(),
+                        crate::util::to_hex(
+                            &radiotap_frame[..radiotap_frame.len().saturating_sub(raw.len())]
+                        )
+                    );
+                }
+            }
+        }
+        // Some FullMAC monitor paths (observed on ath12k) mark every otherwise
+        // parseable frame BAD_FCS. Keep the secure default, but allow a
+        // deliberately scoped interoperability diagnostic; protected data and
+        // EAPOL still have their own CCMP/MIC integrity checks.
+        if bad_fcs && std::env::var_os("RUSTAP_CLIENT_IGNORE_BAD_FCS").is_none() {
             return out;
         }
-        let Some(body) = dot11::strip_radiotap(radiotap_frame) else {
+        let Some(body) = stripped else {
             return out;
         };
         let Some(frame) = dot11::Dot11::parse(body) else {
@@ -100,6 +124,25 @@ impl Client {
         }
 
         let is_mgmt = frame.frame_type() == dot11::TYPE_MGMT;
+        let is_beacon = is_mgmt && frame.subtype() == dot11::SUBTYPE_BEACON;
+        let beacon_matches = is_beacon && self.beacon_matches(&frame);
+        if is_beacon
+            && std::env::var_os("RUSTAP_CLIENT_RX_DEBUG").is_some()
+            && self.target_bssid.is_none_or(|target| frame.addr3 == target)
+        {
+            let ssid = frame
+                .body
+                .get(12..)
+                .and_then(|ies| dot11::find_ie_strict(ies, 0).ok().flatten())
+                .map(String::from_utf8_lossy)
+                .map(|ssid| ssid.into_owned())
+                .unwrap_or_else(|| "<invalid>".to_string());
+            eprintln!(
+                "client RX beacon bssid={} ssid={ssid:?} len={} matches={beacon_matches}",
+                crate::util::bytes_to_mac(&frame.addr3),
+                body.len()
+            );
+        }
 
         // PMF enforcement: robust management frames (Deauth/Disassoc/Action).
         if is_mgmt
@@ -116,11 +159,7 @@ impl Client {
         }
 
         // Beacon -> authenticate (SAE commit or open-system auth)
-        if self.connected == 0
-            && is_mgmt
-            && frame.subtype() == dot11::SUBTYPE_BEACON
-            && self.beacon_matches(&frame)
-        {
+        if self.connected == 0 && beacon_matches {
             let bssid = frame.addr2;
             self.expire_cached_pmksa();
             self.reset_session_keys();

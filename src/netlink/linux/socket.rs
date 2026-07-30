@@ -190,6 +190,7 @@ pub(super) fn resolve_family(
 ) -> io::Result<(u16, Option<u32>)> {
     let seq = sock.next_seq();
     let req = GenlMessage::new(msg::GENL_ID_CTRL, msg::CTRL_CMD_GETFAMILY, 0, seq)
+        .with_version(1)
         .attr(Attr::string(msg::CTRL_ATTR_FAMILY_NAME, family));
     sock.send(&req.to_bytes(sock.pid))?;
 

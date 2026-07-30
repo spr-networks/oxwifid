@@ -77,6 +77,9 @@ impl RadioRuntime {
                         self.group_keys
                             .vlan_gtk
                             .retain(|(known, _), _| known != &result.core_sta);
+                        self.group_keys
+                            .vlan_igtk
+                            .retain(|(known, _), _| known != &result.core_sta);
                         self.stations.forget(&result.core_sta);
                     }
                 }

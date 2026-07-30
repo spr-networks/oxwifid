@@ -90,6 +90,35 @@ pub fn security_tail_for_cipher(mode: SecurityMode, cipher: DataCipher) -> Vec<u
     v
 }
 
+/// Build the advertised RSN/RSNXE tail for an ordered set of pairwise suites.
+///
+/// The first suite is the AP preference. Stations select one suite in their
+/// Association Request. When CCMP-256 is preferred, keep CCMP-128 as a
+/// compatibility fallback and advertise the stronger suite first.
+pub fn security_tail_for_ciphers(mode: SecurityMode, ciphers: &[DataCipher]) -> Vec<u8> {
+    if mode == SecurityMode::Transition && ciphers == [DataCipher::Ccmp256, DataCipher::Ccmp128] {
+        // Advertise the stronger pairwise suite first, followed by the three
+        // personal AKMs, MFPC plus the driver's advertised 16-PTKSA
+        // replay-counter capability, and SAE H2E.
+        return vec![
+            0x30, 0x20, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x02, 0x00, 0x00, 0x0f, 0xac, 0x0a,
+            0x00, 0x0f, 0xac, 0x04, 0x03, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x0f, 0xac, 0x06,
+            0x00, 0x0f, 0xac, 0x08, 0x8c, 0x00, 0xf4, 0x01, 0x20,
+        ];
+    }
+    let Some(first) = ciphers.first().copied() else {
+        return security_tail_for_cipher(mode, DataCipher::Ccmp128);
+    };
+    let mut tail = security_tail_for_cipher(mode, first);
+    for (index, cipher) in ciphers.iter().copied().enumerate().skip(1) {
+        let offset = 14 + (index - 1) * 4;
+        tail.splice(offset..offset, rsn_suite(cipher.suite_type()));
+        tail[1] = tail[1].saturating_add(4);
+    }
+    tail[8..10].copy_from_slice(&(ciphers.len() as u16).to_le_bytes());
+    tail
+}
+
 struct RsnInfo {
     group: [u8; 4],
     pairwise: Vec<[u8; 4]>,
@@ -179,13 +208,31 @@ pub fn validate_assoc_rsn_for_cipher(
     mode: SecurityMode,
     cipher: DataCipher,
 ) -> Result<(), u16> {
+    negotiate_assoc_pairwise_cipher(rsn, mode, &[cipher]).map(|_| ())
+}
+
+/// Validate an association RSNE and return the selected pairwise suite.
+///
+/// `supported` is ordered by AP preference. A normal Association Request
+/// carries one pairwise selector, but accepting the first common selector also
+/// handles peers which echo more than one.
+pub fn negotiate_assoc_pairwise_cipher(
+    rsn: &[u8],
+    mode: SecurityMode,
+    supported: &[DataCipher],
+) -> Result<DataCipher, u16> {
     // reference AP reports a syntactically complete Version-only RSNE as "invalid
     // AKMP" (43), while empty/truncated versions are invalid IEs (40).
     if rsn == [1, 0] {
         return Err(STATUS_INVALID_AKMP);
     }
     let info = parse_rsn(rsn).ok_or(STATUS_INVALID_IE)?;
-    if info.group != rsn_suite(4) || !info.pairwise.contains(&rsn_suite(cipher.suite_type())) {
+    let selected = supported
+        .iter()
+        .copied()
+        .find(|cipher| info.pairwise.contains(&rsn_suite(cipher.suite_type())))
+        .ok_or(STATUS_INVALID_IE)?;
+    if info.group != rsn_suite(4) {
         return Err(STATUS_INVALID_IE);
     }
     let has_psk = info.akms.contains(&rsn_suite(2));
@@ -196,7 +243,7 @@ pub fn validate_assoc_rsn_for_cipher(
         SecurityMode::Wpa2 => has_psk,
         SecurityMode::Wpa2PskSha256 => has_psk || has_psk_sha256,
         SecurityMode::Wpa3Sae => has_sae,
-        SecurityMode::Transition => has_psk || has_sae,
+        SecurityMode::Transition => has_psk || has_psk_sha256 || has_sae,
         SecurityMode::Owe => has_owe,
     };
     if !supported {
@@ -214,7 +261,7 @@ pub fn validate_assoc_rsn_for_cipher(
             return Err(STATUS_INVALID_IE);
         }
     }
-    Ok(())
+    Ok(selected)
 }
 
 /// Validate a scanned BSS/association RSN for the WPA-PSK-SHA256 AKM.

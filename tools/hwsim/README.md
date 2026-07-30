@@ -101,6 +101,48 @@ to one host). The test box is an SPR router whose nftables `INPUT` chain has
 (`nft insert rule inet filter INPUT iifname "wlan0" ... accept`) — with that,
 ping is 3/3. ARP works regardless (not IP-firewalled).
 
+## MLO AP_VLAN support on Linux 6.11
+
+Linux 6.11 predates mac80211's complete MLO AP_VLAN implementation. A station
+can associate to an AP MLD, but moving it to an AP_VLAN fails on a partner link
+or leaves traffic on the base AP netdev. The backports in
+[`patches/`](patches/) are upstream commits `90233b0ad215` and
+`1a4a6a22552c`, adapted to v6.11:
+
+- one AP_VLAN netdev receives internal link objects matching its parent MLD;
+- each AP_VLAN link has its own default multicast-key slot;
+- AP_VLAN multicast/broadcast traffic is transmitted on all MLO links.
+
+Apply and build them against the running kernel's prepared source tree:
+
+```sh
+git -C "$LINUX_SRC" apply \
+  "$BARELY_AP/tools/hwsim/patches/0001-mac80211-create-separate-links-for-vlan-interfaces.patch" \
+  "$BARELY_AP/tools/hwsim/patches/0002-mac80211-vlan-traffic-in-multicast-path.patch"
+make -C "/lib/modules/$(uname -r)/build" \
+  M="$LINUX_SRC/net/mac80211" modules
+```
+
+On an isolated hwsim host, unload any real mac80211 drivers first, then load the
+rebuilt core and create MLO-capable virtual radios:
+
+```sh
+sudo modprobe -r mac80211_hwsim mac80211
+sudo insmod "$LINUX_SRC/net/mac80211/mac80211.ko"
+sudo modprobe mac80211_hwsim radios=3 channels=2 mlo=1
+```
+
+`scripts/hwsim_mlo_single.sh` is the regression test. With `RUN_LEGACY=0`, it
+focuses on the SAE/CCMP-128 MLO station: both links must be valid, ARP and ICMP
+must enter and leave the single per-station AP_VLAN, and protected data frames
+must be captured in both directions on each link. A second data phase enslaves
+the AP_VLAN to a temporary Linux bridge and sends from a separate veth endpoint;
+the capture must show that endpoint's non-AP Ethernet source as Address 3 on
+protected downlink frames over both MLO links. The same test also checks the
+security lifecycle from the AP log: the private VLAN group rotates from
+GTK/IGTK slots 1/4 to fresh slots 2/5 before M1, and the M2-derived PTK reaches
+the driver while unauthorized before verified M4 opens the controlled port.
+
 ## 6 GHz notes
 
 Some older reference AP builds refuse 6 GHz channels ("NO-IR"); newer builds

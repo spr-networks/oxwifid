@@ -81,7 +81,7 @@ pub fn build_assoc_req_owe(
     dh_element: &[u8],
     sc: u16,
 ) -> Vec<u8> {
-    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, FC_TODS, bssid, sta, bssid, sc);
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, 0, bssid, sta, bssid, sc);
     v.extend_from_slice(&CAP_3101);
     v.extend_from_slice(&STA_LISTEN_INTERVAL.to_le_bytes());
     v.extend_from_slice(&ie(0, ssid));
@@ -114,7 +114,7 @@ pub fn build_assoc_req_pmkid(
     pmkid: &[u8; 16],
     sc: u16,
 ) -> Vec<u8> {
-    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, FC_TODS, bssid, sta, bssid, sc);
+    let mut v = dot11_header(TYPE_MGMT, SUBTYPE_ASSOC_REQ, 0, bssid, sta, bssid, sc);
     v.extend_from_slice(&CAP_3101);
     v.extend_from_slice(&STA_LISTEN_INTERVAL.to_le_bytes());
     v.extend_from_slice(&ie(0, ssid));

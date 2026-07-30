@@ -30,6 +30,7 @@ impl Ap {
         let Some(tk) = self.installed_pairwise_key(sta) else {
             return;
         };
+        let cipher = self.station_pairwise_cipher(sta);
         // Reuse an outstanding query's transaction identifier instead of minting
         // a new one. The station answers with the identifier it was given, so
         // letting a later spoofed frame move the target would make the genuine
@@ -48,7 +49,7 @@ impl Ap {
         let sc = self.next_sc();
         let sec = self.mld_mgmt_tx_sec_addrs(sta);
         out.tx(dot11::build_protected_sa_query_for_cipher_sec(
-            self.pairwise_cipher,
+            cipher,
             &self.mac,
             sta,
             false,
@@ -56,7 +57,7 @@ impl Ap {
             trans,
             sc,
             pn,
-            &tk[..self.pairwise_cipher.key_len()],
+            &tk[..cipher.key_len()],
             sec,
         ));
         let mut started = None;
@@ -185,13 +186,14 @@ impl Ap {
                 let Some(tk) = self.installed_pairwise_key(&sta) else {
                     return;
                 };
+                let cipher = self.station_pairwise_cipher(&sta);
                 let Some(pn) = self.stations.get_mut(&sta).unwrap().next_client_pn() else {
                     return;
                 };
                 let sc = self.next_sc();
                 let sec = self.mld_mgmt_tx_sec_addrs(&sta);
                 out.tx(dot11::build_protected_sa_query_for_cipher_sec(
-                    self.pairwise_cipher,
+                    cipher,
                     &self.mac,
                     &sta,
                     false,
@@ -199,7 +201,7 @@ impl Ap {
                     trans,
                     sc,
                     pn,
-                    &tk[..self.pairwise_cipher.key_len()],
+                    &tk[..cipher.key_len()],
                     sec,
                 ));
             }
@@ -241,10 +243,11 @@ impl Ap {
             return None;
         }
         let tk = self.installed_pairwise_key(&sta)?;
+        let cipher = self.station_pairwise_cipher(&sta);
         let Some(plain) = dot11::decrypt_protected_mgmt_sec(
-            self.pairwise_cipher,
+            cipher,
             frame,
-            &tk[..self.pairwise_cipher.key_len()],
+            &tk[..cipher.key_len()],
             self.mld_mgmt_rx_sec_addrs(&sta),
         ) else {
             self.record_failure(&sta, crate::failures::FailureKind::ProtectedMgmt);

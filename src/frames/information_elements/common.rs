@@ -37,13 +37,15 @@ pub const CAP_3101: [u8; 2] = [0x31, 0x01];
 
 /// Capability Information for AP-originated management frames.
 ///
-/// Short Preamble is a 2.4 GHz-only capability. Advertising the old `0x0131`
-/// value on 5/6 GHz also claimed Spectrum Management without the matching
-/// 802.11h elements; strict clients (notably macOS) discard that BSS. Match
-/// reference AP's baseline ESS + Privacy value on the OFDM-only bands.
+/// `0x1031` on 5 GHz advertises ESS, Privacy, Short Preamble, and Radio
+/// Measurement. Do not use the superficially similar
+/// `0x0131`; bit 8 is Spectrum Management and requires the corresponding
+/// 802.11h behavior. 6 GHz does not carry the legacy preamble capability.
 pub(crate) fn ap_capability(channel: u8, band6: bool) -> [u8; 2] {
-    if band6 || is_5ghz(channel) {
+    if band6 {
         0x0011u16.to_le_bytes()
+    } else if is_5ghz(channel) {
+        0x1031u16.to_le_bytes()
     } else {
         CAP_3101
     }
