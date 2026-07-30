@@ -157,6 +157,9 @@ pub struct Ap {
     /// Stations removed from the portable state machine since the transport
     /// last reconciled its kernel/VLAN bookkeeping.
     pub(super) removed_stations: Vec<[u8; 6]>,
+    /// Stations whose newest M2-derived PTK candidate must be installed in the
+    /// driver. The controlled port remains unauthorized until M4 verifies.
+    pub(super) key_install_stations: Vec<[u8; 6]>,
     /// Stations whose four-way handshake just completed and whose keys now need
     /// installation/authorization by the transport.
     pub(super) key_ready_stations: Vec<[u8; 6]>,

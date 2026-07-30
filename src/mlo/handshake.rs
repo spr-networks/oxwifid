@@ -66,7 +66,7 @@ fn multi_link_sta(mld_mac: &[u8; 6], link1_mac: &[u8; 6]) -> Vec<u8> {
 }
 
 /// Fixed Basic Multi-Link element for Authentication frames: Common Info only
-/// (MLD MAC), no per-STA profile and no presence bits. reference implementation/wpa_supplicant use
+/// (MLD MAC), no per-STA profile and no presence bits. reference implementation use
 /// this exact 12-octet IE shape during SAE MLD authentication.
 pub fn multi_link_auth(mld_mac: &[u8; 6]) -> Vec<u8> {
     let mut ml = Vec::new();

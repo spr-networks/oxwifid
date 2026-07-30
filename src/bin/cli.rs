@@ -20,6 +20,91 @@ use zeroize::Zeroize;
 #[cfg(target_os = "linux")]
 use barely_ap::raw_frames::Link;
 
+#[cfg(target_os = "linux")]
+struct HybridClientLink {
+    raw: barely_ap::raw_frames::IfaceLink,
+    management: barely_ap::netlink::NetlinkLink,
+    ethernet: barely_ap::raw_frames::ManagedEthernetLink,
+    station_data_ready: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Link for HybridClientLink {
+    fn try_recv(&mut self, timeout: Duration) -> Option<Vec<u8>> {
+        if let Some(frame) = self.management.try_recv(Duration::ZERO) {
+            return Some(frame);
+        }
+        loop {
+            let frame = self.raw.try_recv(timeout)?;
+            let protected_data = barely_ap::dot11::strip_radiotap(&frame)
+                .and_then(barely_ap::dot11::Dot11::parse)
+                .is_some_and(|frame| {
+                    frame.frame_type() == barely_ap::dot11::TYPE_DATA && frame.protected()
+                });
+            if self.station_data_ready && protected_data {
+                if let Some(frame) = self.management.try_recv(Duration::ZERO) {
+                    return Some(frame);
+                }
+                continue;
+            }
+            return Some(frame);
+        }
+    }
+
+    fn send(&mut self, frame: &[u8]) {
+        let management = barely_ap::dot11::strip_radiotap(frame)
+            .and_then(|body| body.first())
+            .is_some_and(|fc| (fc >> 2) & 0x03 == barely_ap::dot11::TYPE_MGMT);
+        if management {
+            if let Err(error) = self.management.send_station_management_ack(frame) {
+                eprintln!("barely-cli: nl80211 management TX failed: {error}");
+            }
+        } else if barely_ap::dot11::strip_radiotap(frame)
+            .and_then(barely_ap::dot11::Dot11::parse)
+            .is_some_and(|frame| frame.is_eapol())
+        {
+            let parsed =
+                barely_ap::dot11::strip_radiotap(frame).and_then(barely_ap::dot11::Dot11::parse);
+            let encrypt = parsed
+                .as_ref()
+                .and_then(|frame| frame.eapol_key_body())
+                .is_some_and(|body| {
+                    body.len() >= 3 && u16::from_be_bytes([body[1], body[2]]) & 0x0200 != 0
+                });
+            if let Err(error) = self.management.send_station_eapol_ack(frame, encrypt) {
+                eprintln!("barely-cli: nl80211 EAPOL TX failed: {error}");
+            }
+        } else {
+            self.raw.send(frame);
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.raw.is_closed()
+    }
+
+    fn retune(&mut self, channel: u8, band6: bool) -> std::io::Result<()> {
+        self.raw.retune(channel, band6)
+    }
+
+    fn sync_station_keys(&mut self, client: &Client) -> std::io::Result<()> {
+        self.management.sync_station_keys(client)?;
+        self.station_data_ready = client.connected == 4;
+        Ok(())
+    }
+
+    fn send_ethernet(&mut self, frame: &[u8]) -> bool {
+        if let Err(error) = self.ethernet.send(frame) {
+            eprintln!("barely-cli: managed Ethernet TX failed: {error}");
+        }
+        true
+    }
+
+    fn try_recv_ethernet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        self.ethernet.try_recv()
+    }
+}
+
 fn parse_ip(s: &str) -> [u8; 4] {
     let mut out = [0u8; 4];
     for (i, part) in s.split('.').enumerate() {
@@ -579,6 +664,30 @@ fn run_iface_tap(
     state_file: Option<&str>,
     rescan_profile: Option<RescanProfile>,
 ) {
+    let management_iface = std::env::var_os("RUSTAP_CLIENT_NL_MGMT_IFACE");
+    if let Some(management_iface) = management_iface.as_deref() {
+        let management_iface = management_iface.to_string_lossy();
+        let directed = [client.ssid().to_vec()];
+        match barely_ap::netlink::scan_interface(&management_iface, &directed) {
+            Ok(results)
+                if results
+                    .iter()
+                    .any(|result| result.ssid.as_slice() == client.ssid()) =>
+            {
+                eprintln!("barely-cli: managed scan cached target SSID on {management_iface}");
+            }
+            Ok(_) => {
+                eprintln!(
+                    "barely-cli: managed scan did not find target SSID on {management_iface}"
+                );
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("barely-cli: managed scan failed on {management_iface:?}: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let wifi = raw_frames::IfaceLink::open_band(iface, channel, band6).unwrap_or_else(|error| {
         eprintln!("failed to open wireless monitor interface {iface}: {error}");
         std::process::exit(1);
@@ -588,6 +697,42 @@ fn run_iface_tap(
         std::process::exit(1);
     });
     let state_path = state_file.map(std::path::Path::new);
+    if let Some(management_iface) = management_iface {
+        if rescan_profile.is_some() {
+            eprintln!("barely-cli: nl80211 management hybrid cannot be combined with rescan");
+            std::process::exit(2);
+        }
+        let management_iface = management_iface.to_string_lossy();
+        let management = barely_ap::netlink::NetlinkLink::open_station(
+            &management_iface,
+            channel,
+            client.ssid(),
+        )
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "barely-cli: cannot open nl80211 management interface {management_iface:?}: {error}"
+                    );
+                    std::process::exit(1);
+                });
+        let ethernet = barely_ap::raw_frames::ManagedEthernetLink::open(&management_iface)
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "barely-cli: cannot open managed Ethernet interface {management_iface:?}: {error}"
+                );
+                std::process::exit(1);
+            });
+        let hybrid = HybridClientLink {
+            raw: wifi,
+            management,
+            ethernet,
+            station_data_ready: false,
+        };
+        if let Err(error) = raw_frames::run_client_tap(client, hybrid, tap, state_path) {
+            eprintln!("client TAP loop failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let result = if let Some(profile) = rescan_profile {
         let monitor_iface = iface.to_string();
         raw_frames::run_client_tap_with_rescan(

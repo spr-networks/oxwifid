@@ -35,9 +35,13 @@ impl RadioRuntime {
                     &mut self.io,
                     &out,
                     &mut self.stations,
+                    &mut self.group_keys,
                     &mut self.vlans,
                     &mut self.ap,
-                    &self.topology,
+                    RouteEnvironment {
+                        topology: &self.topology,
+                        notifier: self.notifier.as_ref(),
+                    },
                 );
             }
         }
@@ -86,6 +90,11 @@ impl RadioRuntime {
                     .assignment_for(mac)
                     .map(|assignment| assignment.ifname.clone())
                     .unwrap_or_else(|| self.vlans.base_iface.clone());
+                let helper_prepared = matches!(&ev, ApEvent::Connected { .. })
+                    && self
+                        .vlans
+                        .assignment_for(mac)
+                        .is_some_and(|assignment| assignment.data_path_prepared);
                 let mac = crate::util::bytes_to_mac(mac);
                 let spr_event = match &ev {
                     ApEvent::Connected { .. } => Some(SprEvent::Connected { iface, mac }),
@@ -93,7 +102,11 @@ impl RadioRuntime {
                     ApEvent::AuthFailed { kind, .. } => SprEvent::auth_failure(iface, mac, *kind),
                 };
                 if let Some(event) = spr_event {
-                    notifier.notify(event);
+                    if helper_prepared {
+                        notifier.notify_without_dhcp_helper(event);
+                    } else {
+                        notifier.notify(event);
+                    }
                 }
             }
         }

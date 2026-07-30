@@ -29,6 +29,8 @@ pub mod tap;
 #[cfg(target_os = "linux")]
 pub use af_packet::IfaceLink;
 #[cfg(target_os = "linux")]
+pub use af_packet::ManagedEthernetLink;
+#[cfg(target_os = "linux")]
 pub use tap::TapDevice;
 
 #[cfg(target_os = "linux")]
@@ -61,6 +63,23 @@ pub trait Link {
             std::io::ErrorKind::Unsupported,
             "transport cannot retune",
         ))
+    }
+
+    /// Synchronize a managed station transport's kernel keys after the client
+    /// verifies M3 and before its M4 is transmitted.
+    fn sync_station_keys(&mut self, _client: &Client) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Send through a managed Ethernet data path. Raw monitor transports return
+    /// `false`, selecting the existing userspace 802.11 encryption fallback.
+    fn send_ethernet(&mut self, _frame: &[u8]) -> bool {
+        false
+    }
+
+    /// Receive a decrypted Ethernet frame from a managed station data path.
+    fn try_recv_ethernet(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(None)
     }
 }
 
@@ -183,6 +202,7 @@ fn run_client_tap_inner<L: Link>(
             for transmit in out.frames {
                 wifi.send(&transmit);
             }
+            wifi.sync_station_keys(&client)?;
             for ethernet in out.to_network {
                 if std::env::var_os("RUSTAP_CLIENT_DEBUG").is_some() {
                     eprintln!(
@@ -201,6 +221,21 @@ fn run_client_tap_inner<L: Link>(
                 eprintln!("DISCONNECTED");
                 next_rescan = Instant::now();
             }
+        }
+        for _ in 0..TAP_BATCH {
+            let Some(ethernet) = wifi.try_recv_ethernet()? else {
+                break;
+            };
+            if std::env::var_os("RUSTAP_CLIENT_DEBUG").is_some() {
+                eprintln!(
+                    "client managed downlink len={} ethertype={:02x}{:02x} {}",
+                    ethernet.len(),
+                    ethernet.get(12).copied().unwrap_or_default(),
+                    ethernet.get(13).copied().unwrap_or_default(),
+                    ethernet_debug(&ethernet)
+                );
+            }
+            tap.send(&ethernet)?;
         }
 
         if client.connected == 0 && Instant::now() >= next_rescan {
@@ -227,8 +262,10 @@ fn run_client_tap_inner<L: Link>(
                     ethernet_debug(&ethernet)
                 );
             }
-            if let Some(frame) = client.encrypt_uplink(&ethernet) {
-                wifi.send(&frame);
+            if !wifi.send_ethernet(&ethernet) {
+                if let Some(frame) = client.encrypt_uplink(&ethernet) {
+                    wifi.send(&frame);
+                }
             }
         }
 

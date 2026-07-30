@@ -44,14 +44,18 @@ impl Ap {
                 return;
             }
         };
-        if let Err(status) = dot11::validate_assoc_rsn_for_cipher(
+        let supported_pairwise = self.pairwise_ciphers();
+        let selected_pairwise = match dot11::negotiate_assoc_pairwise_cipher(
             assoc_rsn,
             self.security_mode(),
-            self.pairwise_cipher,
+            &supported_pairwise,
         ) {
-            self.reject_assoc_status(&sta, reassoc, status, out);
-            return;
-        }
+            Ok(cipher) => cipher,
+            Err(status) => {
+                self.reject_assoc_status(&sta, reassoc, status, out);
+                return;
+            }
+        };
         let requests_sae = dot11::rsn_has_akm(assoc_rsn, 8);
         let requests_pmf = dot11::rsn_has_mfpc(assoc_rsn);
         let transition_mode = self.security_mode() == dot11::SecurityMode::Transition;
@@ -62,8 +66,13 @@ impl Ap {
         // mutably borrowed) and applied unconditionally, so a station that
         // previously selected AKM 6 and now selects AKM 2 is keyed with SHA-1
         // rather than keeping a stale hierarchy.
-        let selects_psk_sha256 = matches!(self.security_mode(), dot11::SecurityMode::Wpa2PskSha256)
-            .then(|| dot11::rsn_has_akm(assoc_rsn, 6));
+        let selects_psk_sha256 = match self.security_mode() {
+            dot11::SecurityMode::Wpa2PskSha256 => Some(dot11::rsn_has_akm(assoc_rsn, 6)),
+            dot11::SecurityMode::Transition if !requests_sae => {
+                Some(dot11::rsn_has_akm(assoc_rsn, 6))
+            }
+            _ => None,
+        };
         if requests_sae {
             let sae_h2e = self
                 .stations
@@ -125,6 +134,7 @@ impl Ap {
             // Remember the station's capability IEs (HT/VHT/HE/rates) so the
             // netlink station setup can hand them to the driver for rate control.
             s.assoc_ies = frame.body.get(ie_off..).unwrap_or(&[]).to_vec();
+            s.pairwise_cipher = selected_pairwise;
             if let Some(psk_sha256) = selects_psk_sha256 {
                 s.sha256 = psk_sha256;
                 s.psk_sha256 = psk_sha256;
@@ -481,7 +491,7 @@ impl Ap {
                 m1_replay,
                 m1_sc,
                 station_mic,
-                self.pairwise_cipher.key_len() as u16,
+                selected_pairwise.key_len() as u16,
             )
         };
 

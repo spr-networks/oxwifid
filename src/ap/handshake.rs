@@ -8,20 +8,30 @@ impl Ap {
         if frame.addr1 != self.mac {
             return;
         }
-        let (anonce, ready, awaiting_m4, kck, station_mic, group_rekeying, eapol_replay, m1_replay) =
-            match self.stations.get(&sta) {
-                Some(s) => (
-                    s.anonce,
-                    s.eapol_ready,
-                    s.awaiting_m4,
-                    s.kck,
-                    s.key_mic(),
-                    s.group_rekeying,
-                    s.eapol_replay,
-                    s.m1_replay,
-                ),
-                None => return,
-            };
+        let (
+            anonce,
+            ready,
+            awaiting_m4,
+            kck,
+            station_mic,
+            pairwise_cipher,
+            group_rekeying,
+            eapol_replay,
+            m1_replay,
+        ) = match self.stations.get(&sta) {
+            Some(s) => (
+                s.anonce,
+                s.eapol_ready,
+                s.awaiting_m4,
+                s.kck,
+                s.key_mic(),
+                s.pairwise_cipher,
+                s.group_rekeying,
+                s.eapol_replay,
+                s.m1_replay,
+            ),
+            None => return,
+        };
 
         let Some(eapol_frame) = frame.eapol_frame() else {
             return;
@@ -144,7 +154,7 @@ impl Ap {
             if let Some(candidate) = selected {
                 let mut event_mac = None;
                 if let Some(s) = self.stations.get_mut(&sta) {
-                    let tk_len = self.pairwise_cipher.key_len();
+                    let tk_len = pairwise_cipher.key_len();
                     // A new handshake normally yields a new TK, but make the
                     // packet-number invariant independent of nonce uniqueness.
                     // Re-delivery of identical temporal-key material must never
@@ -301,7 +311,7 @@ impl Ap {
         let mut kck = [0u8; 16];
         let mut kek = [0u8; 16];
         let mut tk = [0u8; 32];
-        let tk_len = self.pairwise_cipher.key_len();
+        let tk_len = pairwise_cipher.key_len();
         let mut matched_pmk: Option<[u8; 32]> = None;
         // The MIC input is identical for every credential candidate. Build and
         // clear it once rather than allocating/copying the full EAPOL frame for
@@ -446,7 +456,11 @@ impl Ap {
         // BIP-protected group-addressed management frames, and the BIGTK KDE when
         // Beacon Protection is enabled.
         let igtk = if pmf {
-            Some((self.igtk_key_id, self.igtk_ipn, self.igtk))
+            Some((
+                self.station_igtk_key_id(&sta),
+                self.station_igtk_ipn(&sta),
+                self.station_igtk(&sta),
+            ))
         } else {
             None
         };
@@ -472,15 +486,12 @@ impl Ap {
         // (SAE) station would receive the single-AKM RSNE while the beacon carries
         // the mixed PSK+SAE `RSN_TRANSITION`, so the supplicant rejects m3 as a
         // Beacon/EAPOL IE mismatch (reason 17).
-        let ap_rsn: Vec<u8> =
-            dot11::security_tail_for_cipher(self.security_mode(), self.pairwise_cipher);
-        // In per-station-VIF mode each station gets its own GTK *value* (broadcast
-        // isolation); otherwise all stations share the BSS-wide GTK. Either way the
-        // GTK *index* is the single BSS-wide `gtk_key_id` (what the RSNE advertises
-        // and every client installs under), following the rekey toggle.
+        let ap_rsn = self.advertised_security_tail();
+        // In per-station-VIF mode this is the private VLAN group's key and key
+        // index; otherwise it is the BSS-wide group state.
         let gtk = self.station_gtk(&sta);
-        let gtk_key_id = self.gtk_key_id;
-        let group_rsc = self.current_group_rsc();
+        let gtk_key_id = self.station_gtk_key_id(&sta);
+        let group_rsc = self.station_group_rsc(&sta);
         let mld_station = self.mld && client_mld.is_some();
         let m3 = if mld_station {
             // Every link the station holds needs its group keys: the partner
@@ -535,7 +546,7 @@ impl Ap {
                 m3_replay,
                 sc,
                 station_mic,
-                self.pairwise_cipher.key_len() as u16,
+                pairwise_cipher.key_len() as u16,
             )
         };
         // Keys are derived and m3 is sent, but the station is not authorized
@@ -549,6 +560,11 @@ impl Ap {
             s.eapol_retries = 0;
             s.eapol_acked = false;
         }
+        // Install the M2-derived PTK immediately after queueing M3, while the
+        // station remains unauthorized. On mt7996 this ordering is essential
+        // with AP_VLAN: installing only after M4 leaves the firmware
+        // peer's protected-TX context attached without its pairwise key.
+        self.key_install_stations.push(sta);
         self.arm_eapol_timer(&sta);
         kck.zeroize();
         kek.zeroize();

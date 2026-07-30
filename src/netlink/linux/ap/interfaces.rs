@@ -64,7 +64,7 @@ pub(super) fn flush_stale_ap_vlans(sock: &mut NetlinkSocket, family: u16, iface:
 pub(super) fn nl_create_ap_vlan(
     sock: &mut NetlinkSocket,
     family: u16,
-    ap_ifindex: u32,
+    ap_wdev: u64,
     name: &str,
     parent_addr: &[u8; 6],
 ) -> io::Result<u32> {
@@ -78,7 +78,7 @@ pub(super) fn nl_create_ap_vlan(
         nl_del_iface(sock, family, existing)?;
     }
     let seq = sock.next_seq();
-    let m = ap_vlan_create_message(family, seq, ap_ifindex, name);
+    let m = ap_vlan_create_message(family, seq, ap_wdev, name);
     sock.request_ack(m)?;
     let idx = unsafe { libc::if_nametoindex(cname.as_ptr() as *const libc::c_char) };
     if idx == 0 {

@@ -30,7 +30,7 @@ pub fn fallback_channel(current: u8) -> u8 {
 /// (NEW_KEY) from selecting its TX role (SET_KEY).
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn default_multicast_key_attr(idx: u8) -> msg::Attr {
-    msg::Attr::nested(
+    msg::Attr::nested_unflagged(
         NL80211_ATTR_KEY,
         &[
             msg::Attr::u8(NL80211_KEY_IDX, idx),
@@ -81,11 +81,14 @@ pub(crate) fn ap_vlan_parent_addr(ap: &crate::ap::Ap) -> [u8; 6] {
 pub(crate) fn ap_vlan_create_message(
     family: u16,
     seq: u32,
-    ap_ifindex: u32,
+    ap_wdev: u64,
     name: &str,
 ) -> msg::GenlMessage {
     msg::GenlMessage::new(family, NL80211_CMD_NEW_INTERFACE, 0, seq)
-        .attr(msg::Attr::u32(NL80211_ATTR_IFINDEX, ap_ifindex))
+        // driver_nl80211 creates an AP_VLAN through the parent BSS's WDEV,
+        // not merely its netdev ifindex. The distinction is essential for a
+        // driver to attach the child to the exact AP/MLD link TX context.
+        .attr(msg::Attr::bytes(NL80211_ATTR_WDEV, &ap_wdev.to_ne_bytes()))
         .attr(msg::Attr::string(NL80211_ATTR_IFNAME, name))
         .attr(msg::Attr::u32(NL80211_ATTR_IFTYPE, NL80211_IFTYPE_AP_VLAN))
         // Keep the per-station netdev process-scoped so the kernel removes it
@@ -159,9 +162,14 @@ mod tests {
 
     #[test]
     fn set_default_multicast_key_uses_nested_set_key_layout() {
+        let key_attr = default_multicast_key_attr(1);
+        assert_eq!(
+            key_attr.typ, NL80211_ATTR_KEY,
+            "driver_nl80211 leaves the top-level KEY namespace unflagged"
+        );
         let wire = msg::GenlMessage::new(0x13, NL80211_CMD_SET_KEY, 0, 7)
             .attr(msg::Attr::u32(NL80211_ATTR_IFINDEX, 12))
-            .attr(default_multicast_key_attr(1))
+            .attr(key_attr)
             .to_bytes(99);
 
         let messages = msg::parse_messages(&wire);
@@ -198,12 +206,18 @@ mod tests {
 
     #[test]
     fn ap_vlan_create_request_matches_reference_creation_order() {
-        let wire = ap_vlan_create_message(30, 77, 4, "wlan2.4096").to_bytes(99);
+        let parent_wdev = 0x1_0000_0001u64;
+        let wire = ap_vlan_create_message(30, 77, parent_wdev, "wlan2.4096").to_bytes(99);
         let messages = msg::parse_messages(&wire);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].genl_cmd(), Some(NL80211_CMD_NEW_INTERFACE));
 
         let attrs = msg::parse_attrs(messages[0].genl_attrs());
+        assert_eq!(
+            msg::find_attr(&attrs, NL80211_ATTR_WDEV),
+            Some(parent_wdev.to_ne_bytes().as_slice())
+        );
+        assert!(msg::find_attr(&attrs, NL80211_ATTR_IFINDEX).is_none());
         assert!(msg::find_attr(&attrs, NL80211_ATTR_MAC).is_none());
         assert_eq!(
             msg::find_attr(&attrs, NL80211_ATTR_SOCKET_OWNER),

@@ -16,18 +16,64 @@ impl RadioRuntime {
                 .begin_retirement(&sta, Instant::now() + VLAN_EVENT_GRACE);
         }
 
-        // Install keys for any station that just completed the 4-way. Match the
-        // reference per_sta_vif ordering exactly:
+        // Install a verified M2's PTK immediately after transmitting M3,
+        // before receiving M4 and before authorizing the station. This is
+        // required when a supplicant protects M4 at the 802.11 layer.
+        self.stations
+            .key_install_pending
+            .extend(self.ap.drain_key_install_stations());
+        let pending_installs: Vec<[u8; 6]> =
+            self.stations.key_install_pending.iter().copied().collect();
+        for sta in &pending_installs {
+            if self.stations.is_retiring(sta) || !self.stations.is_live(sta) {
+                self.stations.key_install_pending.remove(sta);
+                continue;
+            }
+            let Some(tk) = self.ap.station_pending_pairwise_key(sta) else {
+                self.stations.key_install_pending.remove(sta);
+                continue;
+            };
+            let mld_mac = self.ap.mld.then(|| self.ap.station_mld_mac(sta)).flatten();
+            let key_sta = mld_mac.as_ref().unwrap_or(sta);
+            let kernel_has_key = self
+                .stations
+                .pairwise_key(sta)
+                .is_some_and(|installed| installed == tk);
+            if !kernel_has_key
+                && !nl_install_key(
+                    &mut self.io.commands,
+                    self.io.family,
+                    KeyInstall::pairwise(
+                        ifindex,
+                        key_sta,
+                        tk,
+                        self.ap.station_pairwise_cipher(sta).suite_selector(),
+                    ),
+                )
+            {
+                continue;
+            }
+            if !kernel_has_key {
+                self.stations.set_pairwise_key(sta, tk.to_vec());
+            }
+            self.stations.key_install_pending.remove(sta);
+            eprintln!(
+                "netlink AP: station {} PTK installed (unauthorized, awaiting M4)",
+                crate::util::bytes_to_mac(key_sta),
+            );
+        }
+
+        // Authorize any station that just completed the four-way.
+        // per_sta_vif association publication has already:
         //
-        //   1. messages 1-4 run on the base AP;
-        //   2. install the PTK and authorize the station on the base AP;
-        //   3. create and group-key the private AP_VLAN;
-        //   4. bind the already-authorized station into the AP_VLAN.
+        //   1. create and group-key the private AP_VLAN;
+        //   2. bind the still-unauthorized station to it;
+        //   3. install the M2-derived PTK before M4, with the port closed;
+        //   4. verify M4 and authorize the MLD station.
         //
-        // SET_STA_VLAN changes the peer's data-path attachment. A later
-        // base-ifindex authorization update is not the same operation as
-        // authorizing that peer before the move, so preserve the reference
-        // implementation's ordering instead of relying on driver tolerance.
+        // In particular, never move an already-keyed/authorized station here.
+        // Drivers build peer/key data-path state using the VIF selected before
+        // PTK installation.
         self.stations
             .key_pending
             .extend(self.ap.drain_key_ready_stations());
@@ -46,20 +92,38 @@ impl RadioRuntime {
                 let already_authorized = self.stations.is_authorized(sta);
                 let mld_mac = self.ap.mld.then(|| self.ap.station_mld_mac(sta)).flatten();
                 let key_sta = mld_mac.as_ref().unwrap_or(sta);
-                let assoc_link_id = self
-                    .topology
-                    .station_links
-                    .get(sta)
-                    .copied()
-                    .unwrap_or(self.ap.link_id);
+                if self.vlans.enabled
+                    && !self
+                        .vlans
+                        .map
+                        .get(sta)
+                        .is_some_and(|assignment| !assignment.station_may_be_on_base)
+                {
+                    eprintln!(
+                        "netlink AP: refusing to key {} before AP_VLAN association binding",
+                        crate::util::bytes_to_mac(sta),
+                    );
+                    self.stations.begin_retirement(*sta);
+                    self.vlans.begin_retirement(sta, Instant::now());
+                    self.stations.key_pending.remove(sta);
+                    continue;
+                }
                 // MLO pairwise keys are addressed to the peer MLD. The kernel
-                // rejects MLO_LINK_ID on pairwise NEW_KEY; per-link scoping only
-                // applies to group/management keys.
+                // rejects MLO_LINK_ID on pairwise NEW_KEY; per-link and VLAN
+                // scoping apply only to group/management keys. Keep pairwise
+                // keys on the base BSS after SET_STA_VLAN.
                 let kernel_has_key = self
                     .stations
                     .pairwise_key(sta)
                     .is_some_and(|installed| installed == tk);
-                if !kernel_has_key {
+                // The verified-M2 install is the station's real RX/TX PTK:
+                // install it once between M3 and M4, then retain that same
+                // kernel key while opening the controlled port.
+                // Deleting/recreating the slot after M4 resets the driver's
+                // pairwise data-path context after the supplicant has committed
+                // to the original installation.
+                let install_rx_tx = !kernel_has_key;
+                if install_rx_tx {
                     if !nl_install_key(
                         &mut self.io.commands,
                         self.io.family,
@@ -67,7 +131,7 @@ impl RadioRuntime {
                             ifindex,
                             key_sta,
                             tk,
-                            self.ap.pairwise_cipher().suite_selector(),
+                            self.ap.station_pairwise_cipher(sta).suite_selector(),
                         ),
                     ) {
                         continue;
@@ -88,166 +152,30 @@ impl RadioRuntime {
                     continue;
                 }
 
-                // reference AP authorizes the kernel station before its
-                // per_sta_vif callback creates and binds the private AP_VLAN.
-                // Keep this ahead of every AP_VLAN operation: the authorization
-                // update is MLD-level state addressed through the base BSS.
-                if !nl_authorize(&mut self.io.commands, self.io.family, ifindex, key_sta) {
+                // Authorization is MLD-level state addressed through the base
+                // BSS. In per_sta_vif mode the station has already been moved
+                // before the four-way.
+                let total_flags = associated_station_flags(
+                    self.ap.station_capability(sta).unwrap_or(0),
+                    self.ap.station_uses_wmm(sta),
+                    self.ap.station_uses_pmf(sta),
+                ) | (1u32 << NL80211_STA_FLAG_AUTHORIZED);
+                if !nl_authorize(
+                    &mut self.io.commands,
+                    self.io.family,
+                    self.topology.wdev,
+                    key_sta,
+                    total_flags,
+                ) {
                     continue;
-                }
-
-                let key_if = if self.vlans.enabled {
-                    if !self.vlans.map.contains_key(sta) {
-                        // Create the private interface only after m4 and base-BSS
-                        // authorization. The station remains on the base AP until
-                        // its group key is installed and SET_STA_VLAN succeeds.
-                        let (vlan_id, name) = match self.vlans.allocate() {
-                            Ok(v) => v,
-                            Err(e) => {
-                                eprintln!("netlink AP: allocate per-station VIF failed: {e}");
-                                self.stations.begin_retirement(*sta);
-                                continue;
-                            }
-                        };
-                        let parent_addr = ap_vlan_parent_addr(&self.ap);
-                        let vidx = match nl_create_ap_vlan(
-                            &mut self.io.commands,
-                            self.io.family,
-                            ifindex,
-                            &name,
-                            &parent_addr,
-                        ) {
-                            Ok(vidx) => vidx,
-                            Err(e) => {
-                                eprintln!("netlink AP: create AP_VLAN {name} failed: {e}");
-                                self.stations.begin_retirement(*sta);
-                                continue;
-                            }
-                        };
-                        // Reserve the id/name immediately after NEW_INTERFACE.
-                        // From this point onward every failure goes through the
-                        // asynchronous retirement state machine; no allocator
-                        // can observe the VIF as free before DEL_INTERFACE ACKs.
-                        let kernel_addr = mld_mac.unwrap_or(*sta);
-                        self.vlans.insert(
-                            *sta,
-                            VlanAssignment {
-                                ifindex: vidx,
-                                vlan_id,
-                                ifname: name.clone(),
-                                sta_addr: kernel_addr,
-                                station_may_be_on_base: true,
-                                retire_at: None,
-                                station_removed: false,
-                                station_cleanup_id: None,
-                                station_retry_at: None,
-                                interface_cleanup_id: None,
-                                interface_retry_at: None,
-                            },
-                        );
-                    }
-                    self.vlans
-                        .map
-                        .get(sta)
-                        .map(|assignment| assignment.ifindex)
-                        .unwrap_or(ifindex)
-                } else {
-                    ifindex
-                };
-
-                if self.vlans.enabled {
-                    // The GTK index is BSS-wide (the advertised key id, shared by
-                    // every station); only the per-station GTK *value* differs.
-                    let gidx = self.ap.gtk_key_id();
-                    let gkey = self.ap.station_gtk(sta);
-                    let group_links = per_station_link_ids(
-                        self.ap.mld,
-                        mld_mac.is_some(),
-                        assoc_link_id,
-                        self.ap.station_mld_link_ids(sta),
-                    );
-                    let mut group_keys_ok = true;
-                    for link_id in group_links {
-                        if !nl_install_key(
-                            &mut self.io.commands,
-                            self.io.family,
-                            KeyInstall::group(key_if, gidx, &gkey, link_id),
-                        ) {
-                            group_keys_ok = false;
-                            continue;
-                        }
-                        self.group_keys
-                            .vlan_gtk
-                            .insert((*sta, link_id), (gidx, gkey));
-                    }
-                    if !group_keys_ok {
-                        // The station is already authorized on the base AP.
-                        // Never leave it there after private-VIF setup failed.
-                        self.stations.begin_retirement(*sta);
-                        self.vlans.begin_retirement(sta, Instant::now());
-                        self.stations.key_pending.remove(sta);
-                        continue;
-                    }
-
-                    // cfg80211 stores an MLO peer under its MLD MAC. Match the
-                    // reference AP and bind the already-authorized station on
-                    // every negotiated MLO link only after the AP_VLAN GTK is
-                    // ready. Binding only the association link leaves partner
-                    // traffic on the base BSS.
-                    let assignment = self
-                        .vlans
-                        .map
-                        .get(sta)
-                        .expect("AP_VLAN reservation must exist before binding");
-                    if assignment.station_may_be_on_base {
-                        let vidx = assignment.ifindex;
-                        let vlan_id = assignment.vlan_id;
-                        let name = assignment.ifname.clone();
-                        let kernel_addr = assignment.sta_addr;
-                        let vlan_links = per_station_link_ids(
-                            self.ap.mld,
-                            mld_mac.is_some(),
-                            assoc_link_id,
-                            self.ap.station_mld_link_ids(sta),
-                        );
-                        let mut vlan_bind_error = None;
-                        for &link_id in &vlan_links {
-                            if let Err(e) = nl_set_sta_vlan(
-                                &mut self.io.commands,
-                                self.io.family,
-                                ifindex,
-                                &kernel_addr,
-                                vidx,
-                                link_id,
-                            ) {
-                                vlan_bind_error = Some((link_id, e));
-                                break;
-                            }
-                        }
-                        if let Some((link_id, e)) = vlan_bind_error {
-                            eprintln!("netlink AP: set_sta_vlan link={link_id:?} failed: {e}");
-                            self.stations.begin_retirement(*sta);
-                            self.vlans.begin_retirement(sta, Instant::now());
-                            self.stations.key_pending.remove(sta);
-                            continue;
-                        }
-                        self.vlans
-                            .map
-                            .get_mut(sta)
-                            .expect("bound AP_VLAN reservation")
-                            .station_may_be_on_base = false;
-                        eprintln!(
-                        "netlink AP: station {} -> {name} (vlan_id {vlan_id}, ifindex {vidx}, links={vlan_links:?})",
-                        crate::util::bytes_to_mac(&kernel_addr),
-                    );
-                    }
                 }
                 self.stations.mark_authorized(sta);
                 self.stations.key_pending.remove(sta);
                 newly_keyed = true;
                 eprintln!(
-                    "netlink AP: station {} keyed + authorized",
-                    crate::util::bytes_to_mac(sta)
+                    "netlink AP: station {} M4 verified + authorized with installed PTK (core link {})",
+                    crate::util::bytes_to_mac(key_sta),
+                    crate::util::bytes_to_mac(sta),
                 );
             }
         }
@@ -260,15 +188,12 @@ impl RadioRuntime {
         let group_keys_changed = self.group_keys.changed(&self.ap);
         let mut group_keys_installed = true;
 
-        // BSS-wide GTK: install once a station is keyed, and re-install whenever
-        // the AP rotates it (group rekey). The kernel must end up using exactly
-        // the GTK bytes + index that rekey_gtk() handed the stations — otherwise
-        // a departed STA can still read kernel group traffic. (Per-STA-VIF mode
-        // has no BSS-wide group key; each AP_VLAN is keyed below instead.)
-        if !self.vlans.enabled
-            && (newly_keyed || group_keys_changed)
-            && self.stations.has_authorized()
-        {
+        // BSS-wide GTK: install this immediately after START_AP, even when
+        // per_sta_vif is enabled. Dynamic AP_VLANs get additional private group
+        // contexts; they do not replace the base BSS key context. Some
+        // FullMAC firmware (including mt7996) initializes protected-TX state for
+        // the BSS from this publication before any station/PTK is installed.
+        if newly_keyed || group_keys_changed {
             let gtk_idx = self.ap.gtk_key_id();
             let gtk = self.ap.gtk();
             let group_links: Vec<Option<u8>> = if self.ap.mld {
@@ -304,7 +229,7 @@ impl RadioRuntime {
         // a later rotation overwrites it, preserving the two-phase rekey window.
         // Without this, a periodic/strict rekey
         // would hand stations a new key while the AP_VLAN kernel key stayed
-        // stale. The initial install above seeds vlan_gtk, so this only fires on
+        // stale. Association publication seeds vlan_gtk, so this only fires on
         // an actual rotation.
         if self.vlans.enabled && group_keys_changed {
             let authorized: Vec<[u8; 6]> = self.stations.authorized().collect();
@@ -313,8 +238,7 @@ impl RadioRuntime {
                     continue;
                 };
                 let vidx = assignment.ifindex;
-                // Shared BSS-wide index, per-station value (see initial install).
-                let gidx = self.ap.gtk_key_id();
+                let gidx = self.ap.station_gtk_key_id(&sta);
                 let gkey = self.ap.station_gtk(&sta);
                 let mld_station = self.ap.mld && self.ap.station_mld_mac(&sta).is_some();
                 let assoc_link_id = self
@@ -332,25 +256,41 @@ impl RadioRuntime {
                 for link_id in group_links {
                     let state_key = (sta, link_id);
                     if self.group_keys.vlan_gtk.get(&state_key) != Some(&(gidx, gkey)) {
-                        if nl_install_key(
-                            &mut self.io.commands,
-                            self.io.family,
-                            KeyInstall::group(vidx, gidx, &gkey, link_id),
-                        ) {
+                        let key = KeyInstall::group(vidx, gidx, &gkey, link_id)
+                            .with_vlan_offload(assignment.vlan_id, self.topology.vlan_offload);
+                        if nl_install_key(&mut self.io.commands, self.io.family, key) {
                             self.group_keys.vlan_gtk.insert(state_key, (gidx, gkey));
                         } else {
                             group_keys_installed = false;
+                        }
+                    }
+                    if self.ap.is_pmf() {
+                        let igtk_idx = self.ap.station_igtk_key_id(&sta) as u8;
+                        let igtk = self.ap.station_igtk(&sta);
+                        let igtk_ipn = self.ap.station_igtk_ipn(&sta);
+                        if self.group_keys.vlan_igtk.get(&state_key) != Some(&(igtk_idx, igtk)) {
+                            let key = KeyInstall::integrity(
+                                vidx, igtk_idx, &igtk, &igtk_ipn, link_id, false,
+                            )
+                            .with_vlan_offload(assignment.vlan_id, self.topology.vlan_offload);
+                            if nl_install_key(&mut self.io.commands, self.io.family, key) {
+                                self.group_keys
+                                    .vlan_igtk
+                                    .insert(state_key, (igtk_idx, igtk));
+                            } else {
+                                group_keys_installed = false;
+                            }
                         }
                     }
                 }
             }
         }
 
-        // IGTK for PMF (SAE/OWE): BSS-wide (one BIP key for the radio's robust
-        // management frames), installed on the main AP interface in both modes so
-        // the kernel can BIP-protect/validate them; re-install on rotation.
-        if self.ap.is_pmf() && (newly_keyed || group_keys_changed) && self.stations.has_authorized()
-        {
+        // IGTK for PMF (SAE/OWE): publish it with the GTK at BSS startup, then
+        // re-install it on rotation. Waiting for the first authorized station
+        // leaves the base firmware security context incomplete while that
+        // station is being bound and pairwise-keyed.
+        if self.ap.is_pmf() && (newly_keyed || group_keys_changed) {
             let igtk_idx = self.ap.igtk_key_id() as u8;
             let igtk = self.ap.igtk();
             let mgmt_links: Vec<Option<u8>> = if self.ap.mld {

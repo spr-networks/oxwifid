@@ -79,6 +79,7 @@ impl Ap {
             maintenance_deadline: None,
             eapol_deadlines: BinaryHeap::new(),
             removed_stations: Vec::new(),
+            key_install_stations: Vec::new(),
             key_ready_stations: Vec::new(),
             group_key_epoch: 0,
             async_sae: None,
@@ -108,6 +109,32 @@ impl Ap {
 
     pub fn pairwise_cipher(&self) -> dot11::DataCipher {
         self.pairwise_cipher
+    }
+
+    /// Ordered pairwise suites advertised by this BSS.
+    ///
+    /// mt7996 AP_VLAN transmit offload does not produce usable CCMP-128
+    /// downlink frames for affected firmware revisions. Offering CCMP-256 first
+    /// with CCMP-128 as a compatibility fallback avoids that path; Apple
+    /// clients select CCMP-256.
+    /// Preserve single-suite behavior for every other explicit cipher.
+    pub fn pairwise_ciphers(&self) -> Vec<dot11::DataCipher> {
+        if self.pairwise_cipher == dot11::DataCipher::Ccmp256 {
+            vec![dot11::DataCipher::Ccmp256, dot11::DataCipher::Ccmp128]
+        } else {
+            vec![self.pairwise_cipher]
+        }
+    }
+
+    pub(super) fn advertised_security_tail(&self) -> Vec<u8> {
+        dot11::security_tail_for_ciphers(self.security_mode(), &self.pairwise_ciphers())
+    }
+
+    pub fn station_pairwise_cipher(&self, sta: &[u8; 6]) -> dot11::DataCipher {
+        self.stations
+            .get(sta)
+            .map(|station| station.pairwise_cipher)
+            .unwrap_or(self.pairwise_cipher)
     }
 
     /// Enable/disable rekeying the GTK when an authorized station leaves
@@ -503,15 +530,113 @@ impl Ap {
         self.gtk
     }
 
-    /// The CCMP key index of the group key handed to `sta`. The GTK key index is
-    /// a BSS-wide concept — it is what the RSNE/beacon advertises and the index
-    /// every client installs its GTK under — so it is the single global
-    /// `gtk_key_id` for every station, in both modes. In `per_sta_vif` mode only
-    /// the GTK *value* differs per station (see [`Ap::station_gtk`]); the shared
-    /// index toggles 1<->2 together on each rekey. Used by the netlink path to
-    /// (re)install the GTK at the same index the station was told.
-    pub fn station_gtk_key_id(&self, _sta: &[u8; 6]) -> u8 {
+    /// The CCMP key index of the group key handed to `sta`. A private AP_VLAN
+    /// owns an independent two-slot WPA group; the non-VLAN path uses the
+    /// BSS-wide index.
+    pub fn station_gtk_key_id(&self, sta: &[u8; 6]) -> u8 {
+        if self.per_sta_vif {
+            if let Some(s) = self.stations.get(sta) {
+                return s.gtk_key_id;
+            }
+        }
         self.gtk_key_id
+    }
+
+    /// Highest group packet number already transmitted under the GTK handed to
+    /// `sta`. Per-STA-VIF stations use the sequence read from their AP_VLAN;
+    /// the ordinary BSS uses the userspace group counter.
+    pub(super) fn station_group_rsc(&self, sta: &[u8; 6]) -> u64 {
+        if self.per_sta_vif {
+            if let Some(s) = self.stations.get(sta) {
+                return s.gtk_rsc;
+            }
+        }
+        self.current_group_rsc()
+    }
+
+    /// Synchronize a private VLAN group's packet-number state from nl80211.
+    ///
+    /// Both arrays use the kernel's PN0..PN5 byte order. GTK RSC is encoded as
+    /// the little-endian 48-bit value in EAPOL-Key; the IGTK KDE carries those
+    /// six bytes verbatim as its IPN.
+    pub(crate) fn set_station_vlan_group_sequences(
+        &mut self,
+        sta: &[u8; 6],
+        gtk: Option<[u8; 6]>,
+        igtk: Option<[u8; 6]>,
+    ) {
+        if !self.per_sta_vif {
+            return;
+        }
+        let Some(s) = self.stations.get_mut(sta) else {
+            return;
+        };
+        if let Some(sequence) = gtk {
+            let mut value = [0u8; 8];
+            value[..6].copy_from_slice(&sequence);
+            s.gtk_rsc = u64::from_le_bytes(value);
+        }
+        if let Some(sequence) = igtk {
+            s.igtk_ipn = sequence;
+        }
+    }
+
+    /// Integrity-group state handed to one station. Dynamic AP_VLANs have their
+    /// own IGTK material/index/IPN; otherwise the BSS group is authoritative.
+    pub fn station_igtk(&self, sta: &[u8; 6]) -> [u8; 16] {
+        if self.per_sta_vif {
+            if let Some(s) = self.stations.get(sta) {
+                return s.igtk;
+            }
+        }
+        self.igtk
+    }
+
+    pub fn station_igtk_key_id(&self, sta: &[u8; 6]) -> u16 {
+        if self.per_sta_vif {
+            if let Some(s) = self.stations.get(sta) {
+                return s.igtk_key_id;
+            }
+        }
+        self.igtk_key_id
+    }
+
+    pub fn station_igtk_ipn(&self, sta: &[u8; 6]) -> [u8; 6] {
+        if self.per_sta_vif {
+            if let Some(s) = self.stations.get(sta) {
+                return s.igtk_ipn;
+            }
+        }
+        self.igtk_ipn
+    }
+
+    /// Run first-station initialization for a private VLAN group.
+    ///
+    /// `wpa_auth_ensure_group()` seeds slots 1/4 when the AP_VLAN is created.
+    /// Once its first station is bound, `wpa_group_ensure_init()` generates new
+    /// GTK/IGTK material in the alternate slots 2/5 before message 1. Returning
+    /// `false` means this AP_VLAN was already initialized.
+    pub(crate) fn initialize_station_vlan_group(&mut self, sta: &[u8; 6]) -> bool {
+        if !self.per_sta_vif {
+            return false;
+        }
+        let Some(s) = self.stations.get_mut(sta) else {
+            return false;
+        };
+        if s.vlan_group_initialized {
+            return false;
+        }
+
+        s.gtk.zeroize();
+        s.gtk = random_bytes::<16>();
+        s.gtk_key_id = if s.gtk_key_id == 1 { 2 } else { 1 };
+        s.gtk_rsc = 0;
+        s.igtk.zeroize();
+        s.igtk = random_bytes::<16>();
+        s.igtk_key_id = if s.igtk_key_id == 4 { 5 } else { 4 };
+        s.igtk_ipn = [0; 6];
+        s.vlan_group_initialized = true;
+        true
     }
 
     /// Build an 802.11v BSS Transition Management Request steering `sta` toward a
@@ -541,5 +666,37 @@ impl Ap {
     /// a Diffie-Hellman exchange in (re)association to key the 4-way handshake.
     pub fn enable_owe(&mut self) {
         self.owe = true;
+    }
+}
+
+#[cfg(test)]
+mod station_vlan_group_tests {
+    use super::*;
+
+    #[test]
+    fn first_bound_station_rotates_its_private_vlan_group_once() {
+        let sta = [0x02, 0, 0, 0, 0, 1];
+        let mut ap = Ap::new("test", "password1234", [0x02, 0, 0, 0, 0, 0], 36);
+        ap.enable_per_sta_vif();
+        ap.stations.insert(sta, Station::new(sta));
+
+        let initial_gtk = ap.station_gtk(&sta);
+        let initial_igtk = ap.station_igtk(&sta);
+        assert_eq!(ap.station_gtk_key_id(&sta), 1);
+        assert_eq!(ap.station_igtk_key_id(&sta), 4);
+
+        assert!(ap.initialize_station_vlan_group(&sta));
+        assert_eq!(ap.station_gtk_key_id(&sta), 2);
+        assert_eq!(ap.station_igtk_key_id(&sta), 5);
+        assert_ne!(ap.station_gtk(&sta), initial_gtk);
+        assert_ne!(ap.station_igtk(&sta), initial_igtk);
+
+        let initialized_gtk = ap.station_gtk(&sta);
+        let initialized_igtk = ap.station_igtk(&sta);
+        assert!(!ap.initialize_station_vlan_group(&sta));
+        assert_eq!(ap.station_gtk_key_id(&sta), 2);
+        assert_eq!(ap.station_igtk_key_id(&sta), 5);
+        assert_eq!(ap.station_gtk(&sta), initialized_gtk);
+        assert_eq!(ap.station_igtk(&sta), initialized_igtk);
     }
 }

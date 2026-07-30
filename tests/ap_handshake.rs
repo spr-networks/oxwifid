@@ -82,12 +82,32 @@ fn full_handshake_matches_reference() {
         !ap.is_associated(&sta),
         "station awaits m4, not yet associated after m3"
     );
+    let expected_tk = from_hex(v["crypto"]["tk"].as_str().unwrap());
+    assert_eq!(
+        ap.station_pending_pairwise_key(&sta),
+        Some(expected_tk.as_slice()),
+        "valid m2 exposes the PTK candidate for driver installation"
+    );
+    assert_eq!(
+        ap.drain_key_install_stations(),
+        vec![sta],
+        "the driver installs the PTK after m3 while the port is unauthorized"
+    );
+    assert!(
+        ap.drain_key_ready_stations().is_empty(),
+        "m2 must not authorize the controlled port"
+    );
 
     // 2b. EAPOL message 4 -> station fully associated (authorized only now).
     send_m4(&mut ap, &v);
     assert!(
         ap.is_associated(&sta),
         "station must be associated after verified m4"
+    );
+    assert_eq!(
+        ap.drain_key_ready_stations(),
+        vec![sta],
+        "verified m4 releases controlled-port authorization"
     );
 
     // 3. Encrypted uplink data decrypts to the expected Ethernet frame

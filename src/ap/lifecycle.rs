@@ -306,6 +306,11 @@ impl Ap {
         self.stations.get(sta).map(|s| s.pmf).unwrap_or(false)
     }
 
+    /// Whether this station negotiated WMM/QoS.
+    pub fn station_uses_wmm(&self, sta: &[u8; 6]) -> bool {
+        self.stations.get(sta).map(|s| s.wmm).unwrap_or(false)
+    }
+
     /// Test hook: age every outstanding SA Query past its timeout so the next
     /// [`Ap::tick`] retires the unresponsive station.
     #[doc(hidden)]
@@ -440,6 +445,14 @@ impl Ap {
         std::mem::take(&mut self.removed_stations)
     }
 
+    /// Drain stations whose latest M2-derived PTK candidate is ready for a
+    /// driver-only install. This deliberately precedes M4/authorization: the
+    /// kernel needs the PTK to establish the peer's protected data context
+    /// while the controlled port is still closed.
+    pub fn drain_key_install_stations(&mut self) -> Vec<[u8; 6]> {
+        std::mem::take(&mut self.key_install_stations)
+    }
+
     /// Drain stations whose PTK became installable after a verified message 4.
     pub fn drain_key_ready_stations(&mut self) -> Vec<[u8; 6]> {
         std::mem::take(&mut self.key_ready_stations)
@@ -473,6 +486,42 @@ impl Ap {
 
     pub fn station_capability(&self, sta: &[u8; 6]) -> Option<u16> {
         self.stations.get(sta).map(|s| s.capability)
+    }
+
+    /// BSS-wide short-preamble state after processing association requests.
+    ///
+    /// Start with short preamble enabled and clear it as soon as any associated
+    /// station lacks the capability. `last_assoc` includes the station whose
+    /// successful Association Response is about to be sent,
+    /// before its four-way handshake marks it fully connected.
+    pub fn bss_short_preamble(&self) -> bool {
+        self.stations
+            .values()
+            .filter(|station| station.last_assoc.is_some())
+            .all(|station| station.capability & (1 << 5) != 0)
+    }
+
+    /// BSS HT operation mode consumed by the driver after association.
+    ///
+    /// Bit 2 is Non-Greenfield HT STAs Present. The protection mode in bits
+    /// 0..1 remains zero while every associated peer advertises HT.
+    pub fn bss_ht_opmode(&self) -> u16 {
+        const HT_CAP_GREEN_FIELD: u16 = 1 << 4;
+        const HT_OPMODE_NON_GF_PRESENT: u16 = 1 << 2;
+        if self
+            .stations
+            .values()
+            .filter(|station| station.last_assoc.is_some())
+            .filter_map(|station| dot11::find_ie(&station.assoc_ies, 45))
+            .filter(|capability| capability.len() >= 2)
+            .any(|capability| {
+                u16::from_le_bytes([capability[0], capability[1]]) & HT_CAP_GREEN_FIELD == 0
+            })
+        {
+            HT_OPMODE_NON_GF_PRESENT
+        } else {
+            0
+        }
     }
 
     /// The station's MLD MAC, when this link-addressed station authenticated as

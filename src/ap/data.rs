@@ -21,8 +21,8 @@ impl Ap {
         if frame.ccmp_key_id() != 0 {
             return;
         }
-        let tk = match self.stations.get(&sta) {
-            Some(s) if s.associated => s.pairwise_tk,
+        let (tk, cipher) = match self.stations.get(&sta) {
+            Some(s) if s.associated => (s.pairwise_tk, s.pairwise_cipher),
             // Known but mid-handshake: drop the (premature) data without
             // deauthing, so a data frame that races ahead of m4 on a reordering
             // link doesn't tear down a handshake that's about to complete.
@@ -54,13 +54,8 @@ impl Ap {
         }
 
         let sec = self.mld_data_rx_sec_addrs(&sta, frame);
-        match dot11::decrypt_protected_data_sec(
-            self.pairwise_cipher,
-            frame,
-            &tk[..self.pairwise_cipher.key_len()],
-            false,
-            sec,
-        ) {
+        match dot11::decrypt_protected_data_sec(cipher, frame, &tk[..cipher.key_len()], false, sec)
+        {
             // sanity: source MAC in the Ethernet frame must match the station
             Some(eth) if eth.len() >= 12 && eth[6..12] == sta => {
                 if let Some(s) = self.stations.get_mut(&sta) {
@@ -145,8 +140,9 @@ impl Ap {
                     None
                 };
                 let tk = s.pairwise_tk;
+                let cipher = s.pairwise_cipher;
                 let sec = self.mld_data_tx_sec_addrs(&dst, &src);
-                (self.pairwise_cipher, 0u8, pn, tk, dst, qos, sec)
+                (cipher, 0u8, pn, tk, dst, qos, sec)
             };
 
         let sc = self.next_sc();

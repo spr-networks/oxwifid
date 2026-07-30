@@ -248,7 +248,7 @@ impl Ap {
     }
 
     /// The affiliated link a station associated on, as an [`MldLink`] carrying
-    /// that link's channel/band/width/address. Like hostapd, the (re)association
+    /// that link's channel/band/width/address. The (re)association
     /// response must be built entirely in the association link's BSS context —
     /// its operating channel and HT/VHT/HE/EHT operation elements — not the
     /// fixed anchor link's, or a client that associated on the 5/6 GHz link

@@ -106,11 +106,8 @@ impl Ap {
         if self.stations.values().any(|s| s.group_rekeying) {
             return Vec::new();
         }
-        // Per-STA-VIF mode: each station has its OWN group key *value* (broadcast
-        // isolation). A shared GTK value would collapse that isolation, so rotate
-        // each station's per-station GTK value and drive its msg 1 with that value.
-        // The key *index* is a fixed constant (1) — each station's value is the
-        // isolation; the index never moves in this mode.
+        // Per-STA-VIF mode: every private AP_VLAN owns an independent WPA group,
+        // including its own GTK/IGTK material and two-slot key indices.
         if self.per_sta_vif {
             return self.rekey_gtk_per_sta();
         }
@@ -206,24 +203,13 @@ impl Ap {
         frames
     }
 
-    /// Per-STA-VIF group rekey: rotate EACH associated station's OWN per-station
-    /// GTK *value* and send that station a Group Key message 1 carrying its own
-    /// new value — preserving the per-station broadcast isolation. The GTK *index*
-    /// is a fixed constant (1): each station's own value (isolated in its own
-    /// AP_VLAN) is what separates them, so the index never moves and is not a
-    /// per-station or a shared toggling counter — the new value overwrites the old
-    /// at the same index 1. The IGTK is genuinely BSS-wide (one BIP key for the
-    /// radio's robust management frames), so it IS rotated once with its own 4<->5
-    /// index toggle and delivered to every PMF station. Called only from
-    /// `rekey_gtk` when `per_sta_vif` is set; the caller already guarantees no
-    /// rekey is in flight.
+    /// Per-STA-VIF group rekey: rotate every private VLAN group's GTK and IGTK
+    /// into that group's alternate slots, then send the matching keys to its
+    /// sole station. Each dynamic VLAN owns an independent WPA group.
     pub(super) fn rekey_gtk_per_sta(&mut self) -> Vec<Vec<u8>> {
-        // The per-station GTK index is a fixed constant (1): each station's own
-        // GTK *value* (its own key, isolated in its own AP_VLAN) is what separates
-        // them, so the index never moves and is not a shared, toggling counter —
-        // only the value rotates per station (below), overwriting the old one at
-        // the same index 1. The BSS-wide IGTK (management-frame BIP, genuinely one
-        // key per radio) still rotates with its own 4<->5 index toggle.
+        // Keep the base BSS group state valid for group-addressed management and
+        // the userspace/raw data path. Netlink AP_VLANs use the station-owned
+        // group states rotated in the loop below.
         self.igtk.zeroize();
         self.igtk = random_bytes::<16>();
         self.igtk_key_id = if self.igtk_key_id == 4 { 5 } else { 4 };
@@ -240,11 +226,7 @@ impl Ap {
         self.group_pn = 1;
         self.last_group_rekey = Instant::now();
         self.group_key_epoch = self.group_key_epoch.wrapping_add(1);
-        let gtk_key_id: u8 = 1;
         let group_rsc = self.current_group_rsc();
-        let igtk = self.igtk;
-        let igtk_key_id = self.igtk_key_id;
-        let igtk_ipn = self.igtk_ipn;
 
         let stations: Vec<[u8; 6]> = self
             .stations
@@ -257,16 +239,31 @@ impl Ap {
         for sta in stations {
             let mld_link_ids = self.station_mld_link_ids(&sta);
             let replay = self.next_eapol_replay();
-            let (kck, kek, pmf, station_mic, replay, gtk) = {
+            let (kck, kek, pmf, station_mic, replay, gtk, gtk_key_id, igtk, igtk_key_id, igtk_ipn) = {
                 let s = self.stations.get_mut(&sta).unwrap();
-                // Rotate this station's own GTK *value*; it goes in at the shared
-                // (already-toggled) BSS-wide index.
                 let mut gtk_full = random_bytes::<32>();
                 s.gtk.zeroize();
                 s.gtk.copy_from_slice(&gtk_full[..16]);
                 gtk_full.zeroize();
+                s.gtk_key_id = if s.gtk_key_id == 1 { 2 } else { 1 };
+                s.gtk_rsc = 0;
+                s.igtk.zeroize();
+                s.igtk = random_bytes::<16>();
+                s.igtk_key_id = if s.igtk_key_id == 4 { 5 } else { 4 };
+                s.igtk_ipn = [0; 6];
                 s.eapol_replay = replay;
-                (s.kck, s.kek, s.pmf, s.key_mic(), s.eapol_replay, s.gtk)
+                (
+                    s.kck,
+                    s.kek,
+                    s.pmf,
+                    s.key_mic(),
+                    s.eapol_replay,
+                    s.gtk,
+                    s.gtk_key_id,
+                    s.igtk,
+                    s.igtk_key_id,
+                    s.igtk_ipn,
+                )
             };
             let igtk_kde = if pmf {
                 Some((igtk_key_id, igtk_ipn, igtk))

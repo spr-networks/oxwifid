@@ -174,11 +174,6 @@ pub(super) fn start_radio(
     // once, before START_AP, then hand the socket to the receive-only radio loop.
     let wdev = nl_get_interface_wdev(&mut sock, family_id, ifindex)?;
     nl_register_ap_frames(&mut sock, family_id, wdev)?;
-    // Derive the nl80211 auth type + RSN AKM suite(s) from the AP's configured
-    // security mode, instead of hardcoding open-system + WPA2-PSK. The AKM suite
-    // list distinguishes the modes; Transition advertises BOTH PSK and SAE AKMs so
-    // WPA2 and WPA3 clients can each pick their AKM.
-    //
     // AUTH_TYPE for START_AP must stay OPEN_SYSTEM for every mode here: barely-ap
     // runs the SAE/OWE exchange in *userspace* (the kernel hands auth frames up via
     // REGISTER_FRAME), so it never offloads SAE to the driver. Passing
@@ -186,42 +181,13 @@ pub(super) fn start_radio(
     // OFFLOAD_AP); a driver without it (e.g. mac80211_hwsim) rejects START_AP with
     // EINVAL. This is what blocked WPA3-SAE — and therefore the PMF-protected EHT
     // (--phy be) config that 802.11be mandates — on the netlink path.
-    let (auth_type, akm_suites): (u32, Vec<u8>) = match ap.security_mode() {
-        dot11::SecurityMode::Wpa2 => (
-            NL80211_AUTHTYPE_OPEN_SYSTEM,
-            WLAN_AKM_SUITE_PSK.to_ne_bytes().to_vec(),
-        ),
-        dot11::SecurityMode::Wpa2PskSha256 => {
-            // Beacon RSNE (RSN_PSK_SHA256_MIXED) advertises both PSK and
-            // PSK-SHA256, so START_AP must offer the same pair for either to be
-            // selectable. AKM 6 does not require PMF, so mfp_required omits it.
-            const WLAN_AKM_SUITE_PSK_SHA256: u32 = 0x000f_ac06;
-            let mut a = WLAN_AKM_SUITE_PSK.to_ne_bytes().to_vec();
-            a.extend_from_slice(&WLAN_AKM_SUITE_PSK_SHA256.to_ne_bytes());
-            (NL80211_AUTHTYPE_OPEN_SYSTEM, a)
-        }
-        dot11::SecurityMode::Wpa3Sae => (
-            NL80211_AUTHTYPE_OPEN_SYSTEM,
-            WLAN_AKM_SUITE_SAE.to_ne_bytes().to_vec(),
-        ),
-        dot11::SecurityMode::Transition => {
-            let mut a = WLAN_AKM_SUITE_PSK.to_ne_bytes().to_vec();
-            a.extend_from_slice(&WLAN_AKM_SUITE_SAE.to_ne_bytes());
-            (NL80211_AUTHTYPE_OPEN_SYSTEM, a)
-        }
-        dot11::SecurityMode::Owe => (
-            NL80211_AUTHTYPE_OPEN_SYSTEM,
-            WLAN_AKM_SUITE_OWE.to_ne_bytes().to_vec(),
-        ),
-    };
+    let auth_type = NL80211_AUTHTYPE_OPEN_SYSTEM;
     // Management Frame Protection is required for SAE and OWE, and mandatory on
     // 6 GHz regardless of AKM.
     let mfp_required = ap.band6()
         || matches!(
             ap.security_mode(),
-            dot11::SecurityMode::Wpa3Sae
-                | dot11::SecurityMode::Owe
-                | dot11::SecurityMode::Transition
+            dot11::SecurityMode::Wpa3Sae | dot11::SecurityMode::Owe
         );
 
     // START_AP: the kernel beacons + (after NEW_KEY) does data CCMP. We keep the
@@ -344,6 +310,11 @@ pub(super) fn start_radio(
             );
         }
         let (head, tail) = split_beacon_at_tim(&beacon);
+        let pairwise_suites: Vec<u8> = ap
+            .pairwise_ciphers()
+            .into_iter()
+            .flat_map(|cipher| cipher.suite_selector().to_ne_bytes())
+            .collect();
         let seq = sock.next_seq();
         let mut start = GenlMessage::new(family_id, NL80211_CMD_START_AP, 0, seq)
             .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
@@ -355,19 +326,22 @@ pub(super) fn start_radio(
             .attr(Attr::u32(NL80211_ATTR_HIDDEN_SSID, 0))
             .attr(Attr::u32(NL80211_ATTR_AUTH_TYPE, auth_type))
             .attr(Attr::bytes(NL80211_ATTR_PRIVACY, &[]))
-            .attr(Attr::u32(NL80211_ATTR_WPA_VERSIONS, NL80211_WPA_VERSION_2))
+            .attr(Attr::u32(
+                NL80211_ATTR_WPA_VERSIONS,
+                nl80211_ap_wpa_version(ap.security_mode()),
+            ))
             .attr(Attr::bytes(
                 NL80211_ATTR_CIPHER_SUITES_PAIRWISE,
-                &ap.pairwise_cipher().suite_selector().to_ne_bytes(),
+                &pairwise_suites,
             ))
             .attr(Attr::u32(
                 NL80211_ATTR_CIPHER_SUITE_GROUP,
                 WLAN_CIPHER_SUITE_CCMP,
             ))
-            .attr(Attr::bytes(NL80211_ATTR_AKM_SUITES, &akm_suites))
             .attr(Attr::bytes(NL80211_ATTR_CONTROL_PORT, &[]))
             .attr(Attr::u16v(NL80211_ATTR_CONTROL_PORT_ETHERTYPE, ETH_P_PAE))
             .attr(Attr::bytes(NL80211_ATTR_CONTROL_PORT_OVER_NL80211, &[]))
+            .attr(Attr::bytes(NL80211_ATTR_CONTROL_PORT_NO_PREAUTH, &[]))
             .attr(Attr::bytes(NL80211_ATTR_SOCKET_OWNER, &[]))
             .attr(Attr::u32(NL80211_ATTR_WIPHY_FREQ, link_freq))
             .attr(Attr::u32(NL80211_ATTR_CHANNEL_WIDTH, link_chan_width))
@@ -383,10 +357,13 @@ pub(super) fn start_radio(
             &mut sock,
             family_id,
             ifindex,
-            ap.mld.then_some(link.link_id),
-            link.channel,
-            !link.band6,
-            ap.guest(),
+            BssParameters {
+                link_id: ap.mld.then_some(link.link_id),
+                channel: link.channel,
+                short_preamble: true,
+                ht_opmode: (!link.band6).then_some(0),
+                isolate: ap.guest() || ap.per_sta_vif(),
+            },
         )?;
         eprintln!(
             "netlink AP: START_AP + SET_BSS ok — kernel beaconing {:?} link_id={} on {} MHz (ifindex {ifindex})",
@@ -442,10 +419,13 @@ pub(super) fn start_radio(
                 &mut sock,
                 family_id,
                 ifindex,
-                Some(link.link_id),
-                link.channel,
-                !link.band6,
-                ap.guest(),
+                BssParameters {
+                    link_id: Some(link.link_id),
+                    channel: link.channel,
+                    short_preamble: true,
+                    ht_opmode: (!link.band6).then_some(0),
+                    isolate: ap.guest() || ap.per_sta_vif(),
+                },
             )?;
             eprintln!(
                 "netlink AP: SET_BEACON + SET_BSS link_id={} with MLE partner_info={} bytes",
@@ -490,6 +470,12 @@ pub(super) fn start_radio(
         dfs_offload: wiphy_caps_by_link
             .values()
             .any(|capabilities| capabilities.dfs_offload),
+        vlan_offload: wiphy_caps_by_link
+            .values()
+            .any(|capabilities| capabilities.vlan_offload),
+        full_ap_client_state: wiphy_caps_by_link
+            .values()
+            .any(|capabilities| capabilities.full_ap_client_state),
         links,
         station_links: HashMap::new(),
         capabilities: wiphy_caps_by_link,

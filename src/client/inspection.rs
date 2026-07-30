@@ -3,8 +3,27 @@
 use super::*;
 
 impl Client {
+    /// SSID selected for this station session.
+    pub fn ssid(&self) -> &[u8] {
+        &self.ssid
+    }
+
     pub fn bssid(&self) -> Option<[u8; 6]> {
         self.bssid
+    }
+
+    /// Pairwise temporal key currently installed by the supplicant state
+    /// machine. Managed transports synchronize this into the driver before M4.
+    pub fn pairwise_key(&self) -> Option<(&[u8], dot11::DataCipher)> {
+        self.ptk_installed.then_some((
+            &self.pairwise_tk[..self.pairwise_cipher.key_len()],
+            self.pairwise_cipher,
+        ))
+    }
+
+    /// GTK and key index currently installed by the supplicant state machine.
+    pub fn group_key(&self) -> Option<(u8, &[u8; 16])> {
+        self.gtk_set.then_some((self.gtk_key_id, &self.gtk))
     }
 
     /// The IGTK installed via PMF (EAPOL message 3), if any.

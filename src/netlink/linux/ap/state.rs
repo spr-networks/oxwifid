@@ -13,6 +13,8 @@ pub(super) type GroupKey = (u8, [u8; 16]);
 /// reconnect from inheriting a retiring kernel peer, VIF, key, or replay state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum KernelStationPhase {
+    /// FULL_AP_CLIENT_STATE peer reserved before the Authentication reply.
+    Unassociated,
     /// NEW_STATION/SET_STATION completed; the four-way is not published yet.
     Associated,
     /// PTK installation and authorization completed.
@@ -30,6 +32,7 @@ pub(super) struct KernelStation {
 
 pub(super) struct StationRegistry {
     pub(super) peers: HashMap<Mac, KernelStation>,
+    pub(super) key_install_pending: HashSet<Mac>,
     pub(super) key_pending: HashSet<Mac>,
     pub(super) pending_assoc: HashMap<Mac, PendingAssocTx>,
     pub(super) held_eapol: HashMap<Mac, Vec<u8>>,
@@ -41,12 +44,24 @@ impl StationRegistry {
     pub(super) fn new() -> Self {
         Self {
             peers: HashMap::new(),
+            key_install_pending: HashSet::new(),
             key_pending: HashSet::new(),
             pending_assoc: HashMap::new(),
             held_eapol: HashMap::new(),
             base_cleanup: HashMap::new(),
             next_cleanup_id: 1,
         }
+    }
+
+    pub(super) fn record_unassociated(&mut self, mac: Mac, kernel_address: Mac) {
+        self.peers.insert(
+            mac,
+            KernelStation {
+                kernel_address: Some(kernel_address),
+                pairwise_key: None,
+                phase: KernelStationPhase::Unassociated,
+            },
+        );
     }
 
     pub(super) fn record_associated(&mut self, mac: Mac, kernel_address: Mac) {
@@ -70,6 +85,18 @@ impl StationRegistry {
         self.peers
             .get(mac)
             .is_some_and(|peer| peer.phase == KernelStationPhase::Authorized)
+    }
+
+    pub(super) fn is_unassociated(&self, mac: &Mac) -> bool {
+        self.peers
+            .get(mac)
+            .is_some_and(|peer| peer.phase == KernelStationPhase::Unassociated)
+    }
+
+    pub(super) fn mark_associated(&mut self, mac: &Mac) {
+        if let Some(peer) = self.peers.get_mut(mac) {
+            peer.phase = KernelStationPhase::Associated;
+        }
     }
 
     pub(super) fn is_retiring(&self, mac: &Mac) -> bool {
@@ -116,12 +143,6 @@ impl StationRegistry {
         })
     }
 
-    pub(super) fn has_authorized(&self) -> bool {
-        self.peers
-            .values()
-            .any(|peer| peer.phase == KernelStationPhase::Authorized)
-    }
-
     pub(super) fn begin_retirement(&mut self, mac: Mac) {
         self.peers
             .entry(mac)
@@ -131,6 +152,7 @@ impl StationRegistry {
                 pairwise_key: None,
                 phase: KernelStationPhase::Retiring,
             });
+        self.key_install_pending.remove(&mac);
         self.key_pending.remove(&mac);
         self.pending_assoc.remove(&mac);
         self.held_eapol.remove(&mac);
@@ -147,6 +169,7 @@ impl StationRegistry {
 
     pub(super) fn forget(&mut self, mac: &Mac) {
         self.peers.remove(mac);
+        self.key_install_pending.remove(mac);
         self.key_pending.remove(mac);
         self.pending_assoc.remove(mac);
         self.held_eapol.remove(mac);
@@ -169,6 +192,7 @@ pub(super) struct GroupKeyStore {
     pub(super) igtk: HashMap<LinkId, GroupKey>,
     pub(super) bigtk: HashMap<LinkId, GroupKey>,
     pub(super) vlan_gtk: HashMap<(Mac, LinkId), GroupKey>,
+    pub(super) vlan_igtk: HashMap<(Mac, LinkId), GroupKey>,
     pub(super) beacon_protection: bool,
     pub(super) installed_epoch: u64,
     pub(super) install_pending: bool,
@@ -181,9 +205,15 @@ impl GroupKeyStore {
             igtk: HashMap::new(),
             bigtk: HashMap::new(),
             vlan_gtk: HashMap::new(),
+            vlan_igtk: HashMap::new(),
             beacon_protection: ap.beacon_prot(),
             installed_epoch: ap.group_key_epoch(),
-            install_pending: false,
+            // Publish the base BSS GTK/IGTK immediately after START_AP,
+            // including when dynamic/per-station AP_VLANs are enabled. Keep
+            // the initial epoch pending until that publication
+            // has completed; the private AP_VLAN groups are additional key
+            // contexts, not replacements for the base BSS group.
+            install_pending: true,
         }
     }
 
@@ -206,6 +236,8 @@ pub(super) struct RadioTopology {
     pub(super) channel: u8,
     pub(super) frequency: u32,
     pub(super) dfs_offload: bool,
+    pub(super) vlan_offload: bool,
+    pub(super) full_ap_client_state: bool,
     pub(super) links: HashMap<u8, (Mac, u32)>,
     pub(super) station_links: HashMap<Mac, u8>,
     pub(super) capabilities: HashMap<u8, WiphyCapabilities>,

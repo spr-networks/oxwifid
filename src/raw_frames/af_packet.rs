@@ -17,6 +17,13 @@ pub struct IfaceLink {
     fd: RawFd,
     /// Band-aware radiotap header prepended on every injected frame.
     tx_radiotap: Vec<u8>,
+    minimal_tx_radiotap: bool,
+}
+
+/// Ethernet TX bound to a managed station interface. The kernel and driver
+/// perform 802.11 encapsulation and encryption with nl80211-installed keys.
+pub struct ManagedEthernetLink {
+    fd: RawFd,
 }
 
 impl IfaceLink {
@@ -28,7 +35,10 @@ impl IfaceLink {
 
     /// Open with explicit band selection (`band6` = 6 GHz channel numbering).
     pub fn open_band(iface: &str, channel: u8, band6: bool) -> io::Result<IfaceLink> {
-        let tx_radiotap = if band6 {
+        let minimal_tx_radiotap = std::env::var_os("RUSTAP_CLIENT_MINIMAL_RADIOTAP").is_some();
+        let tx_radiotap = if minimal_tx_radiotap {
+            dot11::RADIOTAP_TX.to_vec()
+        } else if band6 {
             dot11::build_radiotap_tx_6ghz(channel)
         } else {
             dot11::build_radiotap_tx(channel)
@@ -60,12 +70,18 @@ impl IfaceLink {
                 libc::close(fd);
                 return Err(io::Error::last_os_error());
             }
-            Ok(IfaceLink { fd, tx_radiotap })
+            Ok(IfaceLink {
+                fd,
+                tx_radiotap,
+                minimal_tx_radiotap,
+            })
         }
     }
 
     fn update_channel(&mut self, channel: u8, band6: bool) {
-        self.tx_radiotap = if band6 {
+        self.tx_radiotap = if self.minimal_tx_radiotap {
+            dot11::RADIOTAP_TX.to_vec()
+        } else if band6 {
             dot11::build_radiotap_tx_6ghz(channel)
         } else {
             dot11::build_radiotap_tx(channel)
@@ -122,6 +138,97 @@ impl Link for IfaceLink {
 }
 
 impl Drop for IfaceLink {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+impl ManagedEthernetLink {
+    pub fn open(iface: &str) -> io::Result<ManagedEthernetLink> {
+        unsafe {
+            let protocol = (libc::ETH_P_ALL as u16).to_be() as i32;
+            let fd = libc::socket(libc::AF_PACKET, libc::SOCK_RAW, protocol);
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let ifindex =
+                libc::if_nametoindex(format!("{iface}\0").as_ptr() as *const libc::c_char);
+            if ifindex == 0 {
+                let error = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(error);
+            }
+            let mut address: libc::sockaddr_ll = std::mem::zeroed();
+            address.sll_family = libc::AF_PACKET as u16;
+            address.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+            address.sll_ifindex = ifindex as i32;
+            if libc::bind(
+                fd,
+                &address as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            ) < 0
+            {
+                let error = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(error);
+            }
+            Ok(ManagedEthernetLink { fd })
+        }
+    }
+
+    pub fn send(&mut self, frame: &[u8]) -> io::Result<()> {
+        let sent = unsafe {
+            libc::send(
+                self.fd,
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+                0,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if sent as usize != frame.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short managed Ethernet write",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn try_recv(&mut self) -> io::Result<Option<Vec<u8>>> {
+        unsafe {
+            let mut frame = vec![0u8; 65536];
+            let mut address: libc::sockaddr_ll = std::mem::zeroed();
+            let mut address_len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            let received = libc::recvfrom(
+                self.fd,
+                frame.as_mut_ptr() as *mut libc::c_void,
+                frame.len(),
+                libc::MSG_DONTWAIT,
+                &mut address as *mut _ as *mut libc::sockaddr,
+                &mut address_len,
+            );
+            if received < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            if address.sll_pkttype == libc::PACKET_OUTGOING {
+                return Ok(None);
+            }
+            frame.truncate(received as usize);
+            Ok(Some(frame))
+        }
+    }
+}
+
+impl Drop for ManagedEthernetLink {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.fd);

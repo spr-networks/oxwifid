@@ -46,14 +46,7 @@ impl Client {
         };
         let sc = self.next_sc();
         out.tx(dot11::build_sae_auth(
-            bssid,
-            &self.mac,
-            bssid,
-            dot11::FC_TODS,
-            sc,
-            1,
-            status,
-            &commit,
+            bssid, &self.mac, bssid, 0, sc, 1, status, &commit,
         ));
         self.sae = Some(sae);
     }
@@ -101,7 +94,7 @@ impl Client {
                 &bssid,
                 &self.mac,
                 &bssid,
-                dot11::FC_TODS,
+                0,
                 sc,
                 1,
                 if self.sae_h2e {
@@ -152,7 +145,7 @@ impl Client {
                     &bssid,
                     &self.mac,
                     &bssid,
-                    dot11::FC_TODS,
+                    0,
                     sc,
                     2,
                     dot11::STATUS_SUCCESS,

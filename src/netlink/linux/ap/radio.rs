@@ -66,7 +66,7 @@ pub fn run_offload_ap(
         crate::spr::SprNotifier::new(path, paths.spr_dhcp_helper.map(std::path::PathBuf::from))
     });
 
-    RadioRuntime {
+    let mut runtime = RadioRuntime {
         ap,
         io,
         topology,
@@ -78,8 +78,18 @@ pub fn run_offload_ap(
         notifier,
         bssid,
         event_buffer: vec![0u8; 65536],
+    };
+
+    // Initialize the base BSS group-key context before accepting
+    // authentication/association events. AP_VLANs created later receive their
+    // own GTK/IGTK in addition to these keys.
+    runtime.reconcile_group_keys(false);
+    if runtime.group_keys.install_pending {
+        return Err(io::Error::other(
+            "failed to initialize the base AP group-key context",
+        ));
     }
-    .run()
+    runtime.run()
 }
 
 impl RadioRuntime {

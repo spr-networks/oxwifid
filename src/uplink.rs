@@ -1,9 +1,7 @@
 //! SPR Wi-Fi uplink configuration and scan-result selection.
 //!
 //! SPR stores the networks selected (or manually entered) by the wireless UI in
-//! `/configs/wifi_uplink/wpa.json`. The client consumes that file directly:
-//! there is no generated wpa_supplicant configuration or password-bearing
-//! command line between SPR and barely-ap.
+//! `/configs/wifi_uplink/wpa.json`. The client consumes that file directly
 
 use crate::util::try_mac_to_bytes;
 use serde_json::Value;

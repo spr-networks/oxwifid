@@ -21,9 +21,19 @@ impl Ap {
 
     /// Full negotiated pairwise key for Linux nl80211 installation.
     pub fn station_pairwise_key(&self, sta: &[u8; 6]) -> Option<&[u8]> {
-        self.stations
-            .get(sta)
-            .map(|s| &s.pairwise_tk[..self.pairwise_cipher.key_len()])
+        self.stations.get(sta).map(|s| {
+            let key_len = s.pairwise_cipher.key_len();
+            &s.pairwise_tk[..key_len]
+        })
+    }
+
+    /// Newest M2-derived PTK candidate awaiting M4. Linux AP mode installs this
+    /// key in the driver immediately after transmitting M3, but does not open
+    /// the controlled port until M4 authenticates one of the candidates.
+    pub fn station_pending_pairwise_key(&self, sta: &[u8; 6]) -> Option<&[u8]> {
+        let s = self.stations.get(sta)?;
+        let candidate = s.ptk_candidates.last()?;
+        Some(&candidate.tk[..s.pairwise_cipher.key_len()])
     }
 
     /// 802.11v: send a (CCMP-protected) BSS Transition Management request, e.g.
@@ -35,11 +45,12 @@ impl Ap {
         disassoc_timer: u16,
     ) -> Option<Vec<u8>> {
         let tk = self.installed_pairwise_key(sta)?;
+        let cipher = self.station_pairwise_cipher(sta);
         let pn = self.stations.get_mut(sta)?.next_client_pn()?;
         let sc = self.next_sc();
         let sec = self.mld_mgmt_tx_sec_addrs(sta);
         let frame = dot11::build_protected_btm_request_for_cipher_sec(
-            self.pairwise_cipher,
+            cipher,
             &self.mac,
             sta,
             1,
@@ -47,7 +58,7 @@ impl Ap {
             disassoc_timer,
             sc,
             pn,
-            &tk[..self.pairwise_cipher.key_len()],
+            &tk[..cipher.key_len()],
             sec,
         );
         Some(prepend_radiotap(frame))
@@ -56,6 +67,7 @@ impl Ap {
     /// 802.11k: send a (CCMP-protected) Neighbor Report Response listing this AP.
     pub fn neighbor_report(&mut self, sta: &[u8; 6]) -> Option<Vec<u8>> {
         let tk = self.installed_pairwise_key(sta)?;
+        let cipher = self.station_pairwise_cipher(sta);
         let pn = self.stations.get_mut(sta)?.next_client_pn()?;
         let sc = self.next_sc();
         let op_class = if dot11::is_5ghz(self.channel) {
@@ -66,14 +78,14 @@ impl Ap {
         let neighbor = dot11::neighbor_report_element(&self.mac, op_class, self.channel);
         let sec = self.mld_mgmt_tx_sec_addrs(sta);
         let frame = dot11::build_protected_neighbor_report_for_cipher_sec(
-            self.pairwise_cipher,
+            cipher,
             &self.mac,
             sta,
             1,
             &neighbor,
             sc,
             pn,
-            &tk[..self.pairwise_cipher.key_len()],
+            &tk[..cipher.key_len()],
             sec,
         );
         Some(prepend_radiotap(frame))
@@ -82,17 +94,18 @@ impl Ap {
     /// Build a CCMP-protected unicast Deauthentication toward a PMF station.
     pub fn protected_deauth(&mut self, sta: &[u8; 6], reason: u16) -> Option<Vec<u8>> {
         let tk = self.installed_pairwise_key(sta)?;
+        let cipher = self.station_pairwise_cipher(sta);
         let pn = self.stations.get_mut(sta)?.next_client_pn()?;
         let sc = self.next_sc();
         let sec = self.mld_mgmt_tx_sec_addrs(sta);
         let frame = dot11::build_protected_deauth_for_cipher_sec(
-            self.pairwise_cipher,
+            cipher,
             &self.mac,
             sta,
             reason,
             sc,
             pn,
-            &tk[..self.pairwise_cipher.key_len()],
+            &tk[..cipher.key_len()],
             sec,
         );
         let mut f = dot11::RADIOTAP_TX.to_vec();

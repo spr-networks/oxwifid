@@ -4,7 +4,9 @@ pub(super) struct EapolTxJob {
     pub(super) ifindex: u32,
     pub(super) dst: [u8; 6],
     pub(super) eapol: Vec<u8>,
+    pub(super) encrypt: bool,
     pub(super) link_id: Option<u8>,
+    pub(super) completion: Option<std::sync::mpsc::SyncSender<io::Result<()>>>,
 }
 
 pub(super) struct PendingEapolAck {
@@ -75,29 +77,45 @@ impl EapolTxWorker {
                 loop {
                     let disconnected = match request_rx.recv_timeout(Duration::from_millis(5)) {
                         Ok(job) => {
-                            match nl_queue_eapol(
-                                &mut sock,
-                                family,
-                                job.ifindex,
-                                &job.dst,
-                                &job.eapol,
-                                job.link_id,
-                            ) {
-                                Ok(seq) => {
-                                    pending.insert(
-                                        seq,
-                                        PendingEapolAck {
-                                            dst: job.dst,
-                                            len: job.eapol.len(),
-                                            sent_at: Instant::now(),
-                                        },
-                                    );
+                            if let Some(completion) = job.completion {
+                                let seq = sock.next_seq();
+                                let message = control_port_eapol_message(
+                                    family,
+                                    seq,
+                                    job.ifindex,
+                                    &job.dst,
+                                    &job.eapol,
+                                    job.encrypt,
+                                    job.link_id,
+                                );
+                                let result = sock.request_ack(message);
+                                let _ = completion.send(result);
+                            } else {
+                                match nl_queue_eapol(
+                                    &mut sock,
+                                    family,
+                                    job.ifindex,
+                                    &job.dst,
+                                    &job.eapol,
+                                    job.encrypt,
+                                    job.link_id,
+                                ) {
+                                    Ok(seq) => {
+                                        pending.insert(
+                                            seq,
+                                            PendingEapolAck {
+                                                dst: job.dst,
+                                                len: job.eapol.len(),
+                                                sent_at: Instant::now(),
+                                            },
+                                        );
+                                    }
+                                    Err(err) => eprintln!(
+                                        "netlink AP: TX EAPOL to {} len={} FAILED: {err}",
+                                        crate::util::bytes_to_mac(&job.dst),
+                                        job.eapol.len(),
+                                    ),
                                 }
-                                Err(err) => eprintln!(
-                                    "netlink AP: TX EAPOL to {} len={} FAILED: {err}",
-                                    crate::util::bytes_to_mac(&job.dst),
-                                    job.eapol.len(),
-                                ),
                             }
                             false
                         }
@@ -115,13 +133,22 @@ impl EapolTxWorker {
         })
     }
 
-    pub(super) fn send(&self, ifindex: u32, dst: [u8; 6], eapol: Vec<u8>, link_id: Option<u8>) {
+    pub(super) fn send(
+        &self,
+        ifindex: u32,
+        dst: [u8; 6],
+        eapol: Vec<u8>,
+        encrypt: bool,
+        link_id: Option<u8>,
+    ) {
         let len = eapol.len();
         match self.requests.try_send(EapolTxJob {
             ifindex,
             dst,
             eapol,
+            encrypt,
             link_id,
+            completion: None,
         }) {
             Ok(()) => {}
             Err(std::sync::mpsc::TrySendError::Full(_)) => eprintln!(
@@ -133,6 +160,34 @@ impl EapolTxWorker {
                 crate::util::bytes_to_mac(&dst),
             ),
         }
+    }
+
+    /// Submit an EAPOL frame and wait until nl80211 acknowledges the control-
+    /// port command. Use this barrier for M3 before installing the pairwise
+    /// key; without it, mt7996 can process NEW_KEY while M3 is still queued
+    /// against the pre-key peer.
+    pub(super) fn send_and_wait(
+        &self,
+        ifindex: u32,
+        dst: [u8; 6],
+        eapol: Vec<u8>,
+        encrypt: bool,
+        link_id: Option<u8>,
+    ) -> io::Result<()> {
+        let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+        self.requests
+            .send(EapolTxJob {
+                ifindex,
+                dst,
+                eapol,
+                encrypt,
+                link_id,
+                completion: Some(completion_tx),
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "EAPOL TX worker stopped"))?;
+        completion_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "EAPOL TX ACK timed out"))?
     }
 }
 
