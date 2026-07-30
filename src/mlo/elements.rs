@@ -218,7 +218,7 @@ pub fn per_sta_profile(link_id: u8, link_mac: &[u8; 6], inner: &[u8]) -> Vec<u8>
 /// (Re)Association Response variant of [`per_sta_profile`]: in addition to the
 /// beacon timing fields, a per-STA profile in an association response carries a
 /// BSS Parameters Change Count (STA Control bit 11 `PRES_BSS_PARAM_COUNT` + one
-/// STA Info octet). 
+/// STA Info octet).
 pub fn per_sta_profile_assoc(
     link_id: u8,
     link_mac: &[u8; 6],
