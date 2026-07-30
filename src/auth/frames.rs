@@ -124,5 +124,3 @@ pub fn build_assoc_req_sae_for_cipher(
     v.extend_from_slice(&security_tail_for_cipher(SecurityMode::Wpa3Sae, cipher));
     v
 }
-
-
