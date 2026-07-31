@@ -95,8 +95,9 @@ impl RadioRuntime {
                 // present iff the STA acknowledged it. Feed this to the AP so its
                 // retransmit is ACK-driven (resend fast until the STA got it).
                 if parsed.genl_cmd() == Some(NL80211_CMD_CONTROL_PORT_FRAME_TX_STATUS) {
+                    let acked = msg::find_attr(&attrs, NL80211_ATTR_ACK).is_some();
                     if let Some(fr) = msg::find_attr(&attrs, NL80211_ATTR_FRAME) {
-                        if fr.len() >= 6 && msg::find_attr(&attrs, NL80211_ATTR_ACK).is_some() {
+                        if fr.len() >= 6 && acked {
                             let mut dst = [0u8; 6];
                             dst.copy_from_slice(&fr[..6]);
                             // Map an MLD or affiliated-link destination to the
@@ -105,8 +106,7 @@ impl RadioRuntime {
                             self.ap.note_eapol_acked(&sta);
                         }
                     }
-                    if crate::util::netlink_debug_enabled() {
-                        let acked = msg::find_attr(&attrs, NL80211_ATTR_ACK).is_some();
+                    if !acked || crate::util::netlink_debug_enabled() {
                         let flen = msg::find_attr(&attrs, NL80211_ATTR_FRAME)
                             .map(|f| f.len())
                             .unwrap_or(0);
@@ -463,17 +463,31 @@ impl RadioRuntime {
                                 });
                         if is_m2 && self.vlans.enabled {
                             if let Some(assignment) = self.vlans.map.get(&sta).cloned() {
+                                // A legacy station on an affiliated BSS has no
+                                // peer MLD address, but its AP_VLAN group keys
+                                // are still scoped to the AP link. Use the same
+                                // association-link selector used when the keys
+                                // were installed; omitting it makes GET_KEY
+                                // ambiguous and mt7996 rejects the request.
+                                let key_link_id = self.ap.mld.then(|| {
+                                    self.topology
+                                        .station_links
+                                        .get(&sta)
+                                        .copied()
+                                        .unwrap_or(self.ap.link_id)
+                                });
                                 let gtk_id = self.ap.station_gtk_key_id(&sta);
                                 let gtk_sequence = match nl_get_key_sequence(
                                     &mut self.io.commands,
                                     self.io.family,
                                     assignment.ifindex,
                                     gtk_id,
+                                    key_link_id,
                                 ) {
                                     Ok(sequence) => Some(sequence),
                                     Err(error) => {
                                         eprintln!(
-                                            "netlink AP: GET_KEY GTK={} on {} failed: {error}",
+                                            "netlink AP: GET_KEY GTK={} on {} link={key_link_id:?} failed: {error}",
                                             gtk_id, assignment.ifname,
                                         );
                                         None
@@ -486,11 +500,12 @@ impl RadioRuntime {
                                         self.io.family,
                                         assignment.ifindex,
                                         igtk_id,
+                                        key_link_id,
                                     ) {
                                         Ok(sequence) => Some(sequence),
                                         Err(error) => {
                                             eprintln!(
-                                                "netlink AP: GET_KEY IGTK={} on {} failed: {error}",
+                                                "netlink AP: GET_KEY IGTK={} on {} link={key_link_id:?} failed: {error}",
                                                 igtk_id, assignment.ifname,
                                             );
                                             None

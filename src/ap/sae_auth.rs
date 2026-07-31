@@ -308,7 +308,13 @@ impl Ap {
             let sae_ap = if peer_mld.is_some() {
                 self.mld_mac
             } else {
-                self.mac
+                // A legacy station authenticating on an affiliated link uses that
+                // link's BSSID as the SAE AP identity. The management-frame
+                // boundary canonicalizes link addresses to `self.mac`, so recover
+                // the actual receive link here.
+                self.association_link()
+                    .map(|link| link.mac)
+                    .unwrap_or(self.mac)
             };
             let sae_sta = peer_mld.unwrap_or(*sta);
             // A reference AP-style credential file may bind a different SAE

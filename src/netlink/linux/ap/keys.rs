@@ -179,13 +179,23 @@ pub(super) fn nl_install_key(sock: &mut NetlinkSocket, family: u16, key: KeyInst
     true
 }
 
-pub(super) fn get_key_message(family: u16, seq: u32, ifindex: u32, index: u8) -> GenlMessage {
+pub(super) fn get_key_message(
+    family: u16,
+    seq: u32,
+    ifindex: u32,
+    index: u8,
+    link_id: Option<u8>,
+) -> GenlMessage {
     // driver_nl80211 uses the legacy, top-level KEY_IDX for GET_KEY. This is
     // intentionally different from NEW_KEY/SET_KEY, whose key attributes live
     // inside NL80211_ATTR_KEY.
-    GenlMessage::new(family, NL80211_CMD_GET_KEY, msg::NLM_F_ACK, seq)
+    let mut message = GenlMessage::new(family, NL80211_CMD_GET_KEY, msg::NLM_F_ACK, seq)
         .attr(Attr::u32(NL80211_ATTR_IFINDEX, ifindex))
-        .attr(Attr::u8(NL80211_ATTR_KEY_IDX, index))
+        .attr(Attr::u8(NL80211_ATTR_KEY_IDX, index));
+    if let Some(link_id) = link_id {
+        message = message.attr(Attr::u8(NL80211_ATTR_MLO_LINK_ID, link_id));
+    }
+    message
 }
 
 /// Read the driver's current 48-bit packet number for one group key.
@@ -198,9 +208,10 @@ pub(super) fn nl_get_key_sequence(
     family: u16,
     ifindex: u32,
     index: u8,
+    link_id: Option<u8>,
 ) -> io::Result<[u8; 6]> {
     let seq = sock.next_seq();
-    let message = get_key_message(family, seq, ifindex, index);
+    let message = get_key_message(family, seq, ifindex, index, link_id);
     sock.send(&message.to_bytes(sock.pid))?;
 
     for _ in 0..16 {
@@ -332,7 +343,7 @@ mod key_message_tests {
 
     #[test]
     fn get_key_sequence_matches_driver_nl80211_shape() {
-        let message = get_key_message(0x13, 7, 42, 2);
+        let message = get_key_message(0x13, 7, 42, 2, None);
         let wire = message.to_bytes(99);
         assert_eq!(wire.len(), 36, "hostap GET_KEY request is 36 bytes");
         let parsed = msg::parse_messages(&wire);
@@ -348,6 +359,26 @@ mod key_message_tests {
         assert!(
             msg::find_attr(&top, NL80211_ATTR_KEY).is_none(),
             "GET_KEY uses the top-level KEY_IDX namespace"
+        );
+    }
+
+    #[test]
+    fn get_key_sequence_scopes_an_affiliated_ap_vlan_key_to_its_link() {
+        let message = get_key_message(0x13, 7, 42, 5, Some(1));
+        let wire = message.to_bytes(99);
+        let parsed = msg::parse_messages(&wire);
+        let top = msg::parse_attrs(parsed[0].genl_attrs());
+        assert_eq!(
+            msg::find_attr(&top, NL80211_ATTR_IFINDEX),
+            Some(42u32.to_ne_bytes().as_slice())
+        );
+        assert_eq!(
+            msg::find_attr(&top, NL80211_ATTR_KEY_IDX),
+            Some([5].as_slice())
+        );
+        assert_eq!(
+            msg::find_attr(&top, NL80211_ATTR_MLO_LINK_ID),
+            Some([1].as_slice())
         );
     }
 

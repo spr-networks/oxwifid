@@ -959,8 +959,7 @@ fn transition_mode_accepts_both_wpa2_and_wpa3_clients() {
     }
 }
 
-#[test]
-fn legacy_wpa2_on_mld_transition_uses_the_selected_link_bssid_for_ptk() {
+fn run_legacy_station_on_mld_transition_link1(use_sae: bool) -> (Ap, Client, usize) {
     let ap_link0 = mac_to_bytes("02:00:00:00:10:01");
     let ap_link1 = mac_to_bytes("02:00:00:00:10:02");
     let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
@@ -968,6 +967,9 @@ fn legacy_wpa2_on_mld_transition_uses_the_selected_link_bssid_for_ptk() {
     ap.enable_transition();
     let mut net = FakeNet::new(ap_link1, [10, 10, 10, 1]);
     let mut sta = Client::new("turtlenet", "password1234", sta_mac);
+    if use_sae {
+        sta.enable_sae();
+    }
 
     // The core keeps one canonical AP address. The netlink boundary translates
     // link-1 frames to/from that address while preserving mgmt_rx_link=1.
@@ -1011,9 +1013,27 @@ fn legacy_wpa2_on_mld_transition_uses_the_selected_link_bssid_for_ptk() {
         to_client = next_to_client;
     }
 
+    (ap, sta, rounds)
+}
+
+#[test]
+fn legacy_wpa2_on_mld_transition_uses_the_selected_link_bssid_for_ptk() {
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let (ap, sta, rounds) = run_legacy_station_on_mld_transition_link1(false);
     assert_eq!(
         sta.connected, 4,
         "legacy WPA2 must complete on MLD link 1 (rounds={rounds})"
+    );
+    assert!(ap.is_associated(&sta_mac));
+}
+
+#[test]
+fn legacy_sae_on_mld_transition_uses_the_selected_link_bssid_for_ptk() {
+    let sta_mac = mac_to_bytes("02:00:00:00:ab:cd");
+    let (ap, sta, rounds) = run_legacy_station_on_mld_transition_link1(true);
+    assert_eq!(
+        sta.connected, 4,
+        "legacy SAE must complete on MLD link 1 (rounds={rounds})"
     );
     assert!(ap.is_associated(&sta_mac));
 }

@@ -664,15 +664,19 @@ pub(super) fn route_outputs(
             // associated, group-key handshakes and PTK rekeys are sent under
             // the existing pairwise key.
             let encrypt = ap.is_associated(&core_sta);
-            let key_info = (eapol.len() >= 7).then(|| u16::from_be_bytes([eapol[5], eapol[6]]));
-            let is_unencrypted_m3 = !encrypt && key_info.is_some_and(|info| info & (1 << 6) != 0);
-            if is_unencrypted_m3 {
+            if !encrypt {
+                // Keep the pre-key handshake ordered after station publication,
+                // AP_VLAN binding, and group-key setup. Merely queueing M1 on a
+                // second netlink socket allowed the protocol retry timer to run
+                // without knowing whether nl80211 had accepted the frame. M1
+                // and M3 both need this submission barrier; M3 additionally
+                // relies on it before the PTK is installed.
                 if let Err(error) =
                     io.eapol
                         .send_and_wait(topology.ifindex, *dst, eapol.to_vec(), false, link_id)
                 {
                     eprintln!(
-                        "netlink AP: M3 send barrier failed for {}: {error}",
+                        "netlink AP: pre-key EAPOL send barrier failed for {}: {error}",
                         crate::util::bytes_to_mac(&core_sta),
                     );
                     station_state.begin_retirement(core_sta);
